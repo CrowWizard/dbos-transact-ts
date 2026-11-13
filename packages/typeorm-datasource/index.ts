@@ -1,20 +1,26 @@
 import { PoolConfig } from 'pg';
-import { DBOS, DBOSWorkflowConflictError, FunctionName } from '@dbos-inc/dbos-sdk';
+import { DBOS, FunctionName } from '@dbos-inc/dbos-sdk';
 import {
   type DataSourceTransactionHandler,
-  createTransactionCompletionSchemaPG,
-  createTransactionCompletionTablePG,
   isPGRetriableTransactionError,
-  isPGKeyConflictError,
+  DBOSError,
+  DBOSStepAlreadyRecordedError,
+  DBOSWorkflowConflictError,
+  assertStillOwnsWorkflow,
+  checkpointWorkflowID,
+  replayRecordedStep,
   registerTransaction,
   runTransaction,
   DBOSDataSource,
   registerDataSource,
   PGTransactionConfig,
-  CheckSchemaInstallationReturn,
-  checkSchemaInstallationPG,
+  DataSourceMigrationOptions,
+  DataSourceSQLExecutor,
+  initializeDataSourceSchemaPG,
+  migrateDataSourcePG,
+  verifyDataSourcePG,
 } from '@dbos-inc/dbos-sdk/datasource';
-import { DataSource, EntityManager } from 'typeorm';
+import { DataSource, type DataSourceOptions, EntityManager } from 'typeorm';
 import { AsyncLocalStorage } from 'async_hooks';
 import { SuperJSON } from 'superjson';
 
@@ -22,12 +28,19 @@ export interface TypeORMTransactionConfig extends PGTransactionConfig {
   name?: string;
 }
 
+// TypeORM 1.x renamed the module defining this type, so derive it from the public union instead.
+type PostgresOptions = Extract<DataSourceOptions, { type: 'postgres' }>;
+
 interface DBOSTypeOrmLocalCtx {
   entityManager: EntityManager;
   owner: TypeOrmTransactionHandler;
 }
 
 const asyncLocalCtx = new AsyncLocalStorage<DBOSTypeOrmLocalCtx>();
+
+function typeOrmExecutor(db: DataSource | EntityManager): DataSourceSQLExecutor {
+  return async (sql) => await db.query<Record<string, unknown>[]>(sql);
+}
 
 interface transaction_completion {
   workflow_id: string;
@@ -37,7 +50,6 @@ interface transaction_completion {
 }
 
 class TypeOrmTransactionHandler implements DataSourceTransactionHandler {
-  readonly dsType = 'TypeOrm';
   #createdDataSource: DataSource | undefined;
   readonly schemaName: string;
 
@@ -48,6 +60,7 @@ class TypeOrmTransactionHandler implements DataSourceTransactionHandler {
     private readonly entities?: Function[],
     private readonly providedDataSource?: DataSource,
     schemaName: string = 'dbos',
+    private readonly options: DataSourceMigrationOptions = {},
   ) {
     this.schemaName = schemaName;
   }
@@ -64,9 +77,10 @@ class TypeOrmTransactionHandler implements DataSourceTransactionHandler {
       host: config.host,
       port: config.port,
       username: config.user,
-      // password: config.password,
+      // TypeORM passes password and ssl to pg unchanged but types them more narrowly than pg does.
+      password: config.password as PostgresOptions['password'],
       database: config.database,
-      // ssl: config.ssl,
+      ssl: config.ssl as PostgresOptions['ssl'],
       connectTimeoutMS: config.connectionTimeoutMillis,
       poolSize: config.max,
     });
@@ -89,29 +103,21 @@ class TypeOrmTransactionHandler implements DataSourceTransactionHandler {
       await ds?.destroy();
     }
 
-    let installed = false;
-    try {
-      const res = await this.dataSource.query<CheckSchemaInstallationReturn[]>(
-        checkSchemaInstallationPG(this.schemaName),
-      );
-      installed = !!res[0]?.schema_exists && !!res[0]?.table_exists;
-    } catch (e) {
-      throw new Error(
-        `In initialization of 'TypeOrmDataSource' ${this.name}: Database could not be reached: ${(e as Error).message}`,
-      );
+    if (this.options.runMigrations === false) {
+      await verifyDataSourcePG(typeOrmExecutor(this.dataSource), this.schemaName, this.name);
+      return;
     }
 
-    // Install
-    if (!installed) {
-      try {
-        await this.dataSource.query(createTransactionCompletionSchemaPG(this.schemaName));
-        await this.dataSource.query(createTransactionCompletionTablePG(this.schemaName));
-      } catch (err) {
-        throw new Error(
-          `In initialization of 'TypeOrmDataSource' ${this.name}: The '${this.schemaName}.transaction_completion' table does not exist, and could not be created.  This should be added to your database migrations.
+    // Explicit, because TypeORM 1.x otherwise applies the DataSource's own isolationLevel option.
+    try {
+      await this.dataSource.transaction('READ COMMITTED', (em) =>
+        migrateDataSourcePG(typeOrmExecutor(em), this.schemaName),
+      );
+    } catch (err) {
+      throw new Error(
+        `In initialization of 'TypeOrmDataSource' ${this.name}: The '${this.schemaName}' transaction schema could not be migrated: ${(err as Error).message}. This should be added to your database migrations.
           See: https://docs.dbos.dev/typescript/tutorials/transaction-tutorial#installing-the-dbos-schema`,
-        );
-      }
+      );
     }
   }
 
@@ -119,6 +125,17 @@ class TypeOrmTransactionHandler implements DataSourceTransactionHandler {
     const ds = this.#createdDataSource;
     this.#createdDataSource = undefined;
     await ds?.destroy();
+  }
+
+  async deleteCheckpoints(workflowID: string, startStep: number, beforeCommit?: () => Promise<void>): Promise<void> {
+    await this.dataSource.transaction('READ COMMITTED', async (entityManager: EntityManager) => {
+      await entityManager.query(
+        `DELETE FROM "${this.schemaName}".transaction_completion
+         WHERE workflow_id=$1 AND function_num>=$2;`,
+        [checkpointWorkflowID(workflowID), startStep],
+      );
+      await beforeCommit?.();
+    });
   }
 
   async #checkExecution(
@@ -129,14 +146,10 @@ class TypeOrmTransactionHandler implements DataSourceTransactionHandler {
     const rows = await this.dataSource.query<TxOutputRow[]>(
       `SELECT output, error FROM "${this.schemaName}".transaction_completion
        WHERE workflow_id=$1 AND function_num=$2;`,
-      [workflowID, stepID],
+      [checkpointWorkflowID(workflowID), stepID],
     );
 
     if (rows.length !== 1) {
-      return undefined;
-    }
-
-    if (rows[0].output === null) {
       return undefined;
     }
 
@@ -151,35 +164,42 @@ class TypeOrmTransactionHandler implements DataSourceTransactionHandler {
     output: string,
     schemaName: string,
   ): Promise<void> {
-    try {
-      await entityManager.query(
-        `INSERT INTO "${schemaName}".transaction_completion (workflow_id, function_num, output)
-         VALUES ($1, $2, $3)`,
-        [workflowID, stepID, output],
-      );
-    } catch (error) {
-      if (isPGKeyConflictError(error)) {
-        throw new DBOSWorkflowConflictError(workflowID);
-      } else {
-        throw error;
-      }
+    const rows = await entityManager.query<{ workflow_id: string }[]>(
+      `INSERT INTO "${schemaName}".transaction_completion (workflow_id, function_num, output)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (workflow_id, function_num) DO NOTHING
+       RETURNING workflow_id`,
+      [checkpointWorkflowID(workflowID), stepID, output],
+    );
+    if (rows.length === 0) {
+      throw new DBOSStepAlreadyRecordedError(workflowID, stepID);
     }
+    // Holding this step's row, so a later owner's insert waits on our commit.
+    await assertStillOwnsWorkflow(workflowID);
   }
 
   async #recordError(workflowID: string, stepID: number, error: string): Promise<void> {
-    try {
-      await this.dataSource.query(
-        `INSERT INTO "${this.schemaName}".transaction_completion (workflow_id, function_num, error)
-         VALUES ($1, $2, $3)`,
-        [workflowID, stepID, error],
-      );
-    } catch (error) {
-      if (isPGKeyConflictError(error)) {
-        throw new DBOSWorkflowConflictError(workflowID);
-      } else {
-        throw error;
-      }
+    const rows = await this.dataSource.query<{ workflow_id: string }[]>(
+      `INSERT INTO "${this.schemaName}".transaction_completion (workflow_id, function_num, error)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (workflow_id, function_num) DO NOTHING
+       RETURNING workflow_id`,
+      [checkpointWorkflowID(workflowID), stepID, error],
+    );
+    if (rows.length === 0) {
+      throw new DBOSStepAlreadyRecordedError(workflowID, stepID);
     }
+  }
+
+  // A duplicate execution won the race, so its recorded outcome is the durable one.
+  async #replayConflictingStep<Return>(workflowID: string, stepID: number): Promise<Return> {
+    const recorded = await this.#checkExecution(workflowID, stepID);
+    if (recorded === undefined) {
+      throw new DBOSError(
+        `Step ${stepID} of workflow ${workflowID} conflicted with a concurrent execution, but no recorded outcome was found`,
+      );
+    }
+    return replayRecordedStep<Return>(recorded);
   }
 
   /* Required by base class */
@@ -208,12 +228,7 @@ class TypeOrmTransactionHandler implements DataSourceTransactionHandler {
       // Check to see if this tx has already been executed
       const previousResult = saveResults ? await this.#checkExecution(workflowID, stepID!) : undefined;
       if (previousResult) {
-        DBOS.span?.setAttribute('cached', true);
-
-        if ('error' in previousResult) {
-          throw SuperJSON.parse(previousResult.error);
-        }
-        return (previousResult.output ? SuperJSON.parse(previousResult.output) : null) as Return;
+        return replayRecordedStep<Return>(previousResult);
       }
 
       try {
@@ -242,6 +257,11 @@ class TypeOrmTransactionHandler implements DataSourceTransactionHandler {
 
         return result;
       } catch (error) {
+        if (saveResults && error instanceof DBOSStepAlreadyRecordedError) {
+          return await this.#replayConflictingStep<Return>(workflowID, stepID!);
+        }
+        // The new owner wins; recording an error here would replay it as this step's outcome.
+        if (error instanceof DBOSWorkflowConflictError) throw error;
         if (isPGRetriableTransactionError(error)) {
           DBOS.span?.addEvent('TXN SERIALIZATION FAILURE', { retryWaitMillis: retryWaitMS }, performance.now());
           // Retry serialization failures.
@@ -251,7 +271,14 @@ class TypeOrmTransactionHandler implements DataSourceTransactionHandler {
         } else {
           if (saveResults) {
             const message = SuperJSON.stringify(error);
-            await this.#recordError(workflowID, stepID!, message);
+            try {
+              await this.#recordError(workflowID, stepID!, message);
+            } catch (recordError) {
+              if (recordError instanceof DBOSStepAlreadyRecordedError) {
+                return await this.#replayConflictingStep<Return>(workflowID, stepID!);
+              }
+              throw recordError;
+            }
           }
 
           throw error;
@@ -286,11 +313,20 @@ export class TypeOrmDataSource implements DBOSDataSource<TypeORMTransactionConfi
     return TypeOrmDataSource.#getEntityManager(this.#provider);
   }
 
-  static async initializeDBOSSchema(config: PoolConfig, schemaName: string = 'dbos'): Promise<void> {
+  /**
+   * Create or migrate the DBOS transaction schema, typically with a privileged role,
+   * optionally granting `applicationRole` the minimal permissions to use it.
+   */
+  static async initializeDBOSSchema(
+    config: PoolConfig,
+    schemaName: string = 'dbos',
+    options: { applicationRole?: string } = {},
+  ): Promise<void> {
     const ds = await TypeOrmTransactionHandler.createDataSource(config, []);
     try {
-      await ds.query(createTransactionCompletionSchemaPG(schemaName));
-      await ds.query(createTransactionCompletionTablePG(schemaName));
+      await ds.transaction((em) =>
+        initializeDataSourceSchemaPG(typeOrmExecutor(em), schemaName, options.applicationRole),
+      );
     } finally {
       await ds.destroy();
     }
@@ -298,22 +334,20 @@ export class TypeOrmDataSource implements DBOSDataSource<TypeORMTransactionConfi
 
   #provider: TypeOrmTransactionHandler;
 
-  /**
-   * @deprecated - For readability, use `createFromConfig` or `createFromDataSource`
-   */
-  constructor(
+  private constructor(
     readonly name: string,
     config?: PoolConfig,
     // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
     entities?: Function[],
     dataSource?: DataSource,
     schemaName: string = 'dbos',
+    options: DataSourceMigrationOptions = {},
   ) {
     if (config && entities) {
-      this.#provider = new TypeOrmTransactionHandler(name, config, entities, undefined, schemaName);
+      this.#provider = new TypeOrmTransactionHandler(name, config, entities, undefined, schemaName, options);
       registerDataSource(this.#provider);
     } else if (dataSource) {
-      this.#provider = new TypeOrmTransactionHandler(name, undefined, undefined, dataSource, schemaName);
+      this.#provider = new TypeOrmTransactionHandler(name, undefined, undefined, dataSource, schemaName, options);
       registerDataSource(this.#provider);
     } else {
       throw new TypeError(
@@ -328,12 +362,18 @@ export class TypeOrmDataSource implements DBOSDataSource<TypeORMTransactionConfi
     // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
     entities: Function[],
     schemaName: string = 'dbos',
+    options: DataSourceMigrationOptions = {},
   ) {
-    return new TypeOrmDataSource(name, config, entities, undefined, schemaName);
+    return new TypeOrmDataSource(name, config, entities, undefined, schemaName, options);
   }
 
-  static createFromDataSource(name: string, ds: DataSource, schemaName: string = 'dbos') {
-    return new TypeOrmDataSource(name, undefined, undefined, ds, schemaName);
+  static createFromDataSource(
+    name: string,
+    ds: DataSource,
+    schemaName: string = 'dbos',
+    options: DataSourceMigrationOptions = {},
+  ) {
+    return new TypeOrmDataSource(name, undefined, undefined, ds, schemaName, options);
   }
 
   /**

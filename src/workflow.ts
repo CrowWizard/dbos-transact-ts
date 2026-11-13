@@ -1,10 +1,52 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
-import { type SystemDatabase, WorkflowStatusInternal } from './system_database';
 import { ConfiguredInstance } from './decorators';
-import { deserializePositionalArgs, registerSerializationRecipe } from './serialization';
-import { DBOS, runInternalStep } from './dbos';
-import { DuplicationPolicy, EnqueueOptions } from './system_database';
-import { DBOSExecutor } from './dbos-executor';
+import { registerSerializationRecipe } from './serialization';
+import {
+  awaitRecordedResult,
+  DBOS,
+  getResultInternal,
+  resolvePollingIntervalMs,
+  runInternalStep,
+  type PollingOptions,
+} from './dbos';
+import { DuplicationPolicy, InternalEnqueueOptions } from './system_database';
+import { DBOSError, DBOSWorkflowSuspendedError } from './error';
+import { bindShardKeys } from './shard_keys';
+
+/**
+ * Validate that custom workflow attributes, if provided, are a plain key-value object that
+ * can be serialized to JSON for storage in the JSONB `attributes` column. A key-value object
+ * is required because attributes are queried with the `@>` containment filter; scalars and
+ * arrays would store but never match meaningfully. Called at the workflow-creation entry
+ * points (`startWorkflow`/enqueue) so invalid input fails fast at the call site rather than
+ * surfacing as a database error at insert time.
+ */
+export function validateWorkflowAttributes(attributes: unknown): void {
+  if (attributes === undefined || attributes === null) {
+    return;
+  }
+  if (typeof attributes !== 'object' || Array.isArray(attributes)) {
+    throw new DBOSError(
+      `Invalid workflow attributes: must be a key-value object, got ${
+        Array.isArray(attributes) ? 'array' : typeof attributes
+      }.`,
+    );
+  }
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(attributes);
+  } catch (e) {
+    throw new DBOSError(`Invalid workflow attributes: must be JSON-serializable. ${(e as Error).message}`);
+  }
+  // JSON.stringify silently drops keys whose values are functions or undefined, and returns
+  // "{}" for objects with no serializable keys (e.g. a class instance). Reject these rather
+  // than store an empty object that does not reflect what the caller passed.
+  if (serialized === '{}' && Object.keys(attributes).length > 0) {
+    throw new DBOSError('Invalid workflow attributes: object has no JSON-serializable properties.');
+  }
+}
+
+/** On a workflow ID already in use: 'return-existing' (default) attaches to it; 'reject' throws an error `isWorkflowIDInUseError` matches. */
+export type WorkflowIDReusePolicy = 'return-existing' | 'reject';
 
 export interface WorkflowParams {
   workflowUUID?: string;
@@ -13,11 +55,19 @@ export interface WorkflowParams {
   executeWorkflow?: boolean; // If queueName is set, this will not be run unless executeWorkflow is true.
   timeoutMS?: number | null;
   deadlineEpochMS?: number;
-  enqueueOptions?: EnqueueOptions; // Options for the workflow queue
+  enqueueOptions?: InternalEnqueueOptions; // Options for the workflow queue
   // How to react to a collision on `enqueueOptions.deduplicationID`. When 'return-existing', the
   // executor skips its dedup-error pre-recording at the parent's funcID — the wrapper records the
   // child mapping itself after attaching to the existing workflow.
   duplicationPolicy?: DuplicationPolicy;
+  workflowIDReusePolicy?: WorkflowIDReusePolicy;
+  // Custom key-value attributes to attach to the workflow at creation. Not inherited by child workflows.
+  workflowAttributes?: Record<string, unknown>;
+  // Authentication to record on the workflow, overriding the ambient context.
+  authenticatedUser?: string;
+  authenticatedRoles?: string[];
+  // The shard key the workflow lives under; required on a sharded system database.
+  shardKey?: string;
 }
 
 export const DEFAULT_MAX_RECOVERY_ATTEMPTS = 100;
@@ -51,12 +101,19 @@ export interface WorkflowConfig {
    *  the validated/transformed array. Runs before the workflow function on
    *  every invocation (direct call, queue dispatch, and recovery). */
   inputSchema?: InputSchema;
+  /**
+   * Whether auto-upgrade moves pending instances of this workflow to the latest application version.
+   * Unset, the workflow follows the `autoUpgrade` flag in DBOSConfig.
+   * Set to `true` to enroll it independently of DBOSConfig.autoUpgrade, and set to `false` to opt it out when DBOSConfig.autoUpgrade is true.
+   * Requires Transact Enterprise.
+   */
+  autoUpgrade?: boolean;
 }
 
 export interface WorkflowStatus {
   // The workflow ID
   readonly workflowID: string;
-  // The status of the workflow.  One of PENDING, SUCCESS, ERROR, ENQUEUED, DELAYED, CANCELLED, or MAX_RECOVERY_ATTEMPTS_EXCEEDED.
+  // The status of the workflow.  One of PENDING, SUCCESS, ERROR, ENQUEUED, DELAYED, SUSPENDED, CANCELLED, or MAX_RECOVERY_ATTEMPTS_EXCEEDED.
   readonly status: string;
   // The name of the workflow function.
   readonly workflowName: string;
@@ -85,6 +142,8 @@ export interface WorkflowStatus {
   readonly executorId?: string;
   // The application version on which this workflow started.
   readonly applicationVersion?: string;
+  // The owning application; undefined if unclaimed, in which case any application may run it.
+  readonly applicationName?: string;
 
   // Workflow start time, as a UNIX epoch timestamp in milliseconds
   readonly createdAt: number;
@@ -97,7 +156,7 @@ export interface WorkflowStatus {
   readonly deadlineEpochMS?: number;
   // Unique queue deduplication ID, if any. Deduplication IDs are unset when the workflow completes.
   readonly deduplicationID?: string;
-  // Priority of the workflow on a queue, starting from 1 ~ 2,147,483,647. Default 0 (highest priority).
+  // Priority of the workflow on a queue, 0 ~ 2,147,483,647. Default 0 (highest priority).
   readonly priority: number;
   // If this workflow is enqueued on a partitioned queue, its partition key
   readonly queuePartitionKey?: string;
@@ -116,11 +175,18 @@ export interface WorkflowStatus {
   // If this workflow was started by another workflow, that workflow's ID.
   readonly parentWorkflowID?: string;
 
+  // Custom key-value attributes attached to the workflow at creation, if any.
+  readonly attributes?: Record<string, unknown>;
+
+  // If this workflow was enqueued by a named schedule, that schedule's name.
+  readonly scheduleName?: string;
+
+  // The shard key the workflow lives under; undefined on an unsharded database.
+  readonly shardKey?: string;
+  // The parent workflow's shard key; undefined on an unsharded database.
+  readonly parentShardKey?: string;
+
   // INTERNAL
-  // Deprecated field
-  readonly applicationID: string;
-  // Deprecated field
-  readonly request?: object;
   // The number of times this workflow has been started.
   readonly recoveryAttempts?: number;
 }
@@ -143,18 +209,19 @@ export interface GetWorkflowsInput {
   queuesOnly?: boolean; // Return only workflows that are actively enqueued
   forkedFrom?: string | string[]; // Get workflows forked from this workflow ID (or any of these workflow IDs).
   wasForkedFrom?: boolean; // Filter workflows that have (or have not) been forked from.
+  isFork?: boolean; // Filter workflows that are (or are not) themselves a fork. Opposite end of the relationship from wasForkedFrom.
   parentWorkflowID?: string | string[]; // Get workflows started by this parent workflow ID (or any of these parent workflow IDs).
   hasParent?: boolean; // Filter workflows that have (or do not have) a parent workflow.
+  attributes?: Record<string, unknown>; // Retrieve workflows whose custom attributes contain all of these key-value pairs.
+  scheduleName?: string | string[]; // Retrieve workflows enqueued by this named schedule (or any of these schedules).
+  applicationName?: string | string[]; // Retrieve workflows owned by these applications, plus unclaimed ones. Unset retrieves this application's.
+  shardKey?: string | string[]; // Retrieve workflows living under this shard key (or any of these keys). Requires a sharded system database.
+  parentShardKey?: string | string[]; // Retrieve workflows whose parent lives under this shard key (or any of these keys). Requires a sharded system database.
   limit?: number; // Return up to this many workflows IDs. IDs are ordered by workflow creation time.
   offset?: number; // Skip this many workflows IDs. IDs are ordered by workflow creation time.
   sortDesc?: boolean; // Sort the workflows in descending order by creation time (default ascending order).
   loadInput?: boolean; // Load the input of the workflow (default true)
   loadOutput?: boolean; // Load the output of the workflow (default true)
-}
-
-export interface GetPendingWorkflowsOutput {
-  workflowUUID: string;
-  queueName?: string;
 }
 
 export interface StepInfo {
@@ -163,6 +230,8 @@ export interface StepInfo {
   readonly output: unknown;
   readonly error: Error | null;
   readonly childWorkflowID: string | null;
+  // The child workflow's shard key; undefined on an unsharded database
+  readonly childShardKey?: string;
   readonly startedAtEpochMs?: number;
   readonly completedAtEpochMs?: number;
 }
@@ -170,10 +239,6 @@ export interface StepInfo {
 export interface ListWorkflowStepsOptions {
   limit?: number;
   offset?: number;
-}
-
-export interface PgTransactionId {
-  txid: string;
 }
 
 /** Enumeration of values for workflow status */
@@ -192,6 +257,8 @@ export const StatusString = {
   ENQUEUED: 'ENQUEUED',
   /** Workflow is on a `WorkflowQueue` waiting for a delay to expire before it can start */
   DELAYED: 'DELAYED',
+  /** Workflow is parked in the database by a suspend-mode recv or sleep, until a send or its timer re-enqueues it */
+  SUSPENDED: 'SUSPENDED',
 } as const;
 
 export type WorkflowStatusString =
@@ -201,10 +268,16 @@ export type WorkflowStatusString =
   | 'MAX_RECOVERY_ATTEMPTS_EXCEEDED'
   | 'CANCELLED'
   | 'ENQUEUED'
-  | 'DELAYED';
+  | 'DELAYED'
+  | 'SUSPENDED';
 
 export function isWorkflowActive(status: string) {
-  return status === StatusString.PENDING || status === StatusString.ENQUEUED || status === StatusString.DELAYED;
+  return (
+    status === StatusString.PENDING ||
+    status === StatusString.ENQUEUED ||
+    status === StatusString.DELAYED ||
+    status === StatusString.SUSPENDED
+  );
 }
 
 /**
@@ -220,19 +293,17 @@ export interface WorkflowHandle<R> {
   /**
    * Await workflow completion and return its result.
    */
-  getResult(): Promise<R>;
+  getResult(options?: PollingOptions): Promise<R>;
   /**
    * Return the workflow's ID
    */
   get workflowID(): string;
-  /**
-   * Return the workflow's inputs
-   */
-  getWorkflowInputs<T extends any[]>(): Promise<T>;
+  /** The shard key the workflow lives under; undefined on an unsharded database. */
+  readonly shardKey?: string;
 }
 
 export interface InternalWFHandle<R> extends WorkflowHandle<R> {
-  getResult(funcIdForGet?: number): Promise<R>;
+  getResult(optionsOrFuncIdForGet?: PollingOptions | number): Promise<R>;
 }
 
 /**
@@ -240,42 +311,34 @@ export interface InternalWFHandle<R> extends WorkflowHandle<R> {
  */
 export class InvokedHandle<R> implements InternalWFHandle<R> {
   constructor(
-    readonly systemDatabase: SystemDatabase,
     readonly workflowPromise: Promise<R>,
-    readonly workflowUUID: string,
-    readonly workflowName: string,
+    readonly workflowID: string,
+    readonly shardKey?: string,
   ) {}
 
-  getWorkflowUUID(): string {
-    return this.workflowUUID;
-  }
-
-  get workflowID(): string {
-    return this.workflowUUID;
-  }
-
   async getStatus(): Promise<WorkflowStatus | null> {
-    return await DBOS.getWorkflowStatus(this.workflowUUID);
+    return await DBOS.getWorkflowStatus(this.workflowID, { shardKey: this.shardKey });
   }
 
-  async getResult(funcIdForGet?: number): Promise<R> {
-    return await runInternalStep(
-      async () => {
-        return await this.workflowPromise;
-      },
-      'DBOS.getResult',
-      this.workflowUUID,
-      funcIdForGet,
+  async getResult(optionsOrFuncIdForGet?: PollingOptions | number): Promise<R> {
+    const funcIdForGet = typeof optionsOrFuncIdForGet === 'number' ? optionsOrFuncIdForGet : undefined;
+    const pollingIntervalMs = resolvePollingIntervalMs(optionsOrFuncIdForGet);
+    return await bindShardKeys([[this.workflowID, this.shardKey]], () =>
+      runInternalStep(
+        async () => {
+          try {
+            return await this.workflowPromise;
+          } catch (e) {
+            if (!(e instanceof DBOSWorkflowSuspendedError && e.workflowID === this.workflowID)) throw e;
+            // The workflow parked itself in the database: wait for the outcome a later execution records.
+            return (await awaitRecordedResult<R>(this.workflowID, undefined, undefined, pollingIntervalMs)) as R;
+          }
+        },
+        'DBOS.getResult',
+        this.workflowID,
+        funcIdForGet,
+      ),
     );
-  }
-
-  async getWorkflowInputs<T extends any[]>(): Promise<T> {
-    const status = (await this.systemDatabase.getWorkflowStatus(this.workflowUUID)) as WorkflowStatusInternal;
-    return (await deserializePositionalArgs(
-      status.input,
-      status.serialization,
-      this.systemDatabase.getSerializer(),
-    )) as T;
   }
 }
 
@@ -284,43 +347,30 @@ export class InvokedHandle<R> implements InternalWFHandle<R> {
  */
 export class RetrievedHandle<R> implements InternalWFHandle<R> {
   constructor(
-    readonly systemDatabase: SystemDatabase,
-    readonly workflowUUID: string,
+    readonly workflowID: string,
+    readonly shardKey?: string,
   ) {}
 
-  getWorkflowUUID(): string {
-    return this.workflowUUID;
-  }
-
-  get workflowID(): string {
-    return this.workflowUUID;
-  }
-
   async getStatus(): Promise<WorkflowStatus | null> {
-    return await DBOS.getWorkflowStatus(this.workflowUUID);
+    return await DBOS.getWorkflowStatus(this.workflowID, { shardKey: this.shardKey });
   }
 
-  async getResult(funcIdForGet?: number): Promise<R> {
-    return (await DBOS.getResultInternal<R>(this.workflowUUID, undefined, undefined, funcIdForGet)) as Promise<R>;
-  }
-
-  async getWorkflowInputs<T extends any[]>(): Promise<T> {
-    const status = (await this.systemDatabase.getWorkflowStatus(this.workflowUUID)) as WorkflowStatusInternal;
-    return (await deserializePositionalArgs(
-      status.input,
-      status.serialization,
-      this.systemDatabase.getSerializer(),
-    )) as T;
+  async getResult(optionsOrFuncIdForGet?: PollingOptions | number): Promise<R> {
+    const funcIdForGet = typeof optionsOrFuncIdForGet === 'number' ? optionsOrFuncIdForGet : undefined;
+    const pollingIntervalMs = resolvePollingIntervalMs(optionsOrFuncIdForGet);
+    return (await bindShardKeys([[this.workflowID, this.shardKey]], () =>
+      getResultInternal<R>(this.workflowID, undefined, undefined, funcIdForGet, pollingIntervalMs),
+    )) as Promise<R>;
   }
 }
 
-registerSerializationRecipe<WorkflowHandle<unknown>, { wfid: string }>({
+registerSerializationRecipe<WorkflowHandle<unknown>, { wfid: string; shardKey?: string }>({
   name: 'DBOS.WorkflowHandle',
   isApplicable: (v: unknown): v is WorkflowHandle<unknown> => {
     return v instanceof RetrievedHandle || v instanceof InvokedHandle;
   },
   serialize: (v: WorkflowHandle<unknown>) => {
-    return { wfid: v.workflowID };
+    return v.shardKey === undefined ? { wfid: v.workflowID } : { wfid: v.workflowID, shardKey: v.shardKey };
   },
-  deserialize: (s: { wfid: string }) => new RetrievedHandle(DBOSExecutor.globalInstance!.systemDatabase, s.wfid),
+  deserialize: (s: { wfid: string; shardKey?: string }) => new RetrievedHandle(s.wfid, s.shardKey),
 });

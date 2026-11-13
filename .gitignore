@@ -1,6 +1,5 @@
 .dbos/
 .vscode/
-!packages/create/templates/**/.vscode
 packages/create/templates/**/package-lock.json
 tests/**/package-lock.json
 packages/**/package-lock.json
@@ -9,6 +8,7 @@ packages/**/package-lock.json
 CLAUDE.md
 tests/temp-dist/
 tests/temp-tests/
+.claude/
 
 # Logs
 logs

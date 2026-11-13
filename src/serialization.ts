@@ -53,104 +53,9 @@ registerSerializationRecipe<Buffer, number[]>({
   name: 'Buffer',
 });
 
-/**
- * Reviver and Replacer
- * --------------------
- * These can be passed to JSON.stringify and JSON.parse, respectively, to support more types.
- *
- * Additional types supported:
- * - Buffer
- * - Dates
- *
- * Currently, these are only used for operation inputs.
- * TODO: Use in other contexts where we perform serialization and deserialization.
- */
-
-interface SerializedBuffer {
-  type: 'Buffer';
-  data: number[];
-}
-
-type DBOSSerializeType = 'dbos_Date' | 'dbos_BigInt';
-
-interface DBOSSerialized {
-  dbos_type: DBOSSerializeType;
-}
-
-interface DBOSSerializedDate extends DBOSSerialized {
-  dbos_type: 'dbos_Date';
-  dbos_data: string;
-}
-
-interface DBOSSerializedBigInt extends DBOSSerialized {
-  dbos_type: 'dbos_BigInt';
-  dbos_data: string;
-}
-
-//https://www.typescriptlang.org/docs/handbook/2/functions.html#declaring-this-in-a-function
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function DBOSReplacer(this: any, key: string, value: unknown) {
-  // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment
-  const actualValue = this[key];
-  if (actualValue instanceof Date) {
-    const res: DBOSSerializedDate = {
-      dbos_type: 'dbos_Date',
-      dbos_data: actualValue.toISOString(),
-    };
-    return res;
-  }
-
-  if (typeof actualValue === 'bigint') {
-    const res: DBOSSerializedBigInt = {
-      dbos_type: 'dbos_BigInt',
-      dbos_data: actualValue.toString(),
-    };
-    return res;
-  }
-  return value;
-}
-
-function isSerializedBuffer(value: unknown): value is SerializedBuffer {
-  return typeof value === 'object' && value !== null && (value as Record<string, unknown>).type === 'Buffer';
-}
-
-function isSerializedDate(value: unknown): value is DBOSSerializedDate {
-  return typeof value === 'object' && value !== null && (value as Record<string, unknown>).dbos_type === 'dbos_Date';
-}
-
-function isSerializedBigInt(value: unknown): value is DBOSSerializedBigInt {
-  return typeof value === 'object' && value !== null && (value as Record<string, unknown>).dbos_type === 'dbos_BigInt';
-}
-
-export function DBOSReviver(_key: string, value: unknown): unknown {
-  switch (true) {
-    case isSerializedBuffer(value):
-      return Buffer.from(value.data);
-    case isSerializedDate(value):
-      return new Date(Date.parse(value.dbos_data));
-    case isSerializedBigInt(value):
-      return BigInt(value.dbos_data);
-    default:
-      return value;
-  }
-}
-
-// Keep the old DBOSJSON implementation for reference/testing
-export const DBOSJSONLegacy = {
-  name: () => 'js_legacy',
-  parse: (text: string | null) => {
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-return
-    return text === null ? null : JSON.parse(text, DBOSReviver);
-  },
-  stringify: (value: unknown): string | undefined => {
-    return JSON.stringify(value, DBOSReplacer);
-  },
-};
-
 // Constants for SuperJSON serialization marker
 export const SERIALIZER_MARKER_KEY = '__dbos_serializer';
 export const SERIALIZER_MARKER_VALUE = 'superjson';
-const SERIALIZER_MARKER_STRING = `"${SERIALIZER_MARKER_KEY}":"${SERIALIZER_MARKER_VALUE}"`;
 
 // Type for our branded SuperJSON record with the marker
 type DBOSBrandedSuperjsonRecord = SuperJSONResult & {
@@ -183,12 +88,7 @@ function sjstringify(value: unknown) {
   });
 }
 
-/**
- * DBOSJSON with SuperJSON support for richer type serialization.
- *
- * Backwards compatible - can deserialize both old DBOSJSON format and new SuperJSON format.
- * New serialization uses SuperJSON to handle Sets, Maps, undefined, RegExp, circular refs, etc.
- */
+/** The default format: SuperJSON. */
 export const DBOSJSON: {
   name: () => string;
   parse: (text: string | null | undefined) => unknown;
@@ -197,35 +97,15 @@ export const DBOSJSON: {
   name: () => 'js_superjson',
 
   parse: (text: string | null | undefined): unknown => {
-    if (text === null || text === undefined) return null; // This is from legacy; SuperJSON can do it.
+    if (text === null || text === undefined) return null;
 
-    /**
-     * Performance optimization: String check before JSON parsing.
-     *
-     * Why not just parse once and check the resulting object?
-     * - Legacy DBOSJSON data needs the DBOSReviver function during parsing
-     * - SuperJSON data must be parsed WITHOUT the reviver (it would corrupt the structure)
-     * - We can't know which parser to use without inspecting the data first
-     *
-     * This string check lets us:
-     * 1. Parse legacy data correctly with DBOSReviver in one pass (99% of cases)
-     * 2. Only double-parse when we detect new SuperJSON format (rare for now)
-     * 3. Avoid corrupting SuperJSON's meta structure with the wrong reviver
-     */
-    const hasSuperJSONMarker = text.includes(SERIALIZER_MARKER_STRING);
-
-    if (hasSuperJSONMarker) {
-      // Parse without reviver first to check if it's really our SuperJSON format
-      const vanillaParsed: unknown = JSON.parse(text);
-      if (isDBOSBrandedSuperjsonRecord(vanillaParsed)) {
-        return superjson.deserialize(vanillaParsed);
-      }
-      // False positive - user data happened to contain our marker string
-      // Fall through to parse with reviver
+    const parsed: unknown = JSON.parse(text);
+    if (!isDBOSBrandedSuperjsonRecord(parsed)) {
+      throw new TypeError(
+        `Value carries no ${SERIALIZER_MARKER_VALUE} marker, so it was not written by this serializer`,
+      );
     }
-
-    // Legacy DBOSJSON format
-    return DBOSJSONLegacy.parse(text);
+    return superjson.deserialize(parsed);
   },
   stringify: sjstringify,
 };
@@ -246,8 +126,6 @@ function portableJsonReplacer(_key: string, value: unknown): unknown {
     }
     if (!allStringKeys) {
       throw new TypeError(`Attempt to do portable JSON serialization of a map with non-string keys`);
-      // Other option: list of [key,value] pairs (portable, but needs schema/consumer intent)
-      // return Array.from(value.entries());
     }
 
     const obj: Record<string, unknown> = {};
@@ -259,8 +137,6 @@ function portableJsonReplacer(_key: string, value: unknown): unknown {
 
   if (value instanceof Error) {
     return { name: value.name, message: value.message };
-    // If you want stack too:
-    // return { name: value.name, message: value.message, stack: value.stack };
   }
 
   return value;
@@ -291,6 +167,13 @@ export const DBOSPortableJSON: {
 type PathToMember = Array<string | number | symbol>;
 type AnyObject = { [key: string | symbol]: unknown };
 
+/** The format a value is written in: the explicit choice, else the configured serializer's own. */
+function serializationName(format: WorkflowSerializationFormat, serializer: DBOSSerializer): string {
+  if (format === 'portable') return DBOSPortableJSON.name();
+  if (format === 'native') return DBOSJSON.name();
+  return serializer.name();
+}
+
 /**
  * Roundtrips `value` through serialization.  This doesn't preserve functions by default.
  *   So then, we recursively attach function stubs that throw clear errors, for any
@@ -304,14 +187,12 @@ export async function serializeFunctionInputOutput<T>(
   serializer: DBOSSerializer,
   serializationType?: WorkflowSerializationFormat,
 ): Promise<{ deserialized: T; stringified: string; sername: string }> {
-  const serialization =
-    serializationType === 'portable'
-      ? DBOSPortableJSON.name()
-      : serializationType === 'native'
-        ? DBOSJSON.name()
-        : serializer.name();
-
-  return serializeFunctionInputOutputWithSerializer(value, path, serializer, serialization);
+  return serializeFunctionInputOutputWithSerializer(
+    value,
+    path,
+    serializer,
+    serializationName(serializationType, serializer),
+  );
 }
 
 export async function serializeFunctionInputOutputWithSerializer<T>(
@@ -483,8 +364,6 @@ function isIndexableKey(k: unknown): k is string | number {
   return typeof k === 'string' || typeof k === 'number';
 }
 
-// Deserialize a plain value (not function inputs) using specified serialization,
-//   or the provided default
 export async function deserializeValue(
   serializedValue: string | null,
   serialization: string | null,
@@ -496,29 +375,90 @@ export async function deserializeValue(
   if (serialization === DBOSJSON.name()) {
     return DBOSJSON.parse(serializedValue);
   }
+  // A checkpoint recorded without an explicit format was written by the configured serializer.
   if (!serialization || serialization === serializer.name()) {
     return await serializer.parse(serializedValue);
   }
   throw new TypeError(`Value deserialization type ${serialization} is not available`);
 }
 
-// Deserialize a plain value (not function inputs) using specified serialization,
-//   or the provided default
 export async function deserializePositionalArgs(
   serializedValue: string | null,
   serialization: string | null,
   serializer: DBOSSerializer,
 ): Promise<unknown[]> {
-  if (serialization === DBOSPortableJSON.name()) {
-    return (DBOSPortableJSON.parse(serializedValue) as JsonWorkflowArgs).positionalArgs ?? [];
+  const parsed = await deserializeValue(serializedValue, serialization, serializer);
+  // The portable form wraps the arguments in a record; every other format stores the array itself.
+  return serialization === DBOSPortableJSON.name()
+    ? ((parsed as JsonWorkflowArgs).positionalArgs ?? [])
+    : (parsed as unknown[]);
+}
+
+// serializeError skips the non-enumerable `cause` and `AggregateError.errors`, so walk them explicitly.
+function serializeErrorWithCause(value: unknown, ancestors: Set<object> = new Set()): unknown {
+  if (!(value instanceof Error)) return serializeError(value);
+  if (ancestors.has(value)) return '[Circular]';
+  const out = serializeError(value);
+  if (typeof out === 'object' && out !== null) addNestedErrors(out as Record<string, unknown>, value, ancestors);
+  return out;
+}
+
+// An enumerable `errors` array (e.g. DBOSMaxStepRetriesError) keeps serializeError's copy; its Error entries gain their causes.
+function addNestedErrors(record: Record<string, unknown>, value: Error, ancestors: Set<object>) {
+  ancestors.add(value);
+  if (value.cause !== undefined) record.cause = serializeErrorWithCause(value.cause, ancestors);
+  const errors = (value as { errors?: unknown }).errors;
+  if (Array.isArray(errors)) {
+    const copied = record.errors;
+    if (Array.isArray(copied)) {
+      errors.forEach((e: unknown, i) => {
+        const entry: unknown = copied[i];
+        if (e instanceof Error && !ancestors.has(e) && typeof entry === 'object' && entry !== null) {
+          addNestedErrors(entry as Record<string, unknown>, e, ancestors);
+        }
+      });
+    } else if (value instanceof AggregateError) {
+      record.errors = errors.map((e: unknown) => serializeErrorWithCause(e, ancestors));
+    }
   }
-  if (serialization === DBOSJSON.name()) {
-    return DBOSJSON.parse(serializedValue) as unknown[];
+  ancestors.delete(value);
+}
+
+function isSerializedErrorLike(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.message === 'string' || typeof record.name === 'string';
+}
+
+function reviveNestedError(value: unknown): unknown {
+  return isSerializedErrorLike(value) ? deserializeErrorWithCause(value) : value;
+}
+
+function defineHiddenProperty(target: object, property: string, value: unknown) {
+  Object.defineProperty(target, property, { value, enumerable: false, writable: true, configurable: true });
+}
+
+function deserializeErrorWithCause(value: unknown): Error {
+  const err = deserializeError(value);
+  if (value instanceof Error || !isSerializedErrorLike(value)) return err;
+  reviveNestedErrors(err, value);
+  return err;
+}
+
+// Outside AggregateError, `errors` entries keep deserializeError's plain-object shape and only gain their causes.
+function reviveNestedErrors(target: object, value: Record<string, unknown>) {
+  if (value.cause !== undefined) defineHiddenProperty(target, 'cause', reviveNestedError(value.cause));
+  if (!Array.isArray(value.errors)) return;
+  if (value.name === 'AggregateError') {
+    defineHiddenProperty(target, 'errors', value.errors.map(reviveNestedError));
+    return;
   }
-  if (!serialization || serialization === serializer.name()) {
-    return (await serializer.parse(serializedValue)) as unknown[];
-  }
-  throw new TypeError(`Value deserialization type ${serialization} is not available`);
+  const revived = (target as { errors?: unknown }).errors;
+  if (!Array.isArray(revived)) return;
+  value.errors.forEach((raw: unknown, i) => {
+    const entry: unknown = revived[i];
+    if (isSerializedErrorLike(raw) && typeof entry === 'object' && entry !== null) reviveNestedErrors(entry, raw);
+  });
 }
 
 export async function deserializeResError(
@@ -526,17 +466,13 @@ export async function deserializeResError(
   serialization: string | null,
   serializer: DBOSSerializer,
 ): Promise<Error> {
+  const parsed = await deserializeValue(serializedValue, serialization, serializer);
+  // The portable form carries a language-neutral record rather than a serialized Error.
   if (serialization === DBOSPortableJSON.name()) {
-    const errdata = DBOSPortableJSON.parse(serializedValue) as JsonWorkflowErrorData;
+    const errdata = parsed as JsonWorkflowErrorData;
     throw new PortableWorkflowError(errdata.message, errdata.name, errdata.code, errdata.data);
   }
-  if (serialization === DBOSJSON.name()) {
-    return deserializeError(DBOSJSON.parse(serializedValue));
-  }
-  if (!serialization || serialization === serializer.name()) {
-    return deserializeError(await serializer.parse(serializedValue));
-  }
-  throw new TypeError(`Value deserialization type ${serialization} is not available`);
+  return deserializeErrorWithCause(parsed);
 }
 
 // Attempt to deserialize a value, but if it fails, retun the raw string.
@@ -625,13 +561,7 @@ export async function serializeResError(
   serializer: DBOSSerializer,
   serializationType: WorkflowSerializationFormat,
 ): Promise<{ serializedValue: string | null; serialization: string | null }> {
-  const serialization =
-    serializationType === 'portable'
-      ? DBOSPortableJSON.name()
-      : serializationType === 'native'
-        ? DBOSJSON.name()
-        : serializer.name();
-  return serializeResErrorWithSerializer(err, serializer, serialization);
+  return serializeResErrorWithSerializer(err, serializer, serializationName(serializationType, serializer));
 }
 
 export async function serializeResErrorWithSerializer(
@@ -652,12 +582,12 @@ export async function serializeResErrorWithSerializer(
   }
   if (serialization === DBOSJSON.name()) {
     return {
-      serializedValue: DBOSJSON.stringify(serializeError(err)),
+      serializedValue: DBOSJSON.stringify(serializeErrorWithCause(err)),
       serialization: DBOSJSON.name(),
     };
   }
   return {
-    serializedValue: await serializer.stringify(serializeError(err)),
+    serializedValue: await serializer.stringify(serializeErrorWithCause(err)),
     serialization: serializer.name(),
   };
 }

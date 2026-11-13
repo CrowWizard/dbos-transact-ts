@@ -1,5 +1,5 @@
 import { DBOS, DBOSClient } from '../src';
-import { generateDBOSTestConfig } from './helpers';
+import { describeUnlessSharded, generateDBOSTestConfig } from './helpers';
 import { Client } from 'pg';
 
 interface ExistenceCheck {
@@ -19,7 +19,15 @@ class WorkflowTestClass {
   }
 }
 
-describe('custom-schema-tests', () => {
+const patchedWorkflow = DBOS.registerWorkflow(
+  async () => {
+    return (await DBOS.patch('special-schema-patch')) ? 'patched' : 'unpatched';
+  },
+  { name: 'patchedWorkflow' },
+);
+
+// Makes databases of its own, which a router does not serve.
+describeUnlessSharded('custom-schema-tests', () => {
   beforeAll(async () => {
     // Clean up any existing test database
     const config = generateDBOSTestConfig();
@@ -245,10 +253,15 @@ describe('custom-schema-tests', () => {
         name: 'special-schema-test',
         systemDatabaseUrl: dbUrl.toString(),
         systemDatabaseSchemaName: specialSchemaName,
+        enablePatching: true,
       });
 
       // This should now succeed with proper schema name escaping
       await DBOS.launch();
+
+      // Step checkpoints and patch markers are written to the same quoted schema.
+      await expect(WorkflowTestClass.testWorkflow()).resolves.toBe('step completed');
+      await expect(patchedWorkflow()).resolves.toBe('patched');
 
       // Verify the custom schema was created
       const pgSystemClient = new Client({

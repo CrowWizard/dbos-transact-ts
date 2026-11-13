@@ -1,12 +1,13 @@
-import { InMemorySpanExporter, ReadableSpan, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
+import { InMemorySpanExporter, ReadableSpan, SimpleSpanProcessor, SpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { NodeTracerProvider } from './nodetraceprovider';
 import { DBOS } from '../src';
-import Koa from 'koa';
-import Router from '@koa/router';
 import { context, trace, SpanStatusCode } from '@opentelemetry/api';
 import { isTraceContextWorking } from '../src/telemetry/traces';
 import { AddressInfo } from 'net';
+import http from 'http';
 import { globalParams } from '../src/utils';
+import { randomUUID } from 'node:crypto';
+import { generateDBOSTestConfig, reexecuteWorkflowById, setUpDBOSTestSysDb } from './helpers';
 
 async function tracedStep() {
   return Promise.resolve();
@@ -27,44 +28,55 @@ async function doSomethingTraced_internal() {
 const doSomethingTraced = DBOS.registerWorkflow(doSomethingTraced_internal);
 
 function createApp() {
-  const app = new Koa();
-  const router = new Router();
+  return http.createServer((req, res) => {
+    void (async () => {
+      const path = new URL(req.url ?? '/', 'http://localhost').pathname;
 
-  app.use(async (ctx, next) => {
-    const current = trace.getSpan(context.active());
-    if (current) {
-      return next() as Promise<unknown>;
-    }
-
-    const tracer = trace.getTracer('manual');
-    const span = tracer.startSpan(`manual-span-for-${ctx.method} ${ctx.path}`);
-
-    try {
-      await context.with(trace.setSpan(context.active(), span), async () => {
-        await next();
-        if (ctx.status >= 400) {
-          span.setStatus({ code: SpanStatusCode.ERROR, message: ctx.message });
+      const handle = async () => {
+        if (req.method === 'GET' && path === '/test') {
+          await doSomethingTraced();
+          res.statusCode = 200;
+          res.end('OK');
         } else {
-          span.setStatus({ code: SpanStatusCode.OK });
+          res.statusCode = 404;
+          res.end('Not Found');
         }
-      });
-    } catch (err) {
-      span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
-      throw err;
-    } finally {
-      span.end();
-    }
+      };
+
+      if (trace.getSpan(context.active())) {
+        await handle();
+        return;
+      }
+
+      const tracer = trace.getTracer('manual');
+      const span = tracer.startSpan(`manual-span-for-${req.method} ${path}`);
+
+      try {
+        await context.with(trace.setSpan(context.active(), span), async () => {
+          await handle();
+          if (res.statusCode >= 400) {
+            span.setStatus({ code: SpanStatusCode.ERROR, message: res.statusMessage });
+          } else {
+            span.setStatus({ code: SpanStatusCode.OK });
+          }
+        });
+      } catch (err) {
+        span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
+        if (!res.writableEnded) {
+          res.statusCode = 500;
+          res.end();
+        }
+      } finally {
+        span.end();
+      }
+    })().catch(() => {
+      // Koa answered every handler throw with a 500; without this the socket would hang.
+      if (!res.writableEnded) {
+        res.statusCode = 500;
+        res.end();
+      }
+    });
   });
-
-  router.get('/test', async (ctx) => {
-    await doSomethingTraced();
-    ctx.body = 'OK';
-  });
-
-  app.use(router.routes());
-  app.use(router.allowedMethods());
-
-  return app;
 }
 
 function getParentSpanID(span: ReadableSpan) {
@@ -231,5 +243,71 @@ describe('dbos-standalone-tracing', () => {
   test('workflows-produce-real-spans', async () => {
     const result = await doSomethingTraced();
     expect(result).toBe('Done');
+  });
+});
+
+const spanChild = DBOS.registerWorkflow(async () => Promise.resolve(), { name: 'spanChild' });
+const spanParent = DBOS.registerWorkflow(
+  async (childID: string) => {
+    await (await DBOS.startWorkflow(spanChild, { workflowID: childID })()).getResult();
+  },
+  { name: 'spanParent' },
+);
+
+// A span that never ends is never exported, and tracers that export whole traces then drop the caller's trace too.
+describe('workflow-span-only-for-runs', () => {
+  const memoryExporter = new InMemorySpanExporter();
+  const startedSpans: ReadableSpan[] = [];
+  const startTracker: SpanProcessor = {
+    onStart: (span) => void startedSpans.push(span),
+    onEnd: () => {},
+    forceFlush: () => Promise.resolve(),
+    shutdown: () => Promise.resolve(),
+  };
+
+  beforeAll(async () => {
+    const provider = new NodeTracerProvider({
+      spanProcessors: [startTracker, new SimpleSpanProcessor(memoryExporter)],
+    });
+    provider.register();
+    const config = { ...generateDBOSTestConfig(), tracingEnabled: true };
+    await setUpDBOSTestSysDb(config);
+    DBOS.setConfig(config);
+    await DBOS.launch();
+  });
+
+  afterAll(async () => {
+    await DBOS.shutdown();
+    trace.disable();
+    context.disable();
+  });
+
+  // [started, ended] workflow spans for this workflow ID.
+  function spanCounts(workflowID: string) {
+    const matches = (s: ReadableSpan) => s.attributes['operationUUID'] === workflowID;
+    return [startedSpans.filter(matches).length, memoryExporter.getFinishedSpans().filter(matches).length];
+  }
+
+  test('enqueue', async () => {
+    // Nothing dequeues from this queue, so the workflow does not run here.
+    const handle = await DBOS.startWorkflow(spanChild, { queueName: 'span-test-unserved' })();
+    expect(spanCounts(handle.workflowID)).toEqual([0, 0]);
+  });
+
+  test('start-of-an-existing-workflow', async () => {
+    const workflowID = randomUUID();
+    await (await DBOS.startWorkflow(spanChild, { workflowID })()).getResult();
+    await DBOS.startWorkflow(spanChild, { workflowID })();
+    expect(spanCounts(workflowID)).toEqual([1, 1]);
+  });
+
+  test('replayed-child-start', async () => {
+    const parentID = randomUUID();
+    const childID = randomUUID();
+    await (await DBOS.startWorkflow(spanParent, { workflowID: parentID })(childID)).getResult();
+    expect(spanCounts(childID)).toEqual([1, 1]);
+
+    await (await reexecuteWorkflowById(parentID)).getResult();
+    expect(spanCounts(childID)).toEqual([1, 1]);
   });
 });

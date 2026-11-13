@@ -11,6 +11,7 @@ import { DBOSJSON } from '../serialization';
 import { LoggerConfig } from '../dbos-executor';
 import { DBOSSpan } from './traces';
 import type { format as formatT } from 'winston';
+import { inspect } from 'node:util';
 
 // As DBOS OTLP is optional, OTLP objects must only be dynamically imported
 // and only when OTLP is enabled. Importing OTLP types is fine as long
@@ -48,13 +49,23 @@ enum SeverityNumber {
 /* GLOBAL LOGGER */
 /*****************/
 
-type ContextualMetadata = {
+export type ContextualMetadata = {
   includeContextMetadata?: boolean; // Should the console transport formatter include the context metadata?
   span?: DBOSSpan; // All context metadata should be attributes of the context's span
 };
 
-interface StackTrace {
+export interface StackTrace {
   stack?: string;
+  error?: unknown; // The original logged Error, for loggers that serialize errors themselves
+}
+
+// Append the `cause` and `errors` (which Error.stack omits) to the stack; inspect() handles nested/circular/non-Error values.
+export function errorStackWithCause(error: Error): string {
+  let stack = error.stack ?? `${error.name}: ${error.message}`;
+  if (error.cause !== undefined) stack += `\n  [cause]: ${inspect(error.cause, { depth: 10 })}`;
+  const errors = (error as { errors?: unknown }).errors;
+  if (Array.isArray(errors)) stack += `\n  [errors]: ${inspect(errors, { depth: 10 })}`;
+  return stack;
 }
 
 export class GlobalLogger {
@@ -68,6 +79,10 @@ export class GlobalLogger {
     appName: string = 'dbos',
   ) {
     this.addContextMetadata = config?.addContextMetadata || false;
+    if (config?.logger) {
+      this.logger = config.logger;
+      return;
+    }
     if (!globalParams.enableOTLP) {
       this.logger = new DBOSConsoleLogger(config ?? {});
       return;
@@ -151,14 +166,12 @@ export class GlobalLogger {
     }
 
     // Import Winston dependencies only when OTLP is enabled
-    const { transports, createLogger } = require('winston');
+    const { transports, createLogger, format } = require('winston');
     const winstonTransports: unknown[] = [];
     winstonTransports.push(
       new transports.Console({
         format: getConsoleFormat(),
         level: config?.logLevel || 'info',
-        silent: config?.silent || false,
-        forceConsole: config?.forceConsole || false,
       }),
     );
     let otlpTransport: OTLPLogQueueTransport | undefined = undefined;
@@ -167,7 +180,8 @@ export class GlobalLogger {
       otlpTransport = new OTLPLogQueueTransport(this.telemetryCollector, config?.logLevel || 'info');
       winstonTransports.push(otlpTransport);
     }
-    this.logger = createLogger({ transports: winstonTransports });
+    // Transports format their own output, so skip winston's default JSON serialization of the metadata (and its `error` graph).
+    this.logger = createLogger({ transports: winstonTransports, format: format((info: unknown) => info)() });
 
     if (globalParams.enableOTLP && process.env.DBOS__CAPTURE_STD !== 'false' && this.telemetryCollector?.exporter) {
       interceptStreams((msg, stream) => {
@@ -218,14 +232,21 @@ export class GlobalLogger {
   // metadata can have both ContextualMetadata and the error stack trace
   error(inputError: unknown, metadata?: ContextualMetadata & StackTrace): void {
     this.isLogging = true;
-    if (inputError instanceof Error) {
-      this.logger.error(inputError.message, { ...metadata, stack: inputError.stack });
-    } else if (typeof inputError === 'string') {
-      this.logger.error(inputError, { ...metadata, stack: new Error().stack });
-    } else {
-      this.logger.error(DBOSJSON.stringify(inputError), { ...metadata, stack: new Error().stack });
+    try {
+      if (inputError instanceof Error) {
+        this.logger.error(inputError.message, {
+          ...metadata,
+          stack: errorStackWithCause(inputError),
+          error: inputError,
+        });
+      } else if (typeof inputError === 'string') {
+        this.logger.error(inputError, { ...metadata, stack: new Error().stack });
+      } else {
+        this.logger.error(DBOSJSON.stringify(inputError), { ...metadata, stack: new Error().stack });
+      }
+    } finally {
+      this.isLogging = false;
     }
-    this.isLogging = false;
   }
 
   async destroy() {
@@ -237,6 +258,24 @@ export class GlobalLogger {
 /* CONTEXT LOGGER */
 /******************/
 
+/**
+ * The logger interface used throughout DBOS. Implement this to supply a custom
+ * logger through `DBOSConfig.logger` (for example, an adapter over an existing
+ * logging service).
+ *
+ * Contract for custom implementations:
+ * - Log entries arrive as strings: DBOS stringifies non-string entries before
+ *   delegating, and `error()` receives the message of an `Error` with its
+ *   stack trace (including any `cause` chain and `errors` list) in
+ *   `metadata.stack` and the original `Error` object in `metadata.error`.
+ * - When called from a workflow or step, `metadata.span?.attributes` carries
+ *   the operation context (workflow ID, operation name and type, etc.).
+ * - DBOS does not filter by `logLevel` before delegating; level routing is the
+ *   implementation's responsibility.
+ * - DBOS never flushes or closes the logger; the caller owns its lifecycle.
+ * - Implementations must not log back through `DBOS.logger`, which could
+ *   recurse.
+ */
 export interface DLogger {
   info(logEntry: unknown, metadata?: ContextualMetadata): void;
   debug(logEntry: unknown, metadata?: ContextualMetadata): void;
@@ -296,7 +335,7 @@ const logLevelValues: Record<string, number> = {
 export class DBOSConsoleLogger implements DLogger {
   private readonly levelValue: number;
 
-  constructor(readonly config: LoggerConfig) {
+  constructor(config: LoggerConfig) {
     const level = config.logLevel ?? 'info';
     if (!(level in logLevelValues)) {
       console.warn(

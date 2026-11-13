@@ -1,4 +1,4 @@
-import { DBOS } from '@dbos-inc/dbos-sdk';
+import { DBOS, DBOSWorkflowConflictError } from '@dbos-inc/dbos-sdk';
 import { Client, Pool } from 'pg';
 import { KyselyDataSource } from '..';
 import { Database, dropDB, ensureDB } from './test-helpers';
@@ -51,11 +51,8 @@ describe('KyselyDataSource', () => {
       'SELECT * FROM dbos.transaction_completion WHERE workflow_id = $1',
       [workflowID],
     );
-    expect(rows.length).toBe(1);
-    expect(rows[0].workflow_id).toBe(workflowID);
-    expect(rows[0].function_num).toBe(0);
-    expect(rows[0].output).not.toBeNull();
-    expect(SuperJSON.parse(rows[0].output!)).toMatchObject({ user, greet_count: 1 });
+    // Completion cleared the checkpoint the transaction wrote.
+    expect(rows).toHaveLength(0);
   });
 
   test('rerun insert dataSource.register function', async () => {
@@ -85,11 +82,8 @@ describe('KyselyDataSource', () => {
       'SELECT * FROM dbos.transaction_completion WHERE workflow_id = $1',
       [workflowID],
     );
-    expect(rows.length).toBe(1);
-    expect(rows[0].workflow_id).toBe(workflowID);
-    expect(rows[0].function_num).toBe(0);
-    expect(rows[0].output).not.toBeNull();
-    expect(SuperJSON.parse(rows[0].output!)).toMatchObject({ user, greet_count: 1 });
+    // Completion cleared the checkpoint the transaction wrote.
+    expect(rows).toHaveLength(0);
   });
 
   test('rerun insert dataSource.runAsTx function', async () => {
@@ -134,14 +128,8 @@ describe('KyselyDataSource', () => {
       'SELECT * FROM dbos.transaction_completion WHERE workflow_id = $1',
       [workflowID],
     );
-    expect(txOutput.length).toBe(1);
-    expect(txOutput[0].workflow_id).toBe(workflowID);
-    expect(txOutput[0].function_num).toBe(0);
-    expect(txOutput[0].output).toBeNull();
-    expect(txOutput[0].error).not.toBeNull();
-    const $error = SuperJSON.parse(txOutput[0].error!);
-    expect($error).toBeInstanceOf(Error);
-    expect(($error as Error).message).toMatch(/^test error \d+$/);
+    // Completion cleared the checkpoint the transaction wrote.
+    expect(txOutput).toHaveLength(0);
   });
 
   test('rerun error dataSource.register function', async () => {
@@ -179,14 +167,8 @@ describe('KyselyDataSource', () => {
       'SELECT * FROM dbos.transaction_completion WHERE workflow_id = $1',
       [workflowID],
     );
-    expect(txOutput.length).toBe(1);
-    expect(txOutput[0].workflow_id).toBe(workflowID);
-    expect(txOutput[0].function_num).toBe(0);
-    expect(txOutput[0].output).toBeNull();
-    expect(txOutput[0].error).not.toBeNull();
-    const $error = SuperJSON.parse(txOutput[0].error!);
-    expect($error).toBeInstanceOf(Error);
-    expect(($error as Error).message).toMatch(/^test error \d+$/);
+    // Completion cleared the checkpoint the transaction wrote.
+    expect(txOutput).toHaveLength(0);
   });
 
   test('rerun error dataSource.runAsTx function', async () => {
@@ -298,6 +280,100 @@ describe('KyselyDataSource', () => {
     ]);
     expect(txResults.rows.length).toBe(0);
   });
+
+  test('duplicate execution replays the winner result', async () => {
+    await userDB.query('DELETE FROM race_side_effects');
+    raceState.callCount = 0;
+
+    // A loser whose body succeeds: the collision happens on the result-recording insert.
+    raceState.plantWinner = true;
+    raceState.plantWinnerError = false;
+    raceState.fail = false;
+    const wfid1 = randomUUID();
+    await expect(DBOS.withNextWorkflowID(wfid1, () => regRaceWorkflow())).resolves.toBe('winner-result');
+    expect(raceState.callCount).toBe(1); // the loser did run its body
+
+    // A loser whose body fails: the collision moves to the error-recording insert,
+    // and the winner's result still wins over the loser's own error.
+    raceState.plantWinner = true;
+    raceState.plantWinnerError = false;
+    raceState.fail = true;
+    const wfid2 = randomUUID();
+    await expect(DBOS.withNextWorkflowID(wfid2, () => regRaceWorkflow())).resolves.toBe('winner-result');
+    expect(raceState.callCount).toBe(2);
+
+    // A winner that recorded an error: the loser replays that throw instead of its own result.
+    raceState.plantWinner = true;
+    raceState.plantWinnerError = true;
+    raceState.fail = false;
+    const wfid3 = randomUUID();
+    const winnerError = await throws(() => DBOS.withNextWorkflowID(wfid3, () => regRaceWorkflow()));
+    expect((winnerError as Error).message).toBe('winner-error');
+    expect(raceState.callCount).toBe(3);
+
+    // Every loser's writes were discarded, and completion cleared the winners' checkpoints.
+    const { rows: tags } = await userDB.query<{ tag: string }>('SELECT tag FROM race_side_effects');
+    expect(tags).toHaveLength(0);
+    const { rows: txOutput } = await userDB.query<transaction_completion>(
+      'SELECT * FROM dbos.transaction_completion WHERE workflow_id = ANY($1)',
+      [[wfid1, wfid2, wfid3]],
+    );
+    expect(txOutput).toHaveLength(0);
+  });
+
+  /** Completion clears the checkpoints, so the workflow reads them back while it still runs. */
+  test('transactions record their outcomes as checkpoints', async () => {
+    const user = 'checkpointProbe';
+    await userDB.query('DELETE FROM greetings WHERE name = $1', [user]);
+    const workflowID = randomUUID();
+    const message = await DBOS.withNextWorkflowID(workflowID, () => regCheckpointProbeWorkflow(user));
+    expect(message).toMatch(/^test error \d+$/);
+
+    expect(probeState.rows).toHaveLength(2);
+    const [output, error] = probeState.rows;
+    expect(output).toMatchObject({ workflow_id: workflowID, function_num: 0, error: null });
+    expect(SuperJSON.parse(output.output!)).toMatchObject({ user, greet_count: 1 });
+    expect(error).toMatchObject({ workflow_id: workflowID, function_num: 1, output: null });
+    expect(SuperJSON.parse<Error>(error.error!).message).toBe(message);
+    expect(await readCompletions(workflowID)).toHaveLength(0);
+  });
+
+  /** The checkpoint may be the new owner's only record of the transaction, so a stale execution's cleanup rolls back. */
+  test('a stale execution keeps the checkpoints at completion', async () => {
+    const user = 'handOffTest';
+    await userDB.query('DELETE FROM greetings WHERE name = $1', [user]);
+    const handedOff = new Promise<void>((resolve) => (handOffState.signal = resolve));
+    const workflowID = randomUUID();
+    const execution = DBOS.withNextWorkflowID(workflowID, () => regHandOffWorkflow(user));
+    // Surfaces the workflow's own error if it fails before handing off.
+    await Promise.race([handedOff, execution]);
+
+    // Its outcome is refused too, so the execution parks until the workflow is cancelled.
+    await DBOS.cancelWorkflow(workflowID);
+    await expect(execution).rejects.toThrow(/has been cancelled/);
+    expect(await readCompletions(workflowID)).toHaveLength(1);
+  });
+
+  /** A stale execution cannot apply a step the new owner also runs, nor leave an outcome for it. */
+  test('an execution that loses the workflow mid-transaction rolls back', async () => {
+    await userDB.query('DELETE FROM race_side_effects');
+    const workflowID = randomUUID();
+    await expect(DBOS.withNextWorkflowID(workflowID, () => regStaleWorkflow())).resolves.toBe('conflicted');
+
+    const { rows: tags } = await userDB.query<{ tag: string }>('SELECT tag FROM race_side_effects');
+    expect(tags).toHaveLength(0);
+    expect(staleState.completionsAtConflict).toBe(0);
+    const sysDB = new Client(sysConfig);
+    try {
+      await sysDB.connect();
+      const { rows: steps } = await sysDB.query('SELECT * FROM dbos.operation_outputs WHERE workflow_uuid = $1', [
+        workflowID,
+      ]);
+      expect(steps).toHaveLength(0);
+    } finally {
+      await sysDB.end();
+    }
+  });
 });
 
 export interface greetings {
@@ -325,6 +401,7 @@ async function createDatabases(userDB: Pool, createTxCompletion: boolean) {
       await client.query(
         'CREATE TABLE greetings(name text NOT NULL, greet_count integer DEFAULT 0, PRIMARY KEY(name))',
       );
+      await client.query('CREATE TABLE race_side_effects(tag text NOT NULL)');
     } finally {
       client.release();
     }
@@ -351,6 +428,47 @@ async function errorFunction(user: string) {
   throw new Error(`test error ${Date.now()}`);
 }
 
+const raceState = { callCount: 0, plantWinner: false, plantWinnerError: false, fail: false };
+
+async function raceFunction() {
+  raceState.callCount += 1;
+  await sql`INSERT INTO race_side_effects(tag) VALUES (${`run-${raceState.callCount}`})`.execute(dataSource.client);
+  if (raceState.plantWinner) {
+    raceState.plantWinner = false;
+    await plantWinnerCompletion();
+  }
+  if (raceState.fail) {
+    throw new Error("loser's own failure");
+  }
+  return `result-${raceState.callCount}`;
+}
+
+// A duplicate execution commits its result while this transaction is still open, so this
+// execution's pre-check missed it but its completion insert will collide with it.
+async function plantWinnerCompletion() {
+  const winner = new Client(config.connection);
+  try {
+    await winner.connect();
+    const [column, value] = raceState.plantWinnerError
+      ? ['error', SuperJSON.stringify(new Error('winner-error'))]
+      : ['output', SuperJSON.stringify('winner-result')];
+    await winner.query(
+      `INSERT INTO dbos.transaction_completion (workflow_id, function_num, ${column}) VALUES ($1, $2, $3)`,
+      [DBOS.workflowID, DBOS.stepID, value],
+    );
+  } finally {
+    await winner.end();
+  }
+}
+
+const regRaceFunction = dataSource.registerTransaction(raceFunction);
+
+async function raceWorkflow() {
+  return await regRaceFunction();
+}
+
+const regRaceWorkflow = DBOS.registerWorkflow(raceWorkflow);
+
 async function readFunction(user: string) {
   const row = await dataSource.client
     .selectFrom('greetings')
@@ -362,6 +480,95 @@ async function readFunction(user: string) {
 
 const regInsertFunction = dataSource.registerTransaction(insertFunction);
 const regErrorFunction = dataSource.registerTransaction(errorFunction);
+
+const sysConfig = { ...config.connection, database: 'kysely_ds_test_dbos_sys' };
+
+/** Set the workflow's ownership token, returning the one it replaced. */
+async function setOwner(workflowID: string, ownerXid: string | null): Promise<string | null> {
+  const sysDB = new Client(sysConfig);
+  try {
+    await sysDB.connect();
+    const { rows } = await sysDB.query<{ owner_xid: string | null }>(
+      'SELECT owner_xid FROM dbos.workflow_status WHERE workflow_uuid = $1',
+      [workflowID],
+    );
+    await sysDB.query('UPDATE dbos.workflow_status SET owner_xid = $2 WHERE workflow_uuid = $1', [
+      workflowID,
+      ownerXid,
+    ]);
+    return rows[0].owner_xid;
+  } finally {
+    await sysDB.end();
+  }
+}
+
+/** The checkpoints this data source holds for the workflow, read on a connection of their own. */
+async function readCompletions(workflowID: string): Promise<transaction_completion[]> {
+  const client = new Client(config.connection);
+  try {
+    await client.connect();
+    const { rows } = await client.query<transaction_completion>(
+      'SELECT * FROM dbos.transaction_completion WHERE workflow_id = $1 ORDER BY function_num',
+      [workflowID],
+    );
+    return rows;
+  } finally {
+    await client.end();
+  }
+}
+
+const probeState = { rows: [] as transaction_completion[] };
+
+// Reads back the checkpoints its transactions wrote, before completion clears them.
+async function checkpointProbeWorkflow(user: string) {
+  await regInsertFunction(user);
+  const error = await regErrorFunction(user).then(
+    () => undefined,
+    (e: Error) => e,
+  );
+  probeState.rows = await readCompletions(DBOS.workflowID!);
+  return error?.message;
+}
+
+const regCheckpointProbeWorkflow = DBOS.registerWorkflow(checkpointProbeWorkflow);
+
+const staleState = { originalOwner: null as string | null, completionsAtConflict: -1 };
+
+// Another execution claims the workflow while this transaction is still open.
+async function staleFunction() {
+  await sql`INSERT INTO race_side_effects(tag) VALUES ('stale')`.execute(dataSource.client);
+  staleState.originalOwner = await setOwner(DBOS.workflowID!, 'another-execution');
+  return 'stale';
+}
+
+const regStaleFunction = dataSource.registerTransaction(staleFunction);
+
+async function staleWorkflow() {
+  try {
+    return await regStaleFunction();
+  } catch (e) {
+    if (!(e instanceof DBOSWorkflowConflictError)) throw e;
+    // Read before completion clears it: the conflict must not have been recorded as the step's outcome.
+    staleState.completionsAtConflict = (await readCompletions(DBOS.workflowID!)).length;
+    // A real duplicate parks here instead; reclaimed so this execution's outcome lands.
+    await setOwner(DBOS.workflowID!, staleState.originalOwner);
+    return 'conflicted';
+  }
+}
+
+const regStaleWorkflow = DBOS.registerWorkflow(staleWorkflow);
+
+const handOffState = { signal: () => {} };
+
+// Loses the workflow after its transaction, so its completion is a stale execution's.
+async function handOffWorkflow(user: string) {
+  const result = await regInsertFunction(user);
+  await setOwner(DBOS.workflowID!, 'another-execution');
+  handOffState.signal();
+  return result;
+}
+
+const regHandOffWorkflow = DBOS.registerWorkflow(handOffWorkflow);
 const regReadFunction = dataSource.registerTransaction(readFunction, { readOnly: true });
 
 class StaticClass {
@@ -478,11 +685,8 @@ describe('KyselyDataSourceCreateTxCompletion', () => {
       'SELECT * FROM dbos.transaction_completion WHERE workflow_id = $1',
       [workflowID],
     );
-    expect(rows.length).toBe(1);
-    expect(rows[0].workflow_id).toBe(workflowID);
-    expect(rows[0].function_num).toBe(0);
-    expect(rows[0].output).not.toBeNull();
-    expect(SuperJSON.parse(rows[0].output!)).toMatchObject({ user, greet_count: 1 });
+    // Completion cleared the checkpoint the transaction wrote.
+    expect(rows).toHaveLength(0);
   });
 });
 
@@ -495,7 +699,8 @@ describe('KyselyDataSourceWithCustomKysely', () => {
   });
 
   afterAll(async () => {
-    await DBOS.shutdown();
+    // Deregister so later suites don't re-initialize the datasource over the destroyed custom Kysely.
+    await DBOS.shutdown({ deregister: true });
     await userDB.end();
   });
 
@@ -543,12 +748,56 @@ describe('KyselyDataSourceWithCustomKysely', () => {
       'SELECT * FROM dbos.transaction_completion WHERE workflow_id = $1',
       [workflowID],
     );
-    expect(rows.length).toBe(1);
-    expect(rows[0].workflow_id).toBe(workflowID);
-    expect(rows[0].output).not.toBeNull();
-    expect(SuperJSON.parse(rows[0].output!)).toMatchObject({ user, greet_count: 1 });
+    // Completion cleared the checkpoint the transaction wrote.
+    expect(rows).toHaveLength(0);
 
     // Clean up the custom Kysely instance
     await customKysely.destroy();
+  });
+});
+
+describe('KyselyDataSource migrations', () => {
+  const userDB = new Pool(config.connection);
+
+  afterAll(async () => {
+    await userDB.end();
+  });
+
+  afterEach(async () => {
+    await DBOS.shutdown();
+  });
+
+  test('verify-only initialization requires the schema to be migrated out of band', async () => {
+    const suffix = randomUUID().replace(/-/g, '').slice(0, 8);
+    const schemaName = `ds_mig_${suffix}`;
+    const role = `ds_app_${suffix}`;
+    const admin = new Client({ ...config.connection, database: 'postgres' });
+    await admin.connect();
+    try {
+      await ensureDB(admin, config.connection.database);
+    } finally {
+      await admin.end();
+    }
+    await userDB.query(`CREATE ROLE "${role}"`);
+    try {
+      new KyselyDataSource(`verify-only-${suffix}`, config.connection, schemaName, { runMigrations: false });
+      DBOS.setConfig({ name: 'kysely-ds-test' });
+      await expect(DBOS.launch()).rejects.toThrow(/is at transaction schema version 0/);
+      await DBOS.shutdown();
+      const { rowCount } = await userDB.query('SELECT 1 FROM pg_namespace WHERE nspname = $1', [schemaName]);
+      expect(rowCount).toBe(0);
+
+      await KyselyDataSource.initializeDBOSSchema(config.connection, schemaName, { applicationRole: role });
+      await DBOS.launch();
+      const { rows } = await userDB.query<{ allowed: boolean }>(
+        `SELECT has_table_privilege($1, $2, 'INSERT') AS allowed`,
+        [role, `"${schemaName}".transaction_completion`],
+      );
+      expect(rows).toEqual([{ allowed: true }]);
+    } finally {
+      await userDB.query(`DROP SCHEMA IF EXISTS "${schemaName}" CASCADE`);
+      await userDB.query(`DROP OWNED BY "${role}"`);
+      await userDB.query(`DROP ROLE "${role}"`);
+    }
   });
 });

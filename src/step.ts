@@ -1,5 +1,8 @@
+import { DBOSError } from './error';
+
 /**
  * Configuration options for a `DBOS.step` function
+ * These apply when a workflow hosts the step; called outside a workflow, a step is an ordinary function call
  */
 export interface StepConfig {
   /** If `true`, the step will be retried if it throws an exception (default false) */
@@ -12,6 +15,24 @@ export interface StepConfig {
   backoffRate?: number;
   /** If `retriesAllowed` is true: called after a step throws to decide whether to retry that error. Defaults to retrying every error. */
   shouldRetry?: (error: unknown) => boolean | Promise<boolean>;
+  /**
+   * Maximum duration in milliseconds of a single attempt of this step.
+   * An attempt exceeding this fails with `DBOSStepTimeoutError`; if `retriesAllowed` is true, it is retried like any other failure.
+   * While an attempt runs, `DBOS.stepStatus.timeoutSignal` fires when the timeout expires so the step can cancel its underlying operation.
+   * Independently of any timeout, `DBOS.stepStatus.cancelSignal` fires if the step's workflow is cancelled.
+   * Note the attempt's code is not forcibly terminated: code that does not observe the signal keeps running in the background and its result is discarded.
+   */
+  timeoutMS?: number;
   /** If specified, override step function name */
   name?: string;
+}
+
+/** Validate a step configuration, throwing `DBOSError` if it is invalid. */
+export function validateStepConfig(config: StepConfig, stepName: string): void {
+  const timeoutMS = config.timeoutMS;
+  if (timeoutMS !== undefined && (typeof timeoutMS !== 'number' || !Number.isFinite(timeoutMS) || timeoutMS <= 0)) {
+    throw new DBOSError(
+      `Invalid timeoutMS (${timeoutMS}) in configuration of step ${stepName}: must be a positive number`,
+    );
+  }
 }

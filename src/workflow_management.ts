@@ -1,23 +1,28 @@
-import type { SystemDatabase, WorkflowStatusInternal } from './system_database';
+import type { ShardKeyColumns, SystemDatabase, WorkflowStatusInternal } from './system_database';
 import type { StepInfo, WorkflowStatus, GetWorkflowsInput, ListWorkflowStepsOptions } from './workflow';
+import { isWorkflowActive } from './workflow';
+import type { DataSourceTransactionHandler } from './datasource';
+import { DBOSError, DBOSNonExistentWorkflowError, DBOSWorkflowConflictError } from './error';
 import { DBOSSerializer, safeParse, safeParseError, safeParsePositionalArgs } from './serialization';
 import { randomUUID } from 'node:crypto';
+import type { GlobalLogger } from './telemetry/logs';
+import { globalParams } from './utils';
 
 export async function listWorkflows(sysdb: SystemDatabase, input: GetWorkflowsInput): Promise<WorkflowStatus[]> {
   const workflows = await sysdb.listWorkflows(input);
-  return await Promise.all(workflows.map((wf) => toWorkflowStatus(wf, sysdb.getSerializer())));
+  return await Promise.all(workflows.map((wf) => toWorkflowStatus(wf, sysdb.serializer)));
 }
 
 export async function listQueuedWorkflows(sysdb: SystemDatabase, input: GetWorkflowsInput) {
   input.queuesOnly = true;
   input.loadOutput = false;
   const workflows = await sysdb.listWorkflows(input);
-  return await Promise.all(workflows.map((wf) => toWorkflowStatus(wf, sysdb.getSerializer())));
+  return await Promise.all(workflows.map((wf) => toWorkflowStatus(wf, sysdb.serializer)));
 }
 
 export async function getWorkflow(sysdb: SystemDatabase, workflowID: string): Promise<WorkflowStatus | undefined> {
   const status = await sysdb.getWorkflowStatus(workflowID);
-  return status ? await toWorkflowStatus(status, sysdb.getSerializer()) : undefined;
+  return status ? await toWorkflowStatus(status, sysdb.serializer) : undefined;
 }
 
 export async function listWorkflowSteps(
@@ -31,19 +36,18 @@ export async function listWorkflowSteps(
     return undefined;
   }
 
-  const $steps = await sysdb.getAllOperationResults(workflowID, options?.limit, options?.offset);
+  const $steps = await sysdb.getAllOperationResults(workflowID, options?.limit, options?.offset, loadOutput);
 
   const steps: StepInfo[] = await Promise.all(
     $steps.map(async (step) => ({
       functionID: step.function_id,
       name: step.function_name ?? '',
-      output:
-        loadOutput && step.output ? await safeParse(sysdb.getSerializer(), step.output, step.serialization) : null,
-      error:
-        loadOutput && step.error ? await safeParseError(sysdb.getSerializer(), step.error, step.serialization) : null,
+      output: loadOutput && step.output ? await safeParse(sysdb.serializer, step.output, step.serialization) : null,
+      error: loadOutput && step.error ? await safeParseError(sysdb.serializer, step.error, step.serialization) : null,
       childWorkflowID: step.child_workflow_id,
-      startedAtEpochMs: step.started_at_epoch_ms,
-      completedAtEpochMs: step.completed_at_epoch_ms,
+      childShardKey: (step as ShardKeyColumns).child_shard_key ?? undefined,
+      startedAtEpochMs: step.started_at_epoch_ms ? Number(step.started_at_epoch_ms) : undefined,
+      completedAtEpochMs: step.completed_at_epoch_ms ? Number(step.completed_at_epoch_ms) : undefined,
     })),
   );
 
@@ -68,6 +72,97 @@ export async function forkWorkflow(
   return newWorkflowID;
 }
 
+/**
+ * Refuse to touch a data source's checkpoints for a workflow that is missing or still
+ * running. The system database rewind repeats this check under its own transaction;
+ * this one only keeps a running workflow's checkpoints intact.
+ */
+async function checkRewindable(sysdb: SystemDatabase, workflowID: string): Promise<void> {
+  const status = await sysdb.getWorkflowStatus(workflowID);
+  if (status === null) {
+    throw new DBOSNonExistentWorkflowError(`Workflow ${workflowID} does not exist`);
+  }
+  if (isWorkflowActive(status.status)) {
+    throw new DBOSError(
+      `Cannot rewind ${workflowID} (${status.status}): only a workflow in a terminal state can be rewound, so cancel it first`,
+    );
+  }
+}
+
+/**
+ * Drop the data sources' checkpoints from `startStep` on, then rewind the workflow in
+ * the system database.
+ *
+ * Best effort: if a step fails the workflow is left as it was and the rewind can be
+ * retried, which is safe because the deletes are idempotent and the system database is
+ * only touched last. A data source that keeps no checkpoints of its own does not
+ * implement `deleteCheckpoints` and is skipped.
+ */
+export async function rewindWorkflow(
+  sysdb: SystemDatabase,
+  dataSources: readonly DataSourceTransactionHandler[],
+  workflowID: string,
+  startStep: number,
+  options: {
+    applicationVersion?: string;
+    queueName?: string;
+    queuePartitionKey?: string;
+  } = {},
+): Promise<void> {
+  if (startStep < 0) {
+    throw new DBOSError(`startStep must be >= 0, got ${startStep}`);
+  }
+  const withCheckpoints = keepingCheckpoints(dataSources);
+  // Deleting a running workflow's checkpoints would pull them out from under the
+  // execution that still owns them, so establish the workflow is rewindable before
+  // touching anything the system database rewind will not re-check for us.
+  if (withCheckpoints.length > 0) {
+    await checkRewindable(sysdb, workflowID);
+  }
+  for (const ds of withCheckpoints) {
+    await ds.deleteCheckpoints!(workflowID, startStep);
+  }
+  await sysdb.rewindWorkflow(workflowID, startStep, options);
+}
+
+/** The data sources that keep checkpoints of their own; the others do not implement `deleteCheckpoints`. */
+function keepingCheckpoints(dataSources: readonly DataSourceTransactionHandler[]) {
+  return dataSources.filter((ds) => ds.deleteCheckpoints !== undefined);
+}
+
+/**
+ * Drop a finishing workflow's data source checkpoints, which its step checkpoints now cover,
+ * committing each delete only while `ownerXid` still owns the workflow.
+ *
+ * Best effort: a leftover checkpoint is harmless, so a failure only warns and the other
+ * data sources are still cleared. Once another execution owns the workflow, the
+ * checkpoints are its own and the rest are left alone.
+ */
+export async function deleteCompletedDataSourceCheckpoints(
+  sysdb: SystemDatabase,
+  dataSources: Iterable<DataSourceTransactionHandler>,
+  workflowID: string,
+  ownerXid: string,
+  logger: GlobalLogger,
+): Promise<void> {
+  // Runs after the delete, so every row it removed predates any later owner's.
+  const stillOwner = async () => {
+    if ((await sysdb.getWorkflowOwner(workflowID)) !== ownerXid) {
+      throw new DBOSWorkflowConflictError(workflowID);
+    }
+  };
+  for (const ds of keepingCheckpoints([...dataSources])) {
+    try {
+      await ds.deleteCheckpoints!(workflowID, 0, stillOwner);
+    } catch (e) {
+      if (e instanceof DBOSWorkflowConflictError) return;
+      logger.warn(
+        `Failed to delete data source ${ds.name} checkpoints of workflow ${workflowID}: ${(e as Error).message}`,
+      );
+    }
+  }
+}
+
 export async function toWorkflowStatus(
   internal: WorkflowStatusInternal,
   serializer: DBOSSerializer,
@@ -90,12 +185,10 @@ export async function toWorkflowStatus(
     output: internal.output ? await safeParse(serializer, internal.output ?? null, internal.serialization) : undefined,
     error: internal.error ? await safeParseError(serializer, internal.error, internal.serialization) : undefined,
 
-    request: internal.request,
     executorId: internal.executorId,
     applicationVersion: internal.applicationVersion,
-    applicationID: internal.applicationID,
     recoveryAttempts: internal.recoveryAttempts,
-    createdAt: internal.createdAt,
+    createdAt: internal.createdAt!,
     updatedAt: internal.updatedAt,
     timeoutMS: internal.timeoutMS,
     deadlineEpochMS: internal.deadlineEpochMS,
@@ -108,18 +201,142 @@ export async function toWorkflowStatus(
     parentWorkflowID: internal.parentWorkflowID,
     delayUntilEpochMS: internal.delayUntilEpochMS,
     completedAt: internal.completedAt,
+    attributes: internal.attributes,
+    scheduleName: internal.scheduleName,
+    applicationName: internal.applicationName,
+    shardKey: internal.shardKey,
+    parentShardKey: internal.parentShardKey,
   };
 }
 
-export async function globalTimeout(sysdb: SystemDatabase, cutoffEpochTimestampMs: number): Promise<void> {
-  const cutoffIso = new Date(cutoffEpochTimestampMs).toISOString();
-  for (const workflow of await listWorkflows(sysdb, { status: 'PENDING', endTime: cutoffIso })) {
-    await sysdb.cancelWorkflows([workflow.workflowID]);
+export const workflowTimeoutConfig = {
+  /** How often one of an application's processes runs its background jobs. */
+  pollingIntervalMs: 1000,
+  /** How long a holder keeps one lock transaction before retaking the lock: a peer can win it then. */
+  holdMs: 60_000,
+  /** Most workflows one sweep transaction cancels; a full batch sweeps again at once. */
+  batchSize: 1000,
+};
+
+/** Whether this process holds the background-jobs lock, kept until its loop fails to retake it, as two holders only duplicate work. */
+export class BackgroundLease {
+  #held = false;
+
+  renew(): void {
+    this.#held = true;
   }
-  for (const workflow of await listWorkflows(sysdb, { status: 'ENQUEUED', endTime: cutoffIso })) {
-    await sysdb.cancelWorkflows([workflow.workflowID]);
+
+  lose(): void {
+    this.#held = false;
   }
-  for (const workflow of await listWorkflows(sysdb, { status: 'DELAYED', endTime: cutoffIso })) {
-    await sysdb.cancelWorkflows([workflow.workflowID]);
+
+  held(): boolean {
+    return this.#held;
   }
+}
+
+export function waitOrAbort(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) return resolve();
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/** Run `jobs` once per interval in whichever of this application's processes holds their lock, holding it up to `holdMs` before retaking it, until aborted. */
+export async function runBackgroundJobs(
+  sysdb: SystemDatabase,
+  logger: GlobalLogger,
+  signal: AbortSignal,
+  lockName: string,
+  intervalMs: number,
+  jobs: Record<string, () => Promise<void>>,
+  lease?: BackgroundLease,
+  holdMs: number = workflowTimeoutConfig.holdMs,
+): Promise<void> {
+  try {
+    while (!signal.aborted) {
+      let held = false;
+      try {
+        await sysdb.backgroundJobLock(lockName, async (renew) => {
+          if (renew === undefined) {
+            lease?.lose();
+            return;
+          }
+          lease?.renew();
+          const holdUntil = performance.now() + holdMs;
+          while (true) {
+            // Timed from the pass's start, so slow jobs can't shorten the interval.
+            const started = performance.now();
+            for (const [jobName, job] of Object.entries(jobs)) {
+              try {
+                await job();
+              } catch (e) {
+                logger.warn(`Exception in background job ${jobName}: ${(e as Error).message}`);
+              }
+            }
+            await waitOrAbort(Math.max(0, intervalMs - (performance.now() - started)), signal);
+            if (signal.aborted || performance.now() >= holdUntil) break;
+            // In place, so the lock is never free mid-hold.
+            await renew();
+          }
+          held = true;
+        });
+      } catch (e) {
+        lease?.lose();
+        logger.warn(`Exception taking the ${lockName} lock: ${(e as Error).message}`);
+      }
+      // The holder tries again at once and so keeps the jobs; the rest poll for them.
+      const wait = held ? 0 : intervalMs * (0.9 + Math.random() * 0.2);
+      await waitOrAbort(wait, signal);
+    }
+  } finally {
+    lease?.lose();
+  }
+}
+
+/**
+ * Enqueue DELAYED workflows whose delay expired and cancel those past their deadline, until `signal` aborts.
+ * In suspend mode, also re-enqueue the SUSPENDED workflows whose wake time has come.
+ */
+export async function backgroundJobsLoop(
+  sysdb: SystemDatabase,
+  logger: GlobalLogger,
+  signal: AbortSignal,
+  lease?: BackgroundLease,
+): Promise<void> {
+  const sweep = async () => {
+    while (!signal.aborted) {
+      const cancelled = await sysdb.cancelTimedOutWorkflows(workflowTimeoutConfig.batchSize);
+      for (const workflowID of cancelled) {
+        logger.debug(`Cancelled workflow ${workflowID}: timed out`);
+      }
+      if (cancelled.length < workflowTimeoutConfig.batchSize) break;
+    }
+  };
+  const jobs: Record<string, () => Promise<void>> = {
+    delayed_workflows: () => sysdb.transitionDelayedWorkflows(),
+    workflow_timeout: sweep,
+  };
+  const suspend = sysdb.suspend;
+  if (suspend !== undefined) {
+    jobs.suspended_workflows = () => suspend.transitionSuspendedWorkflows();
+  }
+  await runBackgroundJobs(
+    sysdb,
+    logger,
+    signal,
+    // One holder per application version, so the latest code always runs them; they tolerate overlap.
+    `background_jobs.${globalParams.appVersion}`,
+    workflowTimeoutConfig.pollingIntervalMs,
+    jobs,
+    lease,
+  );
 }

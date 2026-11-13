@@ -1,16 +1,25 @@
 import { DBOSContextualLogger } from './telemetry/logs';
-import { IncomingHttpHeaders } from 'http';
-import { ParsedUrlQuery } from 'querystring';
 import { AsyncLocalStorage } from 'async_hooks';
-import { DBOSInvalidWorkflowTransitionError } from './error';
-import Koa from 'koa';
+import { DBOSError, DBOSInvalidWorkflowTransitionError } from './error';
 import { DBOSExecutor } from './dbos-executor';
 import { WorkflowSerializationFormat } from './workflow';
+import type { DataSourceTransactionHandler } from './datasource';
 
 export interface StepStatus {
   stepID: number;
   currentAttempt?: number;
   maxAttempts?: number;
+  /**
+   * If the step is configured with `timeoutMS`: fires when the current attempt's timeout expires,
+   * so the step can cancel its underlying operation. A fresh signal is issued for each retry attempt.
+   */
+  timeoutSignal?: AbortSignal;
+  /**
+   * Fires when the step's workflow is cancelled, so the step can cancel its underlying operation.
+   * Cancellation is detected by polling, so the signal fires within about a second of the cancel.
+   * All attempts of the step share one signal; if it fires and the workflow is then resumed, later attempts get a fresh one.
+   */
+  readonly cancelSignal: AbortSignal;
 }
 
 export interface DBOSContextOptions {
@@ -20,40 +29,70 @@ export interface DBOSContextOptions {
   authenticatedUser?: string;
   authenticatedRoles?: string[];
   assumedRole?: string;
-  request?: object;
-  operationType?: string; // A custom helper for users to set a operation type of their choice. Intended for functions setting a pctx to run DBOS operations from.
-  operationCaller?: string; // This is made to pass through the operationName to DBOS contexts, and potentially the caller span name.
   workflowTimeoutMS?: number | null;
   serializationType?: WorkflowSerializationFormat;
+  // Shard key for the workflows started from this context, set by DBOS.withShardKey.
+  shardKeyForNextWorkflow?: string;
 }
 
 export interface DBOSLocalCtx extends DBOSContextOptions {
-  parentCtx?: DBOSLocalCtx;
   workflowId?: string;
+  shardKey?: string; // Shard key of the running workflow; undefined on an unsharded database
   curWFFunctionId?: number; // If currently in a WF, the current call number / ID
-  presetID?: boolean;
+  activeStreamReads?: number; // Checkpointed stream reads that have reserved a step but not yet recorded it
   deadlineEpochMS?: number;
-  inRecovery?: boolean;
   curStepFunctionId?: number; // If currently in a step, its function ID
   stepStatus?: StepStatus; // If currently in a step, its public status object
   curTxFunctionId?: number; // If currently in a tx, its function ID
-  koaContext?: Koa.Context;
+  ownerXid?: string; // Token this execution wrote to the row's owner_xid; checkpoints land only while it still matches
+  usedDataSources?: Set<DataSourceTransactionHandler>; // Data sources this workflow called; its checkpoints go when it completes
 }
 
-function isWithinWorkflowCtx(ctx: DBOSLocalCtx) {
+/** The ownership token of the execution writing for `workflowID`, or undefined when there is nothing to check. */
+export function currentOwnerXid(workflowID: string): string | undefined {
+  const ctx = getCurrentContextStore();
+  if (ctx === undefined || ctx.workflowId !== workflowID) return undefined;
+  // Every execution path sets a token before its workflow runs; a context without one is a bug.
+  if (ctx.ownerXid === undefined) {
+    throw new DBOSError(`Workflow ${workflowID} is writing without an ownership token`);
+  }
+  return ctx.ownerXid;
+}
+
+/** A child's default ID: its parent's plus the call number, and the parent's key when the child's differs. */
+export function childWorkflowID(
+  parentID: string,
+  functionID: number,
+  parentKey: string | undefined,
+  childKey: string | undefined,
+): string {
+  const base = `${parentID}-${functionID}`;
+  if (parentKey === undefined || childKey === undefined || childKey === parentKey) {
+    return base;
+  }
+  return `${[...parentKey].length}:${parentKey}:${base}`;
+}
+
+/** The shard key the next workflow started from this context runs under, as set by DBOS.withShardKey. */
+export function nextWorkflowShardKey(ctx: DBOSLocalCtx | undefined): string | undefined {
+  return ctx?.shardKeyForNextWorkflow;
+}
+
+export function isWithinWorkflowCtx(ctx: DBOSLocalCtx) {
   if (ctx.workflowId === undefined) return false;
   return true;
 }
 
 function isInStepCtx(ctx: DBOSLocalCtx) {
   if (ctx.workflowId === undefined) return false;
-  if (ctx.curStepFunctionId) return true;
+  // A function ID of 0 is a step like any other, so test for absence rather than truthiness.
+  if (ctx.curStepFunctionId !== undefined) return true;
   return false;
 }
 
 function isInTxnCtx(ctx: DBOSLocalCtx) {
   if (ctx.workflowId === undefined) return false;
-  if (ctx.curTxFunctionId) return true;
+  if (ctx.curTxFunctionId !== undefined) return true;
   return false;
 }
 
@@ -68,6 +107,29 @@ const asyncLocalCtx = new AsyncLocalStorage<DBOSLocalCtx>();
 
 export function getCurrentContextStore(): DBOSLocalCtx | undefined {
   return asyncLocalCtx.getStore();
+}
+
+// Stop signal of the background DBOS loop (scheduler, queue runner) whose system database retries may be abandoned.
+const dbRetryAbortCtx = new AsyncLocalStorage<AbortSignal | undefined>();
+
+/** Run a background loop so its system database retries give up once `signal` aborts. Must never run user code. */
+export function runWithAbortableDbRetries<R>(signal: AbortSignal, callback: () => Promise<R>): Promise<R> {
+  return dbRetryAbortCtx.run(signal, callback);
+}
+
+/** Leave an abortable-retry scope, e.g. to launch a workflow from a background loop. */
+export function runWithoutAbortableDbRetries<R>(callback: () => Promise<R>): Promise<R> {
+  return dbRetryAbortCtx.run(undefined, callback);
+}
+
+/** The signal that may cut short the current system database retry, if any. */
+export function currentDbRetryAbortSignal(): AbortSignal | undefined {
+  const signal = dbRetryAbortCtx.getStore();
+  if (!signal) return undefined;
+  // Never inside a workflow: an abandoned retry's error would be recorded as the workflow's outcome.
+  const ctx = asyncLocalCtx.getStore();
+  if (ctx && isWithinWorkflowCtx(ctx)) return undefined;
+  return signal;
 }
 
 export function getNextWFID(assignedID?: string) {
@@ -86,6 +148,11 @@ export function getNextWFID(assignedID?: string) {
 export function functionIDGetIncrement(): number {
   const pctx = getCurrentContextStore();
   if (!pctx) throw new DBOSInvalidWorkflowTransitionError(`Attempt to get a call ID number outside of a workflow`);
+  return functionIDGetIncrementForCtx(pctx);
+}
+
+// Take the next call ID from a context held across awaits, where the ambient one may have moved on.
+export function functionIDGetIncrementForCtx(pctx: DBOSLocalCtx): number {
   if (!isInWorkflowCtx(pctx))
     throw new DBOSInvalidWorkflowTransitionError(
       `Attempt to get a call ID number in a workflow that is already in a call`,
@@ -118,7 +185,6 @@ export async function runWithParentContext<R>(
     {
       ...pctx,
       ...ctx,
-      parentCtx: pctx,
     },
     callback,
   );
@@ -131,7 +197,6 @@ export async function runWithDataSourceContext<R>(callnum: number, callback: () 
     {
       ...pctx,
       curTxFunctionId: callnum,
-      parentCtx: pctx,
       logger: DBOSExecutor.globalInstance!.ctxLogger,
     },
     callback,
@@ -141,18 +206,27 @@ export async function runWithDataSourceContext<R>(callnum: number, callback: () 
 export async function runInStepContext<R>(
   pctx: DBOSLocalCtx,
   stepID: number,
-  maxAttempts: number | undefined,
-  currentAttempt: number | undefined,
+  attempt: {
+    maxAttempts?: number;
+    currentAttempt?: number;
+    timeoutSignal?: AbortSignal;
+    getCancelSignal: () => AbortSignal;
+  },
   callback: () => Promise<R>,
 ) {
   // Check we are in a workflow context and not in a step / transaction already
   if (!pctx) throw new DBOSInvalidWorkflowTransitionError();
   if (!isInWorkflowCtx(pctx)) throw new DBOSInvalidWorkflowTransitionError();
 
+  const { maxAttempts, currentAttempt, timeoutSignal, getCancelSignal } = attempt;
   const stepStatus: StepStatus = {
     stepID: stepID,
     currentAttempt: currentAttempt,
     maxAttempts: currentAttempt ? maxAttempts : undefined,
+    timeoutSignal: timeoutSignal,
+    get cancelSignal() {
+      return getCancelSignal();
+    },
   };
 
   return await runWithParentContext(
@@ -160,28 +234,8 @@ export async function runInStepContext<R>(
     {
       stepStatus: stepStatus,
       curStepFunctionId: stepID,
-      parentCtx: pctx,
       logger: DBOSExecutor.globalInstance!.ctxLogger,
     },
     callback,
   );
-}
-
-/**
- * HTTPRequest includes useful information from http.IncomingMessage and parsed body,
- *   URL parameters, and parsed query string.
- * In essence, it is the serializable part of the request.
- */
-export interface HTTPRequest {
-  readonly headers?: IncomingHttpHeaders; // A node's http.IncomingHttpHeaders object.
-  readonly rawHeaders?: string[]; // Raw headers.
-  readonly params?: unknown; // Parsed path parameters from the URL.
-  readonly body?: unknown; // parsed HTTP body as an object.
-  readonly rawBody?: string; // Unparsed raw HTTP body string.
-  readonly query?: ParsedUrlQuery; // Parsed query string.
-  readonly querystring?: string; // Unparsed raw query string.
-  readonly url?: string; // Request URL.
-  readonly method?: string; // Request HTTP method.
-  readonly ip?: string; // Request remote address.
-  readonly requestID?: string; // Request ID. Gathered from headers or generated if missing.
 }

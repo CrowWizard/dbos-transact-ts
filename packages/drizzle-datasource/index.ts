@@ -1,17 +1,24 @@
 import { Client, ClientConfig, Pool, PoolClient, PoolConfig } from 'pg';
-import { DBOS, DBOSWorkflowConflictError, FunctionName } from '@dbos-inc/dbos-sdk';
+import { DBOS, FunctionName } from '@dbos-inc/dbos-sdk';
 import {
   type DataSourceTransactionHandler,
-  createTransactionCompletionSchemaPG,
-  createTransactionCompletionTablePG,
   isPGRetriableTransactionError,
-  isPGKeyConflictError,
+  DBOSError,
+  DBOSStepAlreadyRecordedError,
+  DBOSWorkflowConflictError,
+  assertStillOwnsWorkflow,
+  checkpointWorkflowID,
+  replayRecordedStep,
   registerTransaction,
   runTransaction,
   DBOSDataSource,
   registerDataSource,
-  CheckSchemaInstallationReturn,
-  checkSchemaInstallationPG,
+  DataSourceMigrationOptions,
+  DataSourceSQLExecutor,
+  initializeDataSourceSchemaPG,
+  migrateDataSourcePG,
+  verifyDataSourcePG,
+  guardDataSourcePoolPG,
 } from '@dbos-inc/dbos-sdk/datasource';
 import { drizzle, NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { AsyncLocalStorage } from 'async_hooks';
@@ -28,6 +35,14 @@ export type TransactionConfig = Pick<PgTransactionConfig, 'isolationLevel' | 'ac
 
 const asyncLocalCtx = new AsyncLocalStorage<DrizzleLocalCtx>();
 
+function drizzleExecutor(db: Pick<NodePgDatabase<{ [key: string]: object }>, 'execute'>): DataSourceSQLExecutor {
+  return async (text) => (await db.execute<Record<string, unknown>>(sql.raw(text))).rows;
+}
+
+function clientExecutor(client: Pick<Client, 'query'>): DataSourceSQLExecutor {
+  return async (text) => (await client.query<Record<string, unknown>>(text)).rows;
+}
+
 export interface transaction_completion {
   workflow_id: string;
   function_num: number;
@@ -41,7 +56,6 @@ interface DrizzleConnection {
 }
 
 class DrizzleTransactionHandler implements DataSourceTransactionHandler {
-  readonly dsType = 'drizzle';
   #connection: DrizzleConnection | undefined;
   readonly schemaName: string;
   readonly #userProvidedPool: boolean;
@@ -51,6 +65,7 @@ class DrizzleTransactionHandler implements DataSourceTransactionHandler {
     private readonly configOrPool: PoolConfig | Pool,
     private readonly entities: { [key: string]: object } = {},
     schemaName: string = 'dbos',
+    private readonly options: DataSourceMigrationOptions = {},
   ) {
     this.schemaName = schemaName;
     this.#userProvidedPool = configOrPool instanceof Pool;
@@ -60,34 +75,25 @@ class DrizzleTransactionHandler implements DataSourceTransactionHandler {
     const conn = this.#connection;
 
     const driver = this.configOrPool instanceof Pool ? this.configOrPool : new Pool(this.configOrPool);
-    const db = drizzle(driver, { schema: this.entities });
+    if (!this.#userProvidedPool) {
+      guardDataSourcePoolPG(driver, 'DrizzleDataSource');
+    }
+    const db = drizzle({ client: driver, schema: this.entities });
     this.#connection = { db, end: this.#userProvidedPool ? async () => {} : () => driver.end() };
     await conn?.end();
 
-    let installed = false;
-    try {
-      const res = (await db.execute(sql.raw(checkSchemaInstallationPG(this.schemaName)))) as unknown;
-      const row = Array.isArray(res)
-        ? (res as CheckSchemaInstallationReturn[])[0]
-        : ((res as { rows?: CheckSchemaInstallationReturn[] }).rows?.[0] ??
-          (res as CheckSchemaInstallationReturn[])[0]);
-      installed = !!row?.schema_exists && !!row?.table_exists;
-    } catch (e) {
-      throw new Error(
-        `In initialization of 'DrizzleDataSource' ${this.name}: Database could not be queried: ${(e as Error).message}`,
-      );
+    if (this.options.runMigrations === false) {
+      await verifyDataSourcePG(drizzleExecutor(db), this.schemaName, this.name);
+      return;
     }
 
-    if (!installed) {
-      try {
-        await db.execute(sql.raw(createTransactionCompletionSchemaPG(this.schemaName)));
-        await db.execute(sql.raw(createTransactionCompletionTablePG(this.schemaName)));
-      } catch (err) {
-        throw new Error(
-          `In initialization of 'DrizzleDataSource' ${this.name}: The '${this.schemaName}.transaction_completion' table does not exist, and could not be created.  This should be added to your database migrations.
+    try {
+      await db.transaction((tx) => migrateDataSourcePG(drizzleExecutor(tx), this.schemaName));
+    } catch (err) {
+      throw new Error(
+        `In initialization of 'DrizzleDataSource' ${this.name}: The '${this.schemaName}' transaction schema could not be migrated: ${(err as Error).message}. This should be added to your database migrations.
           See: https://docs.dbos.dev/typescript/tutorials/transaction-tutorial#installing-the-dbos-schema`,
-        );
-      }
+      );
     }
   }
 
@@ -106,6 +112,15 @@ class DrizzleTransactionHandler implements DataSourceTransactionHandler {
     return this.#connection.db;
   }
 
+  async deleteCheckpoints(workflowID: string, startStep: number, beforeCommit?: () => Promise<void>): Promise<void> {
+    await this.#drizzle.transaction(async (client) => {
+      await client.execute(sql`
+        DELETE FROM ${sql.identifier(this.schemaName)}.transaction_completion
+        WHERE workflow_id = ${checkpointWorkflowID(workflowID)} AND function_num >= ${startStep}`);
+      await beforeCommit?.();
+    });
+  }
+
   async #checkExecution(
     workflowID: string,
     stepID: number,
@@ -114,7 +129,7 @@ class DrizzleTransactionHandler implements DataSourceTransactionHandler {
 
     const statement = sql`
         SELECT output, error FROM ${sql.identifier(this.schemaName)}.transaction_completion
-        WHERE workflow_id = ${workflowID} AND function_num = ${stepID}`;
+        WHERE workflow_id = ${checkpointWorkflowID(workflowID)} AND function_num = ${stepID}`;
     const result = await this.#drizzle.execute<Result>(statement);
 
     if (result.rows.length !== 1) {
@@ -132,33 +147,40 @@ class DrizzleTransactionHandler implements DataSourceTransactionHandler {
     output: string,
     schemaName: string,
   ): Promise<void> {
-    try {
-      const statement = sql`
-        INSERT INTO ${sql.identifier(schemaName)}.transaction_completion (workflow_id, function_num, output) 
-        VALUES (${workflowID}, ${stepID}, ${output})`;
-      await client.execute(statement);
-    } catch (error) {
-      if (isPGKeyConflictError(error)) {
-        throw new DBOSWorkflowConflictError(workflowID);
-      } else {
-        throw error;
-      }
+    const statement = sql`
+      INSERT INTO ${sql.identifier(schemaName)}.transaction_completion (workflow_id, function_num, output)
+      VALUES (${checkpointWorkflowID(workflowID)}, ${stepID}, ${output})
+      ON CONFLICT (workflow_id, function_num) DO NOTHING
+      RETURNING workflow_id`;
+    const { rows } = await client.execute(statement);
+    if (rows.length === 0) {
+      throw new DBOSStepAlreadyRecordedError(workflowID, stepID);
     }
+    // Holding this step's row, so a later owner's insert waits on our commit.
+    await assertStillOwnsWorkflow(workflowID);
   }
 
   async #recordError(workflowID: string, stepID: number, error: string): Promise<void> {
-    try {
-      const statement = sql`
-        INSERT INTO ${sql.identifier(this.schemaName)}.transaction_completion (workflow_id, function_num, error) 
-        VALUES (${workflowID}, ${stepID}, ${error})`;
-      await this.#drizzle.execute(statement);
-    } catch (error) {
-      if (isPGKeyConflictError(error)) {
-        throw new DBOSWorkflowConflictError(workflowID);
-      } else {
-        throw error;
-      }
+    const statement = sql`
+      INSERT INTO ${sql.identifier(this.schemaName)}.transaction_completion (workflow_id, function_num, error)
+      VALUES (${checkpointWorkflowID(workflowID)}, ${stepID}, ${error})
+      ON CONFLICT (workflow_id, function_num) DO NOTHING
+      RETURNING workflow_id`;
+    const { rows } = await this.#drizzle.execute(statement);
+    if (rows.length === 0) {
+      throw new DBOSStepAlreadyRecordedError(workflowID, stepID);
     }
+  }
+
+  // A duplicate execution won the race, so its recorded outcome is the durable one.
+  async #replayConflictingStep<Return>(workflowID: string, stepID: number): Promise<Return> {
+    const recorded = await this.#checkExecution(workflowID, stepID);
+    if (recorded === undefined) {
+      throw new DBOSError(
+        `Step ${stepID} of workflow ${workflowID} conflicted with a concurrent execution, but no recorded outcome was found`,
+      );
+    }
+    return replayRecordedStep<Return>(recorded);
   }
 
   /* Invoke a transaction function, called by the framework */
@@ -186,12 +208,7 @@ class DrizzleTransactionHandler implements DataSourceTransactionHandler {
       // Check to see if this tx has already been executed
       const previousResult = saveResults ? await this.#checkExecution(workflowID, stepID!) : undefined;
       if (previousResult) {
-        DBOS.span?.setAttribute('cached', true);
-
-        if ('error' in previousResult) {
-          throw SuperJSON.parse(previousResult.error);
-        }
-        return (previousResult.output ? SuperJSON.parse(previousResult.output) : null) as Return;
+        return replayRecordedStep<Return>(previousResult);
       }
 
       try {
@@ -220,6 +237,11 @@ class DrizzleTransactionHandler implements DataSourceTransactionHandler {
 
         return result;
       } catch (error) {
+        if (saveResults && error instanceof DBOSStepAlreadyRecordedError) {
+          return await this.#replayConflictingStep<Return>(workflowID, stepID!);
+        }
+        // The new owner wins; recording an error here would replay it as this step's outcome.
+        if (error instanceof DBOSWorkflowConflictError) throw error;
         if (isPGRetriableTransactionError(error)) {
           DBOS.span?.addEvent('TXN SERIALIZATION FAILURE', { retryWaitMillis: retryWaitMS }, performance.now());
           // Retry serialization failures.
@@ -229,7 +251,14 @@ class DrizzleTransactionHandler implements DataSourceTransactionHandler {
         } else {
           if (saveResults) {
             const message = SuperJSON.stringify(error);
-            await this.#recordError(workflowID, stepID!, message);
+            try {
+              await this.#recordError(workflowID, stepID!, message);
+            } catch (recordError) {
+              if (recordError instanceof DBOSStepAlreadyRecordedError) {
+                return await this.#replayConflictingStep<Return>(workflowID, stepID!);
+              }
+              throw recordError;
+            }
           }
 
           throw error;
@@ -265,19 +294,30 @@ export class DrizzleDataSource<CT = NodePgDatabase<{ [key: string]: object }>>
     return DrizzleDataSource.#getClient(this.#provider) as CT;
   }
 
+  /**
+   * Create or migrate the DBOS transaction schema, typically with a privileged role,
+   * optionally granting `applicationRole` the minimal permissions to use it.
+   * A provided client runs the statements in its current transaction, if any; a config gets a fresh transaction.
+   */
   static async initializeDBOSSchema(
     configOrClient: ClientConfig | Client | PoolClient,
     schemaName: string = 'dbos',
+    options: { applicationRole?: string } = {},
   ): Promise<void> {
     if (typeof configOrClient === 'object' && 'query' in configOrClient) {
-      await configOrClient.query(createTransactionCompletionSchemaPG(schemaName));
-      await configOrClient.query(createTransactionCompletionTablePG(schemaName));
+      await initializeDataSourceSchemaPG(clientExecutor(configOrClient), schemaName, options.applicationRole);
     } else {
       const client = new Client(configOrClient);
       try {
         await client.connect();
-        await client.query(createTransactionCompletionSchemaPG(schemaName));
-        await client.query(createTransactionCompletionTablePG(schemaName));
+        await client.query('BEGIN');
+        try {
+          await initializeDataSourceSchemaPG(clientExecutor(client), schemaName, options.applicationRole);
+          await client.query('COMMIT');
+        } catch (err) {
+          await client.query('ROLLBACK');
+          throw err;
+        }
       } finally {
         await client.end();
       }
@@ -291,8 +331,9 @@ export class DrizzleDataSource<CT = NodePgDatabase<{ [key: string]: object }>>
     configOrPool: PoolConfig | Pool,
     entities: { [key: string]: object } = {},
     schemaName: string = 'dbos',
+    options: DataSourceMigrationOptions = {},
   ) {
-    this.#provider = new DrizzleTransactionHandler(name, configOrPool, entities, schemaName);
+    this.#provider = new DrizzleTransactionHandler(name, configOrPool, entities, schemaName, options);
     registerDataSource(this.#provider);
   }
 

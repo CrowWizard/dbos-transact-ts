@@ -1,14 +1,42 @@
-import { WorkflowHandle, DBOS, DBOSSerializer } from '../src/';
-import { generateDBOSTestConfig, setUpDBOSTestSysDb, Event } from './helpers';
+import { WorkflowHandle, DBOS, DBOSSerializer, DBOSClient } from '../src/';
+import {
+  generateDBOSTestConfig,
+  setUpDBOSTestSysDb,
+  Event,
+  retryUntilSuccess,
+  reexecuteWorkflowById,
+  describeUnlessSharded,
+  testUnlessSharded,
+  expectError,
+  usingSharding,
+} from './helpers';
 import { randomUUID } from 'node:crypto';
 import { StatusString } from '../src/workflow';
-import { DBOSConfig } from '../src/dbos-executor';
-import { Client, Pool } from 'pg';
-import { DBOSWorkflowCancelledError, DBOSAwaitedWorkflowCancelledError, DBOSInitializationError } from '../src/error';
+import { DBOSConfig, DBOSExecutor } from '../src/dbos-executor';
+import { Client, Pool, PoolClient } from 'pg';
+import {
+  DBOSError,
+  DBOSWorkflowCancelledError,
+  DBOSAwaitedWorkflowCancelledError,
+  DBOSInitializationError,
+} from '../src/error';
 import assert from 'node:assert';
-import { DBOSClient } from '../dist/src';
-import { dropPGDatabase, ensurePGDatabase } from '../src/database_utils';
-import { sleepConfig } from '../src/utils';
+import { deriveDatabaseUrl, dropPGDatabase, ensurePGDatabase, getDatabaseNameFromUrl } from '../src/database_utils';
+import { globalParams, sleepConfig, sleepms } from '../src/utils';
+import { getCurrentContextStore } from '../src/context';
+import { bindShardKeys, shardKeyScope } from '../src/shard_keys';
+import { buildEnqueueStatus } from '../src/enqueue_options';
+import { DBOSJSON } from '../src/serialization';
+import {
+  advisoryLockKey,
+  createSystemDatabase,
+  DBOS_FUNCNAME_GETSTATUS,
+  type SystemDatabase,
+} from '../src/system_database';
+import { BackgroundLease, backgroundJobsLoop, runBackgroundJobs } from '../src/workflow_management';
+import { GlobalLogger } from '../src/telemetry/logs';
+
+const silentDropLogger = { warn: () => {} };
 
 describe('dbos-tests', () => {
   let username: string;
@@ -25,7 +53,6 @@ describe('dbos-tests', () => {
 
   beforeEach(async () => {
     await DBOS.launch();
-    DBOSTestClass.cnt = 0;
   });
 
   afterEach(async () => {
@@ -61,13 +88,13 @@ describe('dbos-tests', () => {
   test('return-void', async () => {
     const workflowUUID = randomUUID();
     await DBOS.withNextWorkflowID(workflowUUID, async () => {
-      await DBOSTestClass.testVoidFunction();
+      await DBOSTestClass.testVoidWorkflow();
     });
     await DBOS.withNextWorkflowID(workflowUUID, async () => {
-      await expect(DBOSTestClass.testVoidFunction()).resolves.toBeFalsy();
+      await expect(DBOSTestClass.testVoidWorkflow()).resolves.toBeFalsy();
     });
     await DBOS.withNextWorkflowID(workflowUUID, async () => {
-      await expect(DBOSTestClass.testVoidFunction()).resolves.toBeFalsy();
+      await expect(DBOSTestClass.testVoidWorkflow()).resolves.toBeFalsy();
     });
   });
 
@@ -79,14 +106,6 @@ describe('dbos-tests', () => {
 
   test('abort-function', async () => {
     await expect(DBOSTestClass.testFailWorkflow('fail')).rejects.toThrow('fail');
-  });
-
-  test('simple-step', async () => {
-    const workflowUUID: string = randomUUID();
-    await DBOS.withNextWorkflowID(workflowUUID, async () => {
-      await expect(DBOSTestClass.testStep()).resolves.toBe(0);
-    });
-    await expect(DBOSTestClass.testStep()).resolves.toBe(1);
   });
 
   test('simple-workflow-notifications', async () => {
@@ -166,6 +185,11 @@ describe('dbos-tests', () => {
     static async sendFromStepIdemWF(dest: string, msg: string, key: string) {
       await SendIdempotencyTestClass.sendFromStepWithKey(dest, msg, key);
     }
+
+    @DBOS.workflow()
+    static async recvOneShort() {
+      return String(await DBOS.recv<string>(undefined, { timeoutSeconds: 3 }));
+    }
   }
 
   test('send-idempotency-key', async () => {
@@ -226,6 +250,23 @@ describe('dbos-tests', () => {
     expect(await handle4.getResult()).toBe('hello_step-null');
   });
 
+  test('send-idempotency-key-scoped-per-destination', async () => {
+    // An idempotency key is scoped per destination: the same key sent to two
+    // different workflows must deliver to both (matching Python and Go, where
+    // message_uuid is `${key}::${destinationID}`).
+    const destA = randomUUID();
+    const destB = randomUUID();
+    const handleA = await DBOS.startWorkflow(SendIdempotencyTestClass, { workflowID: destA }).recvOneShort();
+    const handleB = await DBOS.startWorkflow(SendIdempotencyTestClass, { workflowID: destB }).recvOneShort();
+
+    const key = randomUUID();
+    await DBOS.send(destA, 'to_A', undefined, key);
+    await DBOS.send(destB, 'to_B', undefined, key);
+
+    expect(await handleA.getResult()).toBe('to_A');
+    expect(await handleB.getResult()).toBe('to_B');
+  });
+
   test('simple-workflow-events', async () => {
     const handle: WorkflowHandle<number> = await DBOS.startWorkflow(DBOSTestClass).setEventWorkflow();
     const workflowUUID = handle.workflowID;
@@ -282,8 +323,8 @@ describe('dbos-tests', () => {
       workflowID: workflowUUID,
       status: StatusString.PENDING,
       workflowName: RetrieveWorkflowStatus.testStatusWorkflow.name,
+      input: [123, 'hello'],
     });
-    await expect(workflowHandle.getWorkflowInputs()).resolves.toMatchObject([123, 'hello']);
 
     // getResult with a timeout ... it'll time out.
     await expect(DBOS.getResult<string>(workflowUUID, 0.1)).resolves.toBeNull();
@@ -314,6 +355,40 @@ describe('dbos-tests', () => {
     });
   });
 
+  const sendDestinationWorkflow = DBOS.registerWorkflow(async () => Promise.resolve(), {
+    name: 'sendDestinationWorkflow',
+  });
+  const sendToMaybeMissingWorkflow = DBOS.registerWorkflow(
+    async (destinationID: string) => {
+      try {
+        await DBOS.send(destinationID, 'hello');
+      } catch {
+        return 'missing';
+      }
+      return 'sent';
+    },
+    { name: 'sendToMaybeMissingWorkflow' },
+  );
+
+  test('send-missing-destination-replays-recorded-error', async () => {
+    const destinationID = randomUUID();
+    const handle = await DBOS.startWorkflow(sendToMaybeMissingWorkflow)(destinationID);
+    await expect(handle.getResult()).resolves.toBe('missing');
+    const steps = await DBOS.listWorkflowSteps(handle.workflowID);
+    expect(steps?.map((s) => s.name)).toEqual(['DBOS.send']);
+    expect(steps![0].error?.message).toContain(destinationID);
+
+    // Once the destination exists, a replay still takes the recorded branch and delivers nothing.
+    await DBOS.withNextWorkflowID(destinationID, () => sendDestinationWorkflow());
+    const replayed = await reexecuteWorkflowById(handle.workflowID);
+    await expect(replayed.getResult()).resolves.toBe('missing');
+    const { rows } = await DBOSExecutor.globalInstance!.systemDatabase.pool.query(
+      'SELECT message_uuid FROM dbos.notifications WHERE destination_uuid = $1',
+      [destinationID],
+    );
+    expect(rows).toEqual([]);
+  });
+
   describe('workflow-timeout', () => {
     test('workflow-withWorkflowTimeout', async () => {
       const workflowID: string = randomUUID();
@@ -326,6 +401,27 @@ describe('dbos-tests', () => {
       });
       const status = await DBOS.getWorkflowStatus(workflowID);
       expect(status?.status).toBe(StatusString.CANCELLED);
+    });
+
+    test('nested-withWorkflowTimeout-restores-outer', async () => {
+      // Timeouts large enough that the quick workflows complete without cancelling;
+      // we only inspect the recorded timeoutMS. Regression test for nested `with*`
+      // restore: the inner block must not leak its value to the outer scope.
+      const innerID = randomUUID();
+      const afterID = randomUUID();
+      await DBOS.withWorkflowTimeout(30000, async () => {
+        await DBOS.withWorkflowTimeout(5000, async () => {
+          await DBOS.startWorkflow(DBOSTimeoutTestClass, { workflowID: innerID })
+            .sleepingWorkflow(10)
+            .then((h) => h.getResult());
+        });
+        // The outer 30000ms timeout must be restored here, not the inner 5000ms.
+        await DBOS.startWorkflow(DBOSTimeoutTestClass, { workflowID: afterID })
+          .sleepingWorkflow(10)
+          .then((h) => h.getResult());
+      });
+      expect((await DBOS.getWorkflowStatus(innerID))?.timeoutMS).toBe(5000);
+      expect((await DBOS.getWorkflowStatus(afterID))?.timeoutMS).toBe(30000);
     });
 
     test('workflow-timeout-startWorkflow-params', async () => {
@@ -348,6 +444,11 @@ describe('dbos-tests', () => {
       });
       const status = await DBOS.getWorkflowStatus(workflowID);
       expect(status?.status).toBe(StatusString.CANCELLED);
+      // The child is cancelled by its own inherited deadline, independently of the parent.
+      // Wait for it to settle before reading its status to avoid a race with that cancellation.
+      await expect(DBOS.retrieveWorkflow(childID).getResult()).rejects.toThrow(
+        new DBOSAwaitedWorkflowCancelledError(childID),
+      );
       const childStatus = await DBOS.getWorkflowStatus(childID);
       expect(childStatus?.status).toBe(StatusString.CANCELLED);
       expect(status?.deadlineEpochMS).toBe(childStatus?.deadlineEpochMS);
@@ -363,6 +464,11 @@ describe('dbos-tests', () => {
       await expect(handle.getResult()).rejects.toThrow(new DBOSWorkflowCancelledError(workflowID));
       const status = await DBOS.getWorkflowStatus(workflowID);
       expect(status?.status).toBe(StatusString.CANCELLED);
+      // The child is cancelled by its own inherited deadline, independently of the parent.
+      // Wait for it to settle before reading its status to avoid a race with that cancellation.
+      await expect(DBOS.retrieveWorkflow(childID).getResult()).rejects.toThrow(
+        new DBOSAwaitedWorkflowCancelledError(childID),
+      );
       const childStatus = await DBOS.getWorkflowStatus(childID);
       expect(childStatus?.status).toBe(StatusString.CANCELLED);
       expect(status?.deadlineEpochMS).toBe(childStatus?.deadlineEpochMS);
@@ -380,6 +486,11 @@ describe('dbos-tests', () => {
       });
       const status = await DBOS.getWorkflowStatus(workflowID);
       expect(status?.status).toBe(StatusString.CANCELLED);
+      // The child is cancelled by its own inherited deadline, independently of the parent.
+      // Wait for it to settle before reading its status to avoid a race with that cancellation.
+      await expect(DBOS.retrieveWorkflow(childID).getResult()).rejects.toThrow(
+        new DBOSAwaitedWorkflowCancelledError(childID),
+      );
       const childStatus = await DBOS.getWorkflowStatus(childID);
       expect(childStatus?.status).toBe(StatusString.CANCELLED);
       expect(status?.deadlineEpochMS).toBe(childStatus?.deadlineEpochMS);
@@ -395,6 +506,11 @@ describe('dbos-tests', () => {
       await expect(handle.getResult()).rejects.toThrow(new DBOSWorkflowCancelledError(workflowID));
       const status = await DBOS.getWorkflowStatus(workflowID);
       expect(status?.status).toBe(StatusString.CANCELLED);
+      // The child is cancelled by its own inherited deadline, independently of the parent.
+      // Wait for it to settle before reading its status to avoid a race with that cancellation.
+      await expect(DBOS.retrieveWorkflow(childID).getResult()).rejects.toThrow(
+        new DBOSAwaitedWorkflowCancelledError(childID),
+      );
       const childStatus = await DBOS.getWorkflowStatus(childID);
       expect(childStatus?.status).toBe(StatusString.CANCELLED);
       expect(status?.deadlineEpochMS).toBe(childStatus?.deadlineEpochMS);
@@ -437,6 +553,10 @@ describe('dbos-tests', () => {
       await expect(handle.getResult()).rejects.toThrow(new DBOSWorkflowCancelledError(workflowID));
       const status = await DBOS.getWorkflowStatus(workflowID);
       expect(status?.status).toBe(StatusString.CANCELLED);
+      // A parent cancelled before it awaits its child stops waiting for it, so let the child's own deadline settle it.
+      await expect(DBOS.retrieveWorkflow(childID).getResult()).rejects.toThrow(
+        new DBOSAwaitedWorkflowCancelledError(childID),
+      );
       const childStatus = await DBOS.getWorkflowStatus(childID);
       expect(childStatus?.status).toBe(StatusString.CANCELLED);
       expect(childStatus?.deadlineEpochMS).toBeGreaterThan(status?.deadlineEpochMS as number);
@@ -468,7 +588,7 @@ describe('dbos-tests', () => {
       const handle = await DBOS.startWorkflow(DBOSTimeoutTestClass, {
         workflowID,
         timeoutMS: 100,
-      }).timeoutParentStartDetachedChild(100);
+      }).timeoutParentStartDetachedChild(500);
       await expect(handle.getResult()).rejects.toThrow(new DBOSWorkflowCancelledError(workflowID));
       await expect(handle.getStatus()).resolves.toMatchObject({
         status: StatusString.CANCELLED,
@@ -486,7 +606,7 @@ describe('dbos-tests', () => {
       const handle = await DBOS.startWorkflow(DBOSTimeoutTestClass, {
         workflowID,
         timeoutMS: 100,
-      }).timeoutParentStartDetachedChildWithSyntax(100);
+      }).timeoutParentStartDetachedChildWithSyntax(500);
       await expect(handle.getResult()).rejects.toThrow(new DBOSWorkflowCancelledError(workflowID));
       await expect(handle.getStatus()).resolves.toMatchObject({
         status: StatusString.CANCELLED,
@@ -496,6 +616,87 @@ describe('dbos-tests', () => {
       await expect(childHandle.getStatus()).resolves.toMatchObject({
         status: StatusString.SUCCESS,
       });
+    });
+
+    test('timeout-sweep-cancels-unowned-workflows', async () => {
+      // The sweep cancels every expired active workflow of this application, whether or not a
+      // local run holds it, and leaves other applications' workflows alone.
+      const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+      const appName = sysdb.appName;
+      assert(appName);
+      const [ownID, unclaimedID, otherAppID, unexpiredID, enqueuedID, delayedID] = Array.from({ length: 6 }, () =>
+        randomUUID(),
+      );
+      const ids = [ownID, unclaimedID, otherAppID, unexpiredID, enqueuedID, delayedID];
+      for (const id of ids) {
+        await DBOS.startWorkflow(DBOSTestClass, { workflowID: id })
+          .noopWorkflow()
+          .then((h) => h.getResult());
+      }
+
+      // A sweep that throws must not end the loop: the rows below still get cancelled.
+      const sweep = jest.spyOn(sysdb, 'cancelTimedOutWorkflows').mockRejectedValueOnce(new Error('injected failure'));
+      try {
+        // Rewrite the finished rows into active workflows of a dead executor. The enqueued and
+        // delayed rows sit on a queue no worker polls, so only the sweep can touch them.
+        const past = Date.now() - 1000;
+        const hourAhead = past + 3_600_000;
+        const rows: [string, string, string | null, number, string | null, number | null][] = [
+          [ownID, StatusString.PENDING, appName, past, null, null],
+          [unclaimedID, StatusString.PENDING, null, past, null, null],
+          [otherAppID, StatusString.PENDING, `${appName}-other`, past, null, null],
+          [unexpiredID, StatusString.PENDING, appName, hourAhead, null, null],
+          [enqueuedID, StatusString.ENQUEUED, appName, past, 'unpolled-queue', null],
+          [delayedID, StatusString.DELAYED, appName, past, 'unpolled-queue', hourAhead],
+        ];
+        for (const [id, status, owner, deadline, queue, delay] of rows) {
+          await sysdb.pool.query(
+            `UPDATE "${sysdb.schemaName}".workflow_status
+             SET status = $2, executor_id = 'dead-executor', application_name = $3,
+                 workflow_deadline_epoch_ms = $4, queue_name = $5, delay_until_epoch_ms = $6
+             WHERE workflow_uuid = $1`,
+            [id, status, owner, deadline, queue, delay],
+          );
+        }
+
+        const read = async () => {
+          const { rows } = await sysdb.pool.query<{ workflow_uuid: string; status: string; queue_name: string | null }>(
+            `SELECT workflow_uuid, status, queue_name FROM "${sysdb.schemaName}".workflow_status
+             WHERE workflow_uuid = ANY($1)`,
+            [ids],
+          );
+          return new Map(rows.map((r) => [r.workflow_uuid, r]));
+        };
+        await retryUntilSuccess(async () => {
+          const current = await read();
+          for (const id of [ownID, unclaimedID, enqueuedID, delayedID]) {
+            expect(current.get(id)?.status).toBe(StatusString.CANCELLED);
+          }
+        });
+        await expect(sweep.mock.results[0].value).rejects.toThrow('injected failure');
+        const current = await read();
+        expect(current.get(otherAppID)?.status).toBe(StatusString.PENDING);
+        expect(current.get(unexpiredID)?.status).toBe(StatusString.PENDING);
+        // Cancelling keeps a workflow's queue for a later resume.
+        expect(current.get(enqueuedID)?.queue_name).toBe('unpolled-queue');
+        expect(current.get(delayedID)?.queue_name).toBe('unpolled-queue');
+      } finally {
+        sweep.mockRestore();
+      }
+    });
+
+    test('background-jobs-stop-on-shutdown', async () => {
+      const sweep = jest.spyOn(DBOSExecutor.globalInstance!.systemDatabase, 'cancelTimedOutWorkflows');
+      try {
+        await retryUntilSuccess(() => expect(sweep).toHaveBeenCalled());
+        await DBOS.shutdown();
+        const calls = sweep.mock.calls.length;
+        await sleepms(500);
+        expect(sweep.mock.calls.length).toBe(calls);
+      } finally {
+        sweep.mockRestore();
+        await DBOS.launch();
+      }
     });
 
     test('test_wait_first', async () => {
@@ -529,8 +730,66 @@ describe('dbos-tests', () => {
       }
     });
 
+    test('test_wait_all', async () => {
+      const handleFast = await DBOS.startWorkflow(WaitFirstTestClass).fastWorkflow();
+      const handleSlow = await DBOS.startWorkflow(WaitFirstTestClass).slowWorkflow();
+      const handles = [handleSlow, handleFast, handleFast];
+
+      const resultHandles = await DBOS.waitAll(handles);
+      expect(resultHandles).toHaveLength(handles.length);
+      expect(resultHandles[0]).toBe(handleSlow);
+      expect(resultHandles[1]).toBe(handleFast);
+      expect(resultHandles[2]).toBe(handleFast);
+      await expect(handleFast.getStatus()).resolves.toMatchObject({ status: StatusString.SUCCESS });
+      await expect(handleSlow.getStatus()).resolves.toMatchObject({ status: StatusString.SUCCESS });
+
+      const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+      try {
+        const handleFast2 = await DBOS.startWorkflow(WaitFirstTestClass).fastWorkflow();
+        const handleSlow2 = await DBOS.startWorkflow(WaitFirstTestClass).slowWorkflow();
+        const clientHandleFast = client.retrieveWorkflow(handleFast2.workflowID);
+        const clientHandleSlow = client.retrieveWorkflow(handleSlow2.workflowID);
+        const clientHandles = [clientHandleSlow, clientHandleFast, clientHandleFast];
+
+        const clientResultHandles = await client.waitAll(clientHandles);
+        expect(clientResultHandles).toHaveLength(clientHandles.length);
+        expect(clientResultHandles[0]).toBe(clientHandleSlow);
+        expect(clientResultHandles[1]).toBe(clientHandleFast);
+        expect(clientResultHandles[2]).toBe(clientHandleFast);
+        await expect(clientHandleFast.getStatus()).resolves.toMatchObject({ status: StatusString.SUCCESS });
+        await expect(clientHandleSlow.getStatus()).resolves.toMatchObject({ status: StatusString.SUCCESS });
+      } finally {
+        await client.destroy();
+      }
+    });
+
     test('test_wait_first_empty', async () => {
       await expect(DBOS.waitFirst([])).rejects.toThrow('handles must not be empty');
+    });
+
+    test('test_wait_all_empty', async () => {
+      await expect(DBOS.waitAll([])).resolves.toEqual([]);
+
+      const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+      try {
+        await expect(client.waitAll([])).resolves.toEqual([]);
+      } finally {
+        await client.destroy();
+      }
+    });
+
+    test('test_wait_all_inside_workflow', async () => {
+      const handleFast = await DBOS.startWorkflow(WaitFirstTestClass).fastWorkflow();
+      const handleSlow = await DBOS.startWorkflow(WaitFirstTestClass).slowWorkflow();
+      const workflowID = randomUUID();
+      const waitHandle = await DBOS.startWorkflow(WaitFirstTestClass, { workflowID }).waitAllWorkflow([
+        handleSlow.workflowID,
+        handleFast.workflowID,
+      ]);
+
+      await expect(waitHandle.getResult()).resolves.toEqual([handleSlow.workflowID, handleFast.workflowID]);
+      const steps = await DBOS.listWorkflowSteps(workflowID);
+      expect(steps?.map((step) => step.name)).toContain('DBOS.waitAll');
     });
 
     // This test should run last in the block as it changes some global state
@@ -585,7 +844,7 @@ describe('dbos-tests', () => {
       assert.equal(await DBOS.getEvent(handle.workflowID, key), value);
       const steps = await DBOS.listWorkflowSteps(handle.workflowID);
       assert.ok(steps);
-      assert.equal(steps.length, 2);
+      assert.equal(steps.length, 3);
       assert.ok(steps[0].name.includes('DBOS.setEvent'));
       assert.ok(steps[1].name.includes('DBOS.recv'));
       assert.equal(steps[1].output, message);
@@ -620,7 +879,7 @@ describe('dbos-tests', () => {
       assert.ok(badClientSteps);
       assert.ok(badClientSteps[1].name.includes('DBOS.recv'));
       assert.equal(badClientSteps[1].output, jsonSerializer.stringify(message));
-      assert.equal(badClientSteps.length, 2);
+      assert.equal(badClientSteps.length, 3);
       await badClient.destroy();
     });
   });
@@ -635,8 +894,16 @@ class WaitFirstTestClass {
 
   @DBOS.workflow()
   static async slowWorkflow() {
-    await DBOS.sleep(2);
+    // Sleep well past the 1s result-poll interval so waitFirst reliably observes fastWorkflow complete first.
+    await DBOS.sleep(2000);
     return 'slow';
+  }
+
+  @DBOS.workflow()
+  static async waitAllWorkflow(workflowIDs: string[]) {
+    const handles = workflowIDs.map((workflowID) => DBOS.retrieveWorkflow<string>(workflowID));
+    const resultHandles = await DBOS.waitAll(handles);
+    return resultHandles.map((handle) => handle.workflowID);
   }
 }
 
@@ -689,8 +956,6 @@ class DBOSTimeoutTestClass {
 }
 
 class DBOSTestClass {
-  static cnt: number = 0;
-
   @DBOS.step()
   static async testFunction(name: string) {
     return Promise.resolve(name);
@@ -705,6 +970,11 @@ class DBOSTestClass {
   @DBOS.step()
   static async testVoidFunction() {
     return Promise.resolve();
+  }
+
+  @DBOS.workflow()
+  static async testVoidWorkflow() {
+    return DBOSTestClass.testVoidFunction();
   }
 
   @DBOS.step()
@@ -728,11 +998,6 @@ class DBOSTestClass {
   @DBOS.workflow()
   static async testFailWorkflow(name: string) {
     await DBOSTestClass.testFailFunction(name);
-  }
-
-  @DBOS.step()
-  static async testStep() {
-    return Promise.resolve(DBOSTestClass.cnt++);
   }
 
   @DBOS.workflow()
@@ -924,7 +1189,8 @@ describe('timeout-options-tests', () => {
   });
 });
 
-describe('custom-pool-test', () => {
+// Drops the system database and passes its own pool, which a router does not serve.
+describeUnlessSharded('custom-pool-test', () => {
   afterEach(async () => {
     await DBOS.shutdown();
   });
@@ -932,11 +1198,12 @@ describe('custom-pool-test', () => {
   test('custom-pool-test', async () => {
     const baseConfig = generateDBOSTestConfig();
     // Destroy the system database
-    await dropPGDatabase({ urlToDrop: baseConfig.systemDatabaseUrl, logger: () => {} });
+    await dropPGDatabase(baseConfig.systemDatabaseUrl!, silentDropLogger);
     const systemDatabaseURL = baseConfig.systemDatabaseUrl;
     assert(systemDatabaseURL);
     let pool = new Pool({ connectionString: systemDatabaseURL });
     let config: DBOSConfig = {
+      name: baseConfig.name,
       systemDatabaseUrl: 'postgres://fake:nonsense@badhost:1111/no_database',
       systemDatabasePool: pool,
       useListenNotify: false,
@@ -951,10 +1218,14 @@ describe('custom-pool-test', () => {
     // Launching with a custom pool but nonexistent database should fail
     await expect(DBOS.launch()).rejects.toThrow(DBOSInitializationError);
     await DBOS.shutdown();
+    // A pool DBOS was given is the caller's to close, even after a failed launch
+    assert(!pool.ending && !pool.ended);
+    await pool.end();
     // Create the system database, launch should succeed with a custom pool but fake URL
-    await ensurePGDatabase({ urlToEnsure: baseConfig.systemDatabaseUrl, logger: () => {} });
+    await ensurePGDatabase(baseConfig.systemDatabaseUrl!, { info: () => {}, warn: () => {} });
     pool = new Pool({ connectionString: systemDatabaseURL });
     config = {
+      name: baseConfig.name,
       systemDatabaseUrl: 'postgres://fake:nonsense@badhost:1111/no_database',
       systemDatabasePool: pool,
       useListenNotify: false,
@@ -962,17 +1233,279 @@ describe('custom-pool-test', () => {
     DBOS.setConfig(config);
     await DBOS.launch();
 
-    const message = 'message';
-    const handle = await DBOS.startWorkflow(workflow)();
-    await DBOS.send(handle.workflowID, message);
-    assert.equal(await handle.getResult(), message);
+    try {
+      const message = 'message';
+      const handle = await DBOS.startWorkflow(workflow)();
+      await DBOS.send(handle.workflowID, message);
+      assert.equal(await handle.getResult(), message);
 
-    const client = await DBOSClient.create({
-      systemDatabaseUrl: config.systemDatabaseUrl!,
-      systemDatabasePool: config.systemDatabasePool,
-    });
-    const clientHandle = client.retrieveWorkflow(handle.workflowID);
-    assert.equal(await clientHandle.getResult(), message);
+      const client = await DBOSClient.create({
+        systemDatabaseUrl: config.systemDatabaseUrl!,
+        systemDatabasePool: config.systemDatabasePool,
+      });
+      const clientHandle = client.retrieveWorkflow(handle.workflowID);
+      assert.equal(await clientHandle.getResult(), message);
+
+      // Destroying the client must leave the shared pool open for the runtime still using it
+      await client.destroy();
+      const secondHandle = await DBOS.startWorkflow(workflow)();
+      await DBOS.send(secondHandle.workflowID, message);
+      assert.equal(await secondHandle.getResult(), message);
+
+      await DBOS.shutdown();
+      await pool.query('SELECT 1');
+    } finally {
+      // Shutdown leaves this pool open, and DBOS never gave it an error listener, so a failure above must
+      // not hand it to the next describe, whose DROP DATABASE ... WITH (FORCE) would kill its connections.
+      await DBOS.shutdown();
+      pool.on('error', () => {});
+      await pool.end();
+    }
+  });
+});
+
+describe('custom-pool-lifecycle', () => {
+  let config: DBOSConfig;
+  let systemDatabaseUrl: string;
+
+  beforeAll(async () => {
+    config = generateDBOSTestConfig();
+    systemDatabaseUrl = config.systemDatabaseUrl!;
+    await setUpDBOSTestSysDb(config);
+  });
+
+  test('destroy ends polling waits instead of leaving them running on the caller pool', async () => {
+    const pool = new Pool({ connectionString: systemDatabaseUrl });
+    try {
+      const client = await DBOSClient.create({ systemDatabaseUrl, systemDatabasePool: pool });
+      await client.registerQueue('custom-pool-lifecycle-queue');
+      // Nothing is launched to dequeue it, so this wait would otherwise poll forever.
+      const handle = await client.enqueue<() => Promise<string>>({
+        workflowName: 'neverRuns',
+        queueName: 'custom-pool-lifecycle-queue',
+      });
+      const pending = handle.getResult();
+      await client.destroy();
+
+      await expect(pending).rejects.toThrow('The system database has been shut down');
+      // The caller's pool is still theirs to use.
+      await pool.query('SELECT 1');
+    } finally {
+      await pool.end();
+    }
+  });
+
+  test('never instruments the caller pool, so there is nothing to unpick on destroy', async () => {
+    const pool = new Pool({ connectionString: systemDatabaseUrl });
+    const events = ['error', 'connect', 'acquire', 'release', 'remove'] as const;
+    try {
+      const before = events.map((e) => pool.listenerCount(e));
+
+      const clients: DBOSClient[] = [];
+      for (let i = 0; i < 3; i++) {
+        clients.push(await DBOSClient.create({ systemDatabaseUrl, systemDatabasePool: pool }));
+      }
+      expect(events.map((e) => pool.listenerCount(e))).toEqual(before);
+
+      // Opening a real connection is what would fire a 'connect' hook, so the leak needs one to show up.
+      const connection = await pool.connect();
+      try {
+        // Stock pg leaves a checked-out client with no 'error' listener of its own; DBOS must not add one.
+        expect(connection.listenerCount('error')).toBe(0);
+
+        for (const client of clients) {
+          await client.destroy();
+        }
+
+        // What destroy() does control on a pool it does not own: leave it open and usable.
+        expect(events.map((e) => pool.listenerCount(e))).toEqual(before);
+        expect(pool.ended).toBe(false);
+        expect((await pool.query('SELECT 1')).rowCount).toBe(1);
+      } finally {
+        connection.release();
+      }
+    } finally {
+      await pool.end();
+    }
+  });
+
+  test('many clients share one caller pool while others are created and destroyed', async () => {
+    // A pool smaller than the number of concurrent clients, so they genuinely contend for connections.
+    const pool = new Pool({ connectionString: systemDatabaseUrl, max: 5 });
+    const events = ['error', 'connect', 'acquire', 'release', 'remove'] as const;
+    try {
+      const before = events.map((e) => pool.listenerCount(e));
+
+      // This one stays up throughout, and must be unaffected by its peers coming and going.
+      const survivor = await DBOSClient.create({ systemDatabaseUrl, systemDatabasePool: pool });
+
+      // One name, so the contention is on a single row and the work leaves a single row behind.
+      const queueName = 'custom-pool-shared-queue';
+
+      // Each worker creates, queries, and destroys on its own schedule, so creates and destroys interleave.
+      const churn = Array.from({ length: 8 }, async (_, i) => {
+        const client = await DBOSClient.create({ systemDatabaseUrl, systemDatabasePool: pool });
+        try {
+          // A write, so the connection is held through borrowClient; pool.query() never borrows.
+          await client.registerQueue(queueName);
+          await client.listQueues();
+          if (i % 2 === 0) {
+            await client.listQueues();
+          }
+        } finally {
+          await client.destroy();
+        }
+      });
+      const survivorWork = Array.from({ length: 8 }, () => survivor.registerQueue(queueName));
+      await Promise.all([...churn, ...survivorWork]);
+
+      // Guards the premise: the work above really did contend for several connections at once.
+      expect(pool.totalCount).toBeGreaterThan(1);
+
+      // Peers being destroyed mid-flight left the survivor able to keep using the shared pool.
+      await expect(survivor.registerQueue(queueName)).resolves.toBeDefined();
+      await survivor.destroy();
+
+      expect(events.map((e) => pool.listenerCount(e))).toEqual(before);
+      // The leak a shared pool actually punishes: every connection handed out must have come back.
+      expect(pool.waitingCount).toBe(0);
+      expect(pool.idleCount).toBe(pool.totalCount);
+
+      // All idle per the assertion above, so taking exactly that many never waits on the pool.
+      const idleAtRest = pool.idleCount;
+      const drained: PoolClient[] = [];
+      try {
+        for (let i = 0; i < idleAtRest; i++) {
+          drained.push(await pool.connect());
+        }
+        // pg strips its own idle listener on acquire, so anything left is one borrowClient kept.
+        expect(drained.map((c) => c.listenerCount('error'))).toEqual(drained.map(() => 0));
+      } finally {
+        drained.forEach((c) => c.release());
+      }
+
+      expect((await pool.query('SELECT 1')).rowCount).toBe(1);
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+// Makes a throwaway database of its own, which a router does not serve.
+describeUnlessSharded('run-migrations-flag', () => {
+  let config: DBOSConfig;
+  // A throwaway system database, so a failed verification never touches the shared test one.
+  let unmigratedUrl: string;
+
+  beforeAll(async () => {
+    config = generateDBOSTestConfig();
+    await setUpDBOSTestSysDb(config);
+    unmigratedUrl = deriveDatabaseUrl(config.systemDatabaseUrl!, 'dbostest_unmigrated_sys');
+  });
+
+  afterEach(async () => {
+    await DBOS.shutdown();
+    await dropPGDatabase(unmigratedUrl, silentDropLogger);
+  });
+
+  test('launches against an already-migrated system database', async () => {
+    const workflow = DBOS.registerWorkflow(() => Promise.resolve('migrated'), { name: 'run-migrations-false-test' });
+    DBOS.setConfig({ ...config, runMigrations: false });
+    await DBOS.launch();
+
+    assert.equal(await workflow(), 'migrated');
+  });
+
+  test('throws when the system database is not migrated', async () => {
+    // The database exists but holds no DBOS schema, so it is at version 0.
+    await ensurePGDatabase(unmigratedUrl, { info: () => {}, warn: () => {} });
+    DBOS.setConfig({ ...config, systemDatabaseUrl: unmigratedUrl, runMigrations: false });
+
+    const error = await DBOS.launch().then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(error).toBeInstanceOf(DBOSInitializationError);
+    expect((error as Error).message).toMatch(/is at schema version 0, but this version of DBOS requires/);
+
+    // Verification must not have migrated it on the way past.
+    const dbClient = new Client({ connectionString: unmigratedUrl });
+    try {
+      await dbClient.connect();
+      const { rows } = await dbClient.query<{ schema_name: string }>(
+        `SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'dbos'`,
+      );
+      expect(rows).toHaveLength(0);
+    } finally {
+      await dbClient.end();
+    }
+  });
+
+  test('accepts a system database ahead of this build', async () => {
+    // Migrate the throwaway database, then push it past this build, as a newer peer would.
+    DBOS.setConfig({ ...config, systemDatabaseUrl: unmigratedUrl });
+    await DBOS.launch();
+    await DBOS.shutdown();
+
+    const dbClient = new Client({ connectionString: unmigratedUrl });
+    try {
+      await dbClient.connect();
+      const { rows } = await dbClient.query<{ version: string }>(
+        'UPDATE dbos.dbos_migrations SET version = version + 1000 RETURNING version',
+      );
+      const aheadVersion = rows[0].version;
+
+      DBOS.setConfig({ ...config, systemDatabaseUrl: unmigratedUrl, runMigrations: false });
+      await DBOS.launch();
+
+      // Verification accepts the newer schema and leaves the version untouched.
+      const after = await dbClient.query<{ version: string }>('SELECT version FROM dbos.dbos_migrations');
+      expect(after.rows[0].version).toBe(aheadVersion);
+    } finally {
+      await dbClient.end();
+    }
+  });
+
+  test('does not create a missing system database', async () => {
+    DBOS.setConfig({ ...config, systemDatabaseUrl: unmigratedUrl, runMigrations: false });
+    await expect(DBOS.launch()).rejects.toThrow(DBOSInitializationError);
+
+    const dbClient = new Client({ connectionString: deriveDatabaseUrl(unmigratedUrl, 'postgres') });
+    try {
+      await dbClient.connect();
+      const { rowCount } = await dbClient.query('SELECT 1 FROM pg_database WHERE datname = $1', [
+        getDatabaseNameFromUrl(unmigratedUrl),
+      ]);
+      expect(rowCount).toBe(0);
+    } finally {
+      await dbClient.end();
+    }
+  });
+
+  test('DBOS.migrate prepares a system database for a role that cannot run DDL', async () => {
+    const role = `dbos_app_${randomUUID().replace(/-/g, '').slice(0, 8)}`;
+    const password = 'dbos_app_password';
+    const admin = new Client({ connectionString: config.systemDatabaseUrl });
+    await admin.connect();
+    try {
+      await admin.query(`CREATE ROLE "${role}" LOGIN PASSWORD '${password}'`);
+      await DBOS.migrate(unmigratedUrl, { applicationRole: role });
+
+      const roleUrl = new URL(unmigratedUrl);
+      roleUrl.username = role;
+      roleUrl.password = password;
+      const workflow = DBOS.registerWorkflow(() => Promise.resolve('migrated out of band'), {
+        name: 'dbos-migrate-role-test',
+      });
+      DBOS.setConfig({ ...config, systemDatabaseUrl: roleUrl.toString(), runMigrations: false });
+      await DBOS.launch();
+      assert.equal(await workflow(), 'migrated out of band');
+    } finally {
+      await DBOS.shutdown();
+      await dropPGDatabase(unmigratedUrl, silentDropLogger);
+      await admin.query(`DROP ROLE IF EXISTS "${role}"`);
+      await admin.end();
+    }
   });
 });
 
@@ -1012,5 +1545,423 @@ describe('long-sleep-tests', () => {
       sleepConfig.maxTimeoutMS = saved;
       await DBOS.shutdown();
     }
+  });
+});
+
+const keylessWorkflow = DBOS.registerWorkflow(async () => Promise.resolve(1), { name: 'shard-keys-keyless' });
+const nightlyWorkflow = DBOS.registerWorkflow(async (_scheduledAt: Date, _context: unknown) => Promise.resolve(), {
+  name: 'shard-keys-nightly',
+});
+
+describe('shard-keys', () => {
+  let config: DBOSConfig;
+
+  beforeAll(async () => {
+    config = generateDBOSTestConfig();
+    await setUpDBOSTestSysDb(config);
+    DBOS.setConfig(config);
+  });
+
+  beforeEach(async () => {
+    await DBOS.launch();
+  });
+
+  afterEach(async () => {
+    await DBOS.shutdown();
+  });
+
+  test('with-shard-key-nests-and-restores', async () => {
+    const nextKey = () => getCurrentContextStore()?.shardKeyForNextWorkflow;
+    await DBOS.withShardKey('tenant-a', async () => {
+      await DBOS.withShardKey('tenant-b', async () => {
+        expect(nextKey()).toBe('tenant-b');
+        // Independent of the other context options: setting those keeps the key.
+        await DBOS.withWorkflowQueue('some-queue', async () => {
+          expect(nextKey()).toBe('tenant-b');
+          return Promise.resolve();
+        });
+        expect(nextKey()).toBe('tenant-b');
+      });
+      expect(nextKey()).toBe('tenant-a');
+    });
+    expect(nextKey()).toBeUndefined();
+    await expect(DBOS.withShardKey('', () => Promise.resolve())).rejects.toThrow('non-empty string');
+  });
+
+  test('shard-keys-must-be-non-empty-strings', async () => {
+    // Every way a shard key enters refuses an empty or non-string one.
+    for (const bad of ['', 1] as unknown as string[]) {
+      await expectError(() => bindShardKeys({ w: bad }, () => {}), DBOSError, 'non-empty string');
+      await expectError(() => shardKeyScope(bad, () => {}), DBOSError, 'non-empty string');
+      await expectError(
+        buildEnqueueStatus({ queueName: 'q', workflowName: 'w', shardKey: bad }, DBOSJSON, []),
+        DBOSError,
+        'non-empty string',
+      );
+      await expectError(
+        DBOS.withShardKey(bad, () => Promise.resolve()),
+        DBOSError,
+        'non-empty string',
+      );
+    }
+    // Null and undefined leave the key unset rather than invalid.
+    expect(bindShardKeys({ w: null, v: undefined }, () => shardKeyScope(null, () => 'ok'))).toBe('ok');
+  });
+
+  // Needs an unsharded system database, which refuses every shard key.
+  testUnlessSharded('shard-keys-are-rejected-without-sharding', async () => {
+    // Without sharding, a shard key passed to any API is an error, never silently ignored.
+    const handle = await DBOS.startWorkflow(keylessWorkflow)();
+    expect(await handle.getResult()).toBe(1);
+    const wfid = handle.workflowID;
+    const shardKey = 'tenant-a';
+    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    try {
+      const calls: Array<() => unknown> = [
+        () => DBOS.getWorkflowStatus(wfid, { shardKey }),
+        () => DBOS.retrieveWorkflow(wfid, { shardKey }),
+        () => DBOS.getResult(wfid, { shardKey }),
+        () => DBOS.getEvent(wfid, 'k', { timeoutSeconds: 0, shardKey }),
+        () => DBOS.listWorkflowSteps(wfid, { shardKey }),
+        () => DBOS.cancelWorkflow(wfid, { shardKey }),
+        () => DBOS.resumeWorkflow(wfid, { shardKey }),
+        () => DBOS.forkWorkflow(wfid, 0, { shardKey }),
+        () => DBOS.send(wfid, 'm', undefined, undefined, { shardKey }),
+        () => DBOS.withShardKey(shardKey, () => DBOS.startWorkflow(keylessWorkflow)()),
+        () => client.retrieveWorkflow(wfid, { shardKey }).getStatus(),
+        () => client.send(wfid, 'm', undefined, undefined, { shardKey }),
+      ];
+      for (const call of calls) {
+        await expectError(Promise.resolve().then(call), DBOSError, 'not sharded');
+      }
+      const listings: Array<() => Promise<unknown>> = [
+        () => DBOS.listWorkflows({ shardKey }),
+        () => client.listWorkflows({ shardKey }),
+        () => DBOS.listWorkflows({ parentShardKey: shardKey }),
+        () => client.listQueuedWorkflows({ parentShardKey: shardKey }),
+        () => DBOS.listWorkflows({ shardKey: [] }),
+      ];
+      for (const listing of listings) {
+        await expectError(listing(), DBOSError, 'requires a sharded system database');
+      }
+      await expectError(
+        DBOS.createSchedule({
+          scheduleName: 'keyed',
+          workflowFn: nightlyWorkflow,
+          schedule: '0 0 * * *',
+          options: { shardKey },
+        }),
+        DBOSError,
+        'requires a sharded system database',
+      );
+      // Nothing ran, moved or arrived under the key.
+      expect((await DBOS.getWorkflowStatus(wfid))?.status).toBe(StatusString.SUCCESS);
+      expect(await DBOS.getSchedule('keyed')).toBeNull();
+    } finally {
+      await client.destroy();
+    }
+  });
+});
+
+describe('background-jobs', () => {
+  let config: DBOSConfig;
+
+  beforeAll(async () => {
+    config = generateDBOSTestConfig();
+    await setUpDBOSTestSysDb(config);
+    DBOS.setConfig(config);
+  });
+
+  beforeEach(async () => {
+    await DBOS.launch();
+  });
+
+  afterEach(async () => {
+    await DBOS.shutdown();
+  });
+
+  test('background-jobs-run-once-per-interval-across-processes', async () => {
+    // Whichever process holds the lock runs the jobs, a failing job skips no other, and when the holder stops the other takes over.
+    const local = DBOSExecutor.globalInstance!.systemDatabase;
+    const peer = createSystemDatabase({
+      systemDatabaseUrl: config.systemDatabaseUrl!,
+      logger: new GlobalLogger(),
+      serializer: DBOSJSON,
+      schemaName: local.schemaName,
+      useListenNotify: false,
+      appName: local.appName,
+      sharding: config.sharding,
+    });
+    const interval = 200;
+    const runs: Array<[string, number]> = [];
+    // Recorded, as the loop catches a job's exceptions: an assertion in the job could never fail the test.
+    const unheld: string[] = [];
+    const stops = { local: new AbortController(), peer: new AbortController() };
+    const leases = { local: new BackgroundLease(), peer: new BackgroundLease() };
+    // The failing job warns on every run.
+    const quiet = new GlobalLogger();
+    jest.spyOn(quiet, 'warn').mockImplementation(() => {});
+    const loop = (name: 'local' | 'peer', sysdb: SystemDatabase) =>
+      runBackgroundJobs(
+        sysdb,
+        quiet,
+        stops[name].signal,
+        'test_jobs',
+        interval,
+        {
+          failing: () => Promise.reject(new Error('injected job failure')),
+          job: () => {
+            // A holder's lease is held while its jobs run.
+            if (!leases[name].held()) unheld.push(name);
+            runs.push([name, performance.now()]);
+            return Promise.resolve();
+          },
+        },
+        leases[name],
+      );
+    const loops = { local: loop('local', local), peer: loop('peer', peer) };
+    try {
+      await retryUntilSuccess(() => expect(runs.length).toBeGreaterThanOrEqual(8), 5000);
+      expect(unheld).toEqual([]);
+      // A start trails its lock's by one round trip, so gaps vary by about that much.
+      const starts = runs.map(([, at]) => at);
+      expect(starts[starts.length - 1] - starts[0]).toBeGreaterThanOrEqual((starts.length - 1) * interval * 0.9);
+      for (let i = 1; i < starts.length; i++) {
+        expect(starts[i] - starts[i - 1]).toBeGreaterThanOrEqual(interval / 2);
+      }
+
+      const holder = runs[runs.length - 1][0] as 'local' | 'peer';
+      const other = holder === 'local' ? 'peer' : 'local';
+      stops[holder].abort();
+      await loops[holder];
+      expect(leases[holder].held()).toBe(false);
+      await retryUntilSuccess(() => {
+        expect(runs[runs.length - 1][0]).toBe(other);
+        expect(leases[other].held()).toBe(true);
+      }, 5000);
+    } finally {
+      stops.local.abort();
+      stops.peer.abort();
+      await Promise.all([loops.local, loops.peer]);
+      await peer.destroy();
+    }
+  });
+
+  test('background-jobs-hold-one-lock-session-across-intervals', async () => {
+    // A holder keeps its lock session across intervals, renewing it in place past the idle timeout, so a peer retrying as fast as it can never finds the lock free mid-hold.
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    // Short, so a hold that went idle instead of renewing would lose its session mid-test.
+    const idleTimeout = sysdb.backgroundJobLockIdleTimeoutMs;
+    sysdb.backgroundJobLockIdleTimeoutMs = 500;
+    const runs: number[] = [];
+    const stop = new AbortController();
+    const lease = new BackgroundLease();
+    const loop = runBackgroundJobs(
+      sysdb,
+      new GlobalLogger(),
+      stop.signal,
+      'hold_jobs',
+      100,
+      {
+        job: () => {
+          runs.push(performance.now());
+          return Promise.resolve();
+        },
+      },
+      lease,
+      3000,
+    );
+    try {
+      await retryUntilSuccess(() => expect(lease.held()).toBe(true), 5000);
+      const deadline = performance.now() + 2000;
+      while (performance.now() < deadline) {
+        await sysdb.backgroundJobLock('hold_jobs', (renew) => {
+          expect(renew).toBeUndefined();
+          return Promise.resolve();
+        });
+        expect(lease.held()).toBe(true);
+      }
+      expect(runs.length).toBeGreaterThanOrEqual(10);
+    } finally {
+      stop.abort();
+      await loop;
+      sysdb.backgroundJobLockIdleTimeoutMs = idleTimeout;
+    }
+  });
+
+  test('background-jobs-lock-is-per-application-version', async () => {
+    // Each application version takes its own background-jobs lock, so every live version runs the jobs and fires schedules, the latest code included.
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const names: string[] = [];
+    const appVersion = globalParams.appVersion;
+    const lock = jest.spyOn(sysdb, 'backgroundJobLock');
+    try {
+      for (const version of ['v1', 'v2']) {
+        globalParams.appVersion = version;
+        const stop = new AbortController();
+        lock.mockImplementation((lockName, callback) => {
+          names.push(lockName);
+          stop.abort();
+          return callback(undefined);
+        });
+        await backgroundJobsLoop(sysdb, new GlobalLogger(), stop.signal);
+      }
+    } finally {
+      lock.mockRestore();
+      globalParams.appVersion = appVersion;
+    }
+    expect(names).toEqual(['background_jobs.v1', 'background_jobs.v2']);
+  });
+
+  testUnlessSharded('background-job-lock-session-holds-no-snapshot', async () => {
+    // A held lock's idle session holds no xmin, even after renewals, so it never holds back vacuum.
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const key = advisoryLockKey(`dbos.background_job.${sysdb.schemaName}.${sysdb.appName ?? ''}.xmin_job`);
+    const client = new Client({ connectionString: config.systemDatabaseUrl });
+    await client.connect();
+    try {
+      await sysdb.backgroundJobLock('xmin_job', async (renew) => {
+        expect(renew).toBeDefined();
+        for (let i = 0; i < 8; i++) {
+          await renew!();
+        }
+        const { rows } = await client.query<{ backend_xmin: string | null; state: string }>(
+          `SELECT a.backend_xmin::text, a.state FROM pg_stat_activity a
+           JOIN pg_locks l ON l.pid = a.pid WHERE l.locktype = 'advisory' AND l.granted
+           AND l.classid::int8 = $1 AND l.objid::int8 = $2 AND l.objsubid = 1`,
+          [((key >> 32n) & 0xffffffffn).toString(), (key & 0xffffffffn).toString()],
+        );
+        expect(rows).toEqual([{ backend_xmin: null, state: 'idle in transaction' }]);
+      });
+    } finally {
+      await client.end();
+    }
+  });
+
+  testUnlessSharded('concurrent-index-builds-do-not-wait-on-the-background-job-lock', async () => {
+    // An online migration's CREATE INDEX CONCURRENTLY waits for older snapshots' transactions to end; the lock's idle transaction holds none, so a build never waits out a hold.
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const client = new Client({ connectionString: config.systemDatabaseUrl });
+    await client.connect();
+    try {
+      await client.query("SET statement_timeout = '10s'");
+      await client.query('DROP TABLE IF EXISTS cic_probe');
+      await client.query('CREATE TABLE cic_probe (id int)');
+      await sysdb.backgroundJobLock('cic_job', async (renew) => {
+        expect(renew).toBeDefined();
+        for (let i = 0; i < 8; i++) {
+          await renew!();
+        }
+        const started = performance.now();
+        await client.query('CREATE INDEX CONCURRENTLY cic_probe_idx ON cic_probe (id)');
+        expect(performance.now() - started).toBeLessThan(3000);
+      });
+      await client.query('DROP TABLE cic_probe');
+    } finally {
+      await client.end();
+    }
+  });
+});
+
+describe('custom-pool-getstatus', () => {
+  let systemDatabaseUrl: string;
+  let name: string;
+
+  beforeAll(async () => {
+    const config = generateDBOSTestConfig();
+    systemDatabaseUrl = config.systemDatabaseUrl!;
+    name = config.name!;
+    await setUpDBOSTestSysDb(config);
+  });
+
+  afterEach(async () => {
+    await DBOS.shutdown();
+  });
+
+  test('concurrent getStatus inside workflows does not exhaust a small pool', async () => {
+    // Fewer connections than workflows: getStatus used to hold one in a transaction while waiting on a
+    // second, so once every connection was held this way nothing could progress.
+    const pool = new Pool({ connectionString: systemDatabaseUrl, max: 4, connectionTimeoutMillis: 2000 });
+    pool.on('error', () => {});
+    try {
+      DBOS.setConfig({ name, systemDatabasePool: pool, useListenNotify: false, sharding: usingSharding() });
+      const child = DBOS.registerWorkflow(async () => Promise.resolve('done'), { name: 'getstatus-child' });
+      const gate = new Event();
+      const parent = DBOS.registerWorkflow(
+        async () => {
+          const handle = await DBOS.startWorkflow(child)();
+          await gate.wait();
+          return (await handle.getStatus())?.workflowID === handle.workflowID;
+        },
+        { name: 'getstatus-parent' },
+      );
+      await DBOS.launch();
+
+      const handles = [];
+      for (let i = 0; i < 12; i++) {
+        handles.push(await DBOS.startWorkflow(parent)());
+      }
+      // Release every parent at once so their getStatus calls all contend for the pool.
+      gate.set();
+      // Bounded well inside the test timeout, so a deadlock fails here instead of hanging jest.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const deadlocked = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('getStatus calls deadlocked the pool')), 15000);
+      });
+      try {
+        const results = await Promise.race([Promise.all(handles.map((h) => h.getResult())), deadlocked]);
+        expect(results).toEqual(handles.map(() => true));
+      } finally {
+        clearTimeout(timer);
+      }
+
+      // getStatus follows startWorkflow (function 0), so it is checkpointed in the transaction this test is about.
+      for (const handle of handles) {
+        const steps = await DBOS.listWorkflowSteps(handle.workflowID);
+        expect(steps?.find((s) => s.functionID === 1)?.name).toBe(DBOS_FUNCNAME_GETSTATUS);
+      }
+    } finally {
+      await DBOS.shutdown();
+      await pool.end();
+    }
+  }, 30000);
+});
+
+describe('getstatus-checkpoint', () => {
+  let config: DBOSConfig;
+
+  beforeAll(async () => {
+    config = generateDBOSTestConfig();
+    await setUpDBOSTestSysDb(config);
+  });
+
+  afterEach(async () => {
+    await DBOS.shutdown();
+  });
+
+  test('getStatus as the first call in a workflow is checkpointed', async () => {
+    DBOS.setConfig(config);
+    const gate = new Event();
+    const target = DBOS.registerWorkflow(async () => gate.wait(), { name: 'getstatus-first-target' });
+    // getStatus is this workflow's first call, so it runs as function 0.
+    const observer = DBOS.registerWorkflow(
+      async (targetID: string) => (await DBOS.getWorkflowStatus(targetID))?.status,
+      { name: 'getstatus-first-observer' },
+    );
+    await DBOS.launch();
+
+    const targetHandle = await DBOS.startWorkflow(target)();
+    const observerID = randomUUID();
+    await expect(DBOS.withNextWorkflowID(observerID, () => observer(targetHandle.workflowID))).resolves.toBe(
+      StatusString.PENDING,
+    );
+    const steps = await DBOS.listWorkflowSteps(observerID);
+    expect(steps?.find((s) => s.functionID === 0)?.name).toBe(DBOS_FUNCNAME_GETSTATUS);
+
+    // The target finishes, but a re-execution must replay the recorded status rather than read it again.
+    gate.set();
+    await targetHandle.getResult();
+    const reexecuted = await reexecuteWorkflowById(observerID);
+    await expect(reexecuted.getResult()).resolves.toBe(StatusString.PENDING);
   });
 });

@@ -1,4 +1,4 @@
-import glob from 'fast-glob';
+import { glob } from 'tinyglobby';
 import path from 'path';
 import fs from 'fs';
 import { execSync } from 'child_process';
@@ -22,7 +22,7 @@ export const copy = async (src: string, targets: string[], dest: string, { renam
     cwd: src,
     dot: true,
     absolute: false,
-    stats: false,
+    expandDirectories: false,
     ignore: ['package-lock.json', '**/node_modules/**', '**/dist/**'],
   });
 
@@ -43,8 +43,8 @@ export const copy = async (src: string, targets: string[], dest: string, { renam
 };
 
 export function isValidApplicationName(appName: string): boolean | string {
-  if (appName.length < 3 || appName.length > 30) {
-    return 'Application name must be between 3 and 30 characters long';
+  if (appName.length < 3 || appName.length > 256) {
+    return 'Application name must be between 3 and 256 characters long';
   }
   if (!validator.matches(appName, '^[a-z0-9-_]+$')) {
     return 'Application name can only contain lowercase letters, numbers, hyphens and underscores';
@@ -130,7 +130,7 @@ interface PackageJson {
 export async function init(appName: string, templateName: string) {
   if (isValidApplicationName(appName) !== true) {
     throw new Error(
-      `Invalid application name: ${appName}. Application name must be between 3 and 30 characters long and can only contain lowercase letters, numbers, hyphens and underscores. Exiting...`,
+      `Invalid application name: ${appName}. Application name must be between 3 and 256 characters long and can only contain lowercase letters, numbers, hyphens and underscores. Exiting...`,
     );
   }
 
@@ -168,7 +168,6 @@ export async function init(appName: string, templateName: string) {
   fs.writeFileSync(packageJsonName, JSON.stringify(packageJson, null, 2), 'utf-8');
   updateLocalFileDependency(appName, packageJson.dependencies);
   execSync('npm i --no-fund --loglevel=error', { cwd: appName, stdio: 'inherit' });
-  execSync('npm install --no-fund --save-dev @dbos-inc/dbos-cloud@latest', { cwd: appName, stdio: 'inherit' });
   console.log('Application initialized successfully!');
 }
 

@@ -26,7 +26,6 @@ import {
   restoreUserDB,
   connect,
 } from './databases/databases.js';
-import { launchDashboard, getDashboardURL, deleteDashboard } from './dashboards/dashboards.js';
 import { DBOSCloudHost, credentialsExist, defaultConfigFilePath, deleteCredentials, getLogger } from './cloudutils.js';
 import { getAppInfo } from './applications/get-app-info.js';
 import promptSync from 'prompt-sync';
@@ -229,7 +228,6 @@ applicationCommands
     ) => {
       const exitCode = await deployAppCode(
         DBOSCloudHost,
-        false,
         options.previousVersion ?? null,
         options.verbose ?? false,
         null,
@@ -257,7 +255,6 @@ applicationCommands
     ) => {
       const exitCode = await deployAppCode(
         DBOSCloudHost,
-        false,
         options.previousVersion ?? null,
         options.verbose ?? false,
         options.database,
@@ -547,36 +544,6 @@ databaseCommands
   .option('-S, --show-password', 'Show the password in the output')
   .action(async (dbname: string | undefined, options: { password: string | undefined; showPassword: boolean }) => {
     const exitCode = await connect(DBOSCloudHost, dbname, options.password, options.showPassword);
-    process.exit(exitCode);
-  });
-
-/////////////////////
-/* USER DASHBOARDS */
-/////////////////////
-
-const dashboardCommands = program.command('dashboard').description('Manage Monitoring Dashboards');
-
-dashboardCommands
-  .command('launch')
-  .description('Deploy the Monitoring Dashboard')
-  .action(async () => {
-    const exitCode = await launchDashboard(DBOSCloudHost);
-    process.exit(exitCode);
-  });
-
-dashboardCommands
-  .command('url')
-  .description('Deploy the Monitoring Dashboard if it does not exist; then return its URL')
-  .action(async () => {
-    const exitCode = await getDashboardURL(DBOSCloudHost);
-    process.exit(exitCode);
-  });
-
-dashboardCommands
-  .command('delete')
-  .description('Delete your Monitoring Dashboard')
-  .action(async () => {
-    const exitCode = await deleteDashboard(DBOSCloudHost);
     process.exit(exitCode);
   });
 

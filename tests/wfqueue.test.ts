@@ -1,6 +1,13 @@
 import { StatusString, WorkflowHandle, DBOS, ConfiguredInstance, DBOSClient } from '../src';
 import { DBOSConfig, DBOSExecutor, DBOS_QUEUE_MAX_PRIORITY, DBOS_QUEUE_MIN_PRIORITY } from '../src/dbos-executor';
-import { QueueParameters, wfQueueRunner } from '../src/wfqueue';
+import {
+  isPartitionedQueue,
+  QueueParameters,
+  QueueRateLimit,
+  registerInternalQueue,
+  wfQueueRunner,
+  WorkflowQueue,
+} from '../src/wfqueue';
 import {
   generateDBOSTestConfig,
   setUpDBOSTestSysDb,
@@ -8,11 +15,17 @@ import {
   queueEntriesAreCleanedUp,
   recoverPendingWorkflows,
   reexecuteWorkflowById,
+  retryUntilSuccess,
   setWfAndChildrenToPending,
+  describeUnlessSharded,
+  testUnlessSharded,
+  usingSharding,
 } from './helpers';
-import { WorkflowQueue } from '../src';
+import { EnqueueOptions, QueueRecord, SystemDatabase } from '../src/system_database';
 import { randomUUID } from 'node:crypto';
-import { globalParams, sleepms } from '../src/utils';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { globalParams, sleepms, INTERNAL_QUEUE_NAME } from '../src/utils';
+import { scopedShardKey } from '../src/shard_keys';
 
 import { WF } from './wfqtestprocess';
 
@@ -35,7 +48,8 @@ import {
   DEBUG_TRIGGER_WORKFLOW_QUEUE_START,
   DEBUG_TRIGGER_BETWEEN_PARTITION_DISPATCHES,
   DEBUG_TRIGGER_FIND_AND_MARK_AFTER_SELECT,
-  // DEBUG_TRIGGER_WORKFLOW_ENQUEUE,
+  DEBUG_TRIGGER_PARTITIONED_DEQUEUE_AFTER_CANDIDATES,
+  DEBUG_TRIGGER_PARTITIONED_DEQUEUE_BEFORE_LOCKS,
   setDebugTrigger,
 } from '../src/debugpoint';
 import assert from 'node:assert';
@@ -102,6 +116,7 @@ describe('queued-wf-tests-simple', () => {
       TestResumeQueues.queue,
       TestResumeQueuesPartitioned.queue,
       TestConcurrencyAcrossVersions.queue,
+      TestVersionlessDequeue.queue,
       waitFirstQueue,
     ]) {
       await DBOS.registerQueue(ref.name, { onConflict: 'always_update', ...ref.config });
@@ -296,40 +311,46 @@ describe('queued-wf-tests-simple', () => {
     expect(await wfh2b.getResult()).toBe('cd');
   });
 
-  test('queue workflow in recovered workflow', async () => {
-    expect(WF.x).toBe(5);
-    console.log('shutdown');
-    const appVersion = globalParams.appVersion;
-    await DBOS.shutdown(); // DO not want to take queued jobs from here
+  // Its side process runs outside the sharded run's harness.
+  testUnlessSharded(
+    'queue workflow in recovered workflow',
+    async () => {
+      expect(WF.x).toBe(5);
+      console.log('shutdown');
+      const appVersion = globalParams.appVersion;
+      await DBOS.shutdown(); // DO not want to take queued jobs from here
 
-    console.log('run side process');
-    // We crash a workflow on purpose; this has queued some things up and awaited them...
-    const { stdout, stderr } = await execFileAsync('npx', ['ts-node', './tests/wfqtestprocess.ts'], {
-      cwd: process.cwd(),
-      env: {
-        ...process.env,
-        DIE_ON_PURPOSE: 'true',
-        DBOS__APPVERSION: appVersion,
-      },
-    });
+      console.log('run side process');
+      // We crash a workflow on purpose; this has queued some things up and awaited them...
+      const { stdout, stderr } = await execFileAsync('npx', ['ts-node', './tests/wfqtestprocess.ts'], {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          DIE_ON_PURPOSE: 'true',
+          DBOS__APPVERSION: appVersion,
+        },
+      });
 
-    expect(stderr).toBeDefined();
-    expect(stdout).toBeDefined();
-    console.log(stdout);
+      expect(stderr).toBeDefined();
+      expect(stdout).toBeDefined();
+      console.log(stdout);
 
-    console.log('start again');
-    await DBOS.launch();
-    const wfh = DBOS.retrieveWorkflow('testqueuedwfcrash');
-    expect((await wfh.getStatus())?.status).toBe('PENDING');
+      console.log('start again');
+      await DBOS.launch();
+      const wfh = DBOS.retrieveWorkflow('testqueuedwfcrash');
+      // Launch recovery re-enqueued it; whether the queue has already dequeued it here is a race.
+      expect([StatusString.ENQUEUED, StatusString.PENDING]).toContain((await wfh.getStatus())?.status);
 
-    // It should proceed.  And should not take too long, either...
-    //  We could also recover the workflow
-    console.log('Waiting for recovered WF to complete...');
-    expect(await wfh.getResult()).toBe(5);
+      // It should proceed.  And should not take too long, either...
+      //  We could also recover the workflow
+      console.log('Waiting for recovered WF to complete...');
+      expect(await wfh.getResult()).toBe(5);
 
-    expect((await wfh.getStatus())?.status).toBe('SUCCESS');
-    expect(await queueEntriesAreCleanedUp()).toBe(true);
-  }, 60000);
+      expect((await wfh.getStatus())?.status).toBe('SUCCESS');
+      expect(await queueEntriesAreCleanedUp()).toBe(true);
+    },
+    60000,
+  );
 
   class TestDuplicateID {
     @DBOS.workflow()
@@ -427,7 +448,7 @@ describe('queued-wf-tests-simple', () => {
       //  below that intentionally runs the workflow concurrently.  Promise.all
       //  will run the getResult calls concurrently.  In turn, they will all be in a
       //  race to record their results in system DB.  The system DB reacts by killing
-      //  (throwing a DBOSWorkflowConflictError) from the workflows that conflict, and
+      //  (throwing a DBOSStepNondeterminismError) from the workflows that conflict, and
       //  there's a high probability that this is both of them, as there are 5 separate
       //  races here (to record each of the 5 results).  Boom! (with 15/16 probability).
       const results: number[] = [];
@@ -621,9 +642,14 @@ describe('queued-wf-tests-simple', () => {
     });
     await expect(regularHandle.getResult()).resolves.toBeUndefined();
 
-    // Complete the blocked workflow
+    // Unblock the cancelled workflow's body. Even though it now runs to
+    // completion, CANCELLED is terminal: it must not overwrite CANCELLED with
+    // SUCCESS, and awaiting its result must raise.
     TestCancelQueues.blockingEvent.set();
     await expect(blockedHandle.getResult()).rejects.toThrow(DBOSAwaitedWorkflowCancelledError);
+    await expect(blockedHandle.getStatus()).resolves.toMatchObject({
+      status: StatusString.CANCELLED,
+    });
 
     // Verify all queue entries eventually get cleaned up
     expect(await queueEntriesAreCleanedUp()).toBe(true);
@@ -673,12 +699,21 @@ describe('queued-wf-tests-simple', () => {
       status: StatusString.ENQUEUED,
     });
 
-    await DBOS.resumeWorkflow(wfid);
+    try {
+      // Resuming without a queue leaves the workflow waiting on its own queue
+      await DBOS.resumeWorkflow(wfid);
+      await expect(regularHandle.getStatus()).resolves.toMatchObject({
+        status: StatusString.ENQUEUED,
+        queueName: TestResumeQueues.queue.name,
+      });
 
-    await expect(regularHandle.getResult()).resolves.toBeUndefined();
-
-    // Complete the blocked workflow. Verify the second regular workflow also completes.
-    TestResumeQueues.blockingEvent.set();
+      // Resuming onto the internal queue starts it immediately, bypassing its queue
+      await DBOS.resumeWorkflow(wfid, { queueName: INTERNAL_QUEUE_NAME });
+      await expect(regularHandle.getResult()).resolves.toBeUndefined();
+    } finally {
+      // Complete the blocked workflow. Verify the second regular workflow also completes.
+      TestResumeQueues.blockingEvent.set();
+    }
     await expect(blockedHandle.getResult()).resolves.toBeUndefined();
     await expect(regularHandleTwo.getResult()).resolves.toBeUndefined();
 
@@ -691,7 +726,7 @@ describe('queued-wf-tests-simple', () => {
     static blockingEvent = new Event();
     static queue: QueueRef = {
       name: 'TestResumeQueuesPartitioned',
-      config: { concurrency: 1, partitionQueue: true, ...testPolling },
+      config: { partitionConcurrency: 1, ...testPolling },
     };
 
     @DBOS.workflow()
@@ -737,13 +772,30 @@ describe('queued-wf-tests-simple', () => {
       status: StatusString.ENQUEUED,
     });
 
-    await DBOS.resumeWorkflow(wfid);
-    console.log('RESUMED', wfid);
+    try {
+      // Resuming without a queue leaves the workflow waiting on its own queue
+      await DBOS.resumeWorkflow(wfid);
+      await expect(regularHandle.getStatus()).resolves.toMatchObject({
+        status: StatusString.ENQUEUED,
+        queueName: TestResumeQueuesPartitioned.queue.name,
+      });
 
-    await expect(regularHandle.getResult()).resolves.toBeUndefined();
+      // Resuming onto the internal queue starts it immediately, bypassing its queue
+      await DBOS.resumeWorkflow(wfid, { queueName: INTERNAL_QUEUE_NAME });
+      await expect(regularHandle.getResult()).resolves.toBeUndefined();
 
-    // Complete the blocked workflow. Verify the second regular workflow also completes.
-    TestResumeQueuesPartitioned.blockingEvent.set();
+      // A new partition key alone moves it out of the busy partition, still on its queue
+      await DBOS.resumeWorkflow(regularHandleTwo.workflowID, { queuePartitionKey: 'other' });
+      await expect(regularHandleTwo.getStatus()).resolves.toMatchObject({
+        queueName: TestResumeQueuesPartitioned.queue.name,
+        queuePartitionKey: 'other',
+      });
+      await expect(regularHandleTwo.getResult()).resolves.toBeUndefined();
+      await expect(blockedHandle.getStatus()).resolves.toMatchObject({ status: StatusString.PENDING });
+    } finally {
+      // Complete the blocked workflow. Verify the second regular workflow also completes.
+      TestResumeQueuesPartitioned.blockingEvent.set();
+    }
     await expect(blockedHandle.getResult()).resolves.toBeUndefined();
     await expect(regularHandleTwo.getResult()).resolves.toBeUndefined();
 
@@ -759,6 +811,18 @@ describe('queued-wf-tests-simple', () => {
 
     @DBOS.workflow()
     static async testWorkflow() {
+      return Promise.resolve(DBOS.workflowID);
+    }
+  }
+
+  class TestVersionlessDequeue {
+    static queue: QueueRef = {
+      name: 'TestVersionlessDequeue',
+      config: { workerConcurrency: 1, ...testPolling },
+    };
+
+    @DBOS.workflow()
+    static async versionlessWorkflow() {
       return Promise.resolve(DBOS.workflowID);
     }
   }
@@ -782,6 +846,43 @@ describe('queued-wf-tests-simple', () => {
 
     globalParams.appVersion = other_version;
     await expect(other_version_handle.getResult()).resolves.toBeTruthy();
+    await client.destroy();
+  });
+
+  test('test-versionless-dequeue-requires-latest-version', async () => {
+    expect(config.systemDatabaseUrl).toBeDefined();
+    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const workerVersion = globalParams.appVersion;
+
+    // Register a newer application version so this worker is no longer the latest.
+    const newerVersion = `newer-${randomUUID()}`;
+    await sysdb.createApplicationVersion(newerVersion);
+    await sysdb.updateApplicationVersionTimestamp(newerVersion, Date.now() + 1_000_000);
+
+    // Enqueue a version-less workflow (application_version IS NULL): no appVersion field.
+    const versionlessHandle = await client.enqueue({
+      queueName: TestVersionlessDequeue.queue.name,
+      workflowName: 'versionlessWorkflow',
+      workflowClassName: 'TestVersionlessDequeue',
+    });
+
+    // Enqueue a workflow tagged with this worker's own (non-latest) version.
+    const taggedHandle = await DBOS.startWorkflow(TestVersionlessDequeue, {
+      queueName: TestVersionlessDequeue.queue.name,
+    }).versionlessWorkflow();
+
+    // A matching-version worker still dequeues its own version-tagged workflow.
+    await expect(taggedHandle.getResult()).resolves.toBeTruthy();
+
+    // But the version-less workflow stays ENQUEUED: this worker is not the latest version.
+    await sleepms(1000);
+    expect((await versionlessHandle.getStatus())?.status).toBe(StatusString.ENQUEUED);
+
+    // Make this worker the latest version again; the version-less workflow now completes.
+    await sysdb.updateApplicationVersionTimestamp(workerVersion, Date.now() + 2_000_000);
+    await expect(versionlessHandle.getResult()).resolves.toBeTruthy();
+
     await client.destroy();
   });
 
@@ -1045,7 +1146,8 @@ class InterProcessWorkflow {
   }
 }
 
-describe('queued-wf-tests-concurrent-workers', () => {
+// Its worker processes run outside the sharded run's harness.
+describeUnlessSharded('queued-wf-tests-concurrent-workers', () => {
   let config: DBOSConfig;
 
   beforeAll(async () => {
@@ -1251,7 +1353,42 @@ describe('enqueue-options', () => {
     }
   }
 
-  test('test_deduplication', async () => {
+  class UnqueuedExample {
+    @DBOS.workflow()
+    static async simpleWorkflow(input: string): Promise<string> {
+      return Promise.resolve(input);
+    }
+  }
+
+  test('test_enqueue_options_require_a_queue', async () => {
+    // Only the queue machinery reads these, and a stored dedup ID becomes a unique-constraint violation once anything assigns the row a queue name.
+    const options: EnqueueOptions[] = [
+      { deduplicationID: 'dedup_without_queue' },
+      { priority: 5 },
+      { queuePartitionKey: 'key_without_queue' },
+      { delaySeconds: 30 },
+    ];
+    for (const option of options) {
+      const wfid = randomUUID();
+      await expect(
+        DBOS.startWorkflow(UnqueuedExample, { workflowID: wfid, enqueueOptions: option }).simpleWorkflow('bob'),
+      ).rejects.toThrow(new RegExp(`${Object.keys(option)[0]}.*not being enqueued`));
+      // The call must be rejected before any row is written, or it would leave the orphaned PENDING row this validation exists to prevent.
+      await expect(DBOS.getWorkflowStatus(wfid)).resolves.toBeNull();
+    }
+
+    // applicationVersion is excluded because without a queue it still selects which executors can recover the workflow.
+    const pinnedID = randomUUID();
+    await DBOS.startWorkflow(UnqueuedExample, {
+      workflowID: pinnedID,
+      enqueueOptions: { applicationVersion: 'some_other_version' },
+    }).simpleWorkflow('bob');
+    const pinned = await DBOS.getWorkflowStatus(pinnedID);
+    expect(pinned?.applicationVersion).toBe('some_other_version');
+  });
+
+  // Deduplication is not supported on a sharded system database.
+  testUnlessSharded('test_deduplication', async () => {
     const wfid = randomUUID();
     const dedupID = 'my_dedup_id';
 
@@ -1333,11 +1470,11 @@ describe('enqueue-options', () => {
 
     static queue: QueueRef = {
       name: 'test_queue_prority',
-      config: { concurrency: 1, priorityEnabled: true, ...testPolling },
+      config: { concurrency: 1, ...testPolling },
     };
     static childqueue: QueueRef = {
       name: 'child_queue',
-      config: { concurrency: 1, priorityEnabled: true, ...testPolling },
+      config: { concurrency: 1, ...testPolling },
     };
 
     @DBOS.workflow()
@@ -1412,7 +1549,7 @@ describe('enqueue-options', () => {
   class SetPriorityTest {
     static setPriorityQueue: QueueRef = {
       name: 'test_set_priority_queue',
-      config: { concurrency: 1, priorityEnabled: true, ...testPolling },
+      config: { concurrency: 1, ...testPolling },
     };
 
     static resolveBlocker: () => void;
@@ -1476,8 +1613,8 @@ describe('enqueue-options', () => {
     // Workflow 1 should run first (priority 1), then 3 (priority 3), then 2 (priority 4)
     expect(SetPriorityTest.executionOrder).toEqual([1, 3, 2]);
 
-    // Test invalid priority
-    await expect(DBOS.setWorkflowPriority('some-id', 0)).rejects.toBeInstanceOf(DBOSInvalidQueuePriorityError);
+    // 0, the default priority, is accepted; anything outside [0, max] is not
+    await expect(DBOS.setWorkflowPriority('some-id', 0)).resolves.toBeUndefined();
     await expect(DBOS.setWorkflowPriority('some-id', -1)).rejects.toBeInstanceOf(DBOSInvalidQueuePriorityError);
     await expect(DBOS.setWorkflowPriority('some-id', DBOS_QUEUE_MAX_PRIORITY + 1)).rejects.toBeInstanceOf(
       DBOSInvalidQueuePriorityError,
@@ -1531,6 +1668,12 @@ describe('queue-time-outs', () => {
     }
 
     @DBOS.workflow()
+    static async parentStartsChild() {
+      const handle = await DBOS.startWorkflow(DBOSTimeoutTestClass).sleepingWorkflow(1);
+      return await handle.getResult();
+    }
+
+    @DBOS.workflow()
     static async timeoutParentStartDetachedChild(duration: number) {
       await DBOS.startWorkflow(DBOSTimeoutTestClass, { timeoutMS: null })
         .sleepingWorkflow(duration * 2)
@@ -1560,7 +1703,7 @@ describe('queue-time-outs', () => {
 
   beforeEach(async () => {
     await DBOS.launch();
-    for (const ref of [timeoutQueue, dedupRecoveryQueue, partitionQueue]) {
+    for (const ref of [timeoutQueue, dedupRecoveryQueue, partitionQueue, partitionWorkerConcurrencyQueue]) {
       await DBOS.registerQueue(ref.name, { onConflict: 'always_update', ...ref.config });
     }
   });
@@ -1591,13 +1734,34 @@ describe('queue-time-outs', () => {
       workflowID,
       queueName: timeoutQueue.name,
     }).timeoutParentStartWF(100);
-    await expect(handle.getResult()).rejects.toThrow(new DBOSAwaitedWorkflowCancelledError(childID));
+    // The parent recorded this error, so it comes back deserialized as a plain Error carrying the original fields.
+    await expect(handle.getResult()).rejects.toMatchObject({
+      message: `Awaited ${childID} was cancelled`,
+      workflowID: childID,
+    });
     await expect(handle.getStatus()).resolves.toMatchObject({
       status: StatusString.ERROR,
     });
     const childHandle = DBOS.retrieveWorkflow(childID);
     await expect(childHandle.getStatus()).resolves.toMatchObject({
       status: StatusString.CANCELLED,
+    });
+  });
+
+  // A near-maximum timeout saturates the deadline on dequeue; a child inheriting it must still insert (#1421)
+  test('enqueue-workflow-saturatedDeadlineChild', async () => {
+    const workflowID: string = randomUUID();
+    const childID: string = `${workflowID}-0`;
+    const handle = await DBOS.startWorkflow(DBOSTimeoutTestClass, {
+      workflowID,
+      queueName: timeoutQueue.name,
+      timeoutMS: 9223372036854774807,
+    }).parentStartsChild();
+    await expect(handle.getResult()).resolves.toBe(42);
+    await expect(handle.getStatus()).resolves.toMatchObject({ deadlineEpochMS: Number.MAX_SAFE_INTEGER });
+    await expect(DBOS.retrieveWorkflow(childID).getStatus()).resolves.toMatchObject({
+      status: StatusString.SUCCESS,
+      deadlineEpochMS: Number.MAX_SAFE_INTEGER,
     });
   });
 
@@ -1633,10 +1797,15 @@ describe('queue-time-outs', () => {
     const handle = await DBOS.startWorkflow(DBOSTimeoutTestClass, {
       workflowID,
       queueName: timeoutQueue.name,
-      timeoutMS: 2000, // allow a dequeue interval to pass
+      // Long enough that the parent, which learns of the child's cancellation on its next
+      // result poll (not instantly), observes it well before the parent's own deadline fires.
+      timeoutMS: 4000,
     }).timeoutParentEnqueueWF(100);
     await events_map.get(childID)?.wait();
-    await expect(handle.getResult()).rejects.toThrow(new DBOSAwaitedWorkflowCancelledError(childID));
+    await expect(handle.getResult()).rejects.toMatchObject({
+      message: `Awaited ${childID} was cancelled`,
+      workflowID: childID,
+    });
     await expect(handle.getStatus()).resolves.toMatchObject({
       status: StatusString.ERROR,
     });
@@ -1656,7 +1825,7 @@ describe('queue-time-outs', () => {
       workflowID,
       queueName: timeoutQueue.name,
       timeoutMS: 100,
-    }).timeoutParentStartDetachedChild(100);
+    }).timeoutParentStartDetachedChild(500);
     await expect(handle.getResult()).rejects.toThrow(new DBOSAwaitedWorkflowCancelledError(workflowID));
     await expect(handle.getStatus()).resolves.toMatchObject({
       status: StatusString.CANCELLED,
@@ -1676,7 +1845,7 @@ describe('queue-time-outs', () => {
       workflowID,
       queueName: timeoutQueue.name,
       timeoutMS: 100,
-    }).timeoutParentStartDetachedChildWithSyntax(100);
+    }).timeoutParentStartDetachedChildWithSyntax(500);
     await expect(handle.getResult()).rejects.toThrow(new DBOSAwaitedWorkflowCancelledError(workflowID));
     await expect(handle.getStatus()).resolves.toMatchObject({
       status: StatusString.CANCELLED,
@@ -1761,7 +1930,8 @@ describe('queue-time-outs', () => {
     { name: 'dedupRecoveryChildWorkflow' },
   );
 
-  test('dedup-recovery', async () => {
+  // Deduplication is not supported on a sharded system database.
+  testUnlessSharded('dedup-recovery', async () => {
     const handle = await DBOS.startWorkflow(dedupRecoveryParentWorkflow)();
     const childID = await handle.getResult();
     const steps = await DBOS.listWorkflowSteps(handle.workflowID);
@@ -1776,14 +1946,18 @@ describe('queue-time-outs', () => {
 
     // Verify it still works on recovery
     const recoveredHandle = await reexecuteWorkflowById(handle.workflowID);
-    await recoveredHandle!.getResult();
+    await recoveredHandle.getResult();
   });
 
   const partitionBlockingEvent = new Event();
   const partitionWaitingEvent = new Event();
   const partitionQueue: QueueRef = {
     name: 'partition-queue',
-    config: { partitionQueue: true, concurrency: 1, ...testPolling },
+    config: { partitionConcurrency: 1, ...testPolling },
+  };
+  const partitionWorkerConcurrencyQueue: QueueRef = {
+    name: 'partition-worker-concurrency-queue',
+    config: { partitionWorkerConcurrency: 1, ...testPolling },
   };
 
   const partitionBlockedWorkflow = DBOS.registerWorkflow(
@@ -1800,6 +1974,19 @@ describe('queue-time-outs', () => {
       return Promise.resolve(DBOS.workflowID);
     },
     { name: 'partitionNormalWorkflow' },
+  );
+
+  const partitionWorkerConcurrencyBlockingEvent = new Event();
+  const partitionWorkerConcurrencyStartedEvent = new Event();
+  let partitionWorkerConcurrencyStartedCount = 0;
+  const partitionWorkerConcurrencyWorkflow = DBOS.registerWorkflow(
+    async () => {
+      partitionWorkerConcurrencyStartedCount++;
+      partitionWorkerConcurrencyStartedEvent.set();
+      await partitionWorkerConcurrencyBlockingEvent.wait();
+      return DBOS.workflowID;
+    },
+    { name: 'partitionWorkerConcurrencyWorkflow' },
   );
 
   test('partitioned-queues', async () => {
@@ -1852,16 +2039,115 @@ describe('queue-time-outs', () => {
     } finally {
       await client.destroy();
     }
+  });
 
-    // Deduplication is not supported for partitioned queues. This check is
-    // purely from supplied params, so it fires regardless of whether the
-    // queue is in the in-memory map.
-    await assert.rejects(async () => {
-      await DBOS.startWorkflow(partitionNormalWorkflow, {
+  const partitionDedupBlockingEvent = new Event();
+  const partitionDedupWaitingEvent = new Event();
+  const partitionDedupBlockedWorkflow = DBOS.registerWorkflow(
+    async () => {
+      partitionDedupWaitingEvent.set();
+      await partitionDedupBlockingEvent.wait();
+      return DBOS.workflowID;
+    },
+    { name: 'partitionDedupBlockedWorkflow' },
+  );
+
+  // Deduplication is not supported on a sharded system database.
+  testUnlessSharded('partitioned-queue-deduplication', async () => {
+    // A deduplication ID spans every partition of its queue; per-partition dedup means prefixing the partition key.
+    const dedupID = 'partition-dedup-key';
+    const partitionA = 'dedup-a';
+    const partitionB = 'dedup-b';
+
+    // The holder of the key starts on partition A and blocks there.
+    const holder = await DBOS.startWorkflow(partitionDedupBlockedWorkflow, {
+      queueName: partitionQueue.name,
+      enqueueOptions: { queuePartitionKey: partitionA, deduplicationID: dedupID },
+    })();
+    await partitionDedupWaitingEvent.wait();
+    await expect(holder.getStatus()).resolves.toMatchObject({
+      status: StatusString.PENDING,
+      queuePartitionKey: partitionA,
+      deduplicationID: dedupID,
+    });
+
+    // The same key on a different partition collides, through both in-process enqueue paths.
+    await expect(
+      DBOS.startWorkflow(partitionNormalWorkflow, {
         queueName: partitionQueue.name,
-        enqueueOptions: { queuePartitionKey: normalPartitionKey, deduplicationID: 'key' },
-      })();
-    }, Error);
+        enqueueOptions: { queuePartitionKey: partitionB, deduplicationID: dedupID },
+      })(),
+    ).rejects.toBeInstanceOf(DBOSQueueDuplicatedError);
+    await expect(
+      DBOS.enqueueWorkflowWithOptions({
+        queueName: partitionQueue.name,
+        workflowName: 'partitionNormalWorkflow',
+        queuePartitionKey: partitionB,
+        deduplicationID: dedupID,
+      }),
+    ).rejects.toBeInstanceOf(DBOSQueueDuplicatedError);
+
+    // Under 'return-existing', a caller on partition B is handed the partition-A holder.
+    const existing = await DBOS.startWorkflow(partitionNormalWorkflow, {
+      queueName: partitionQueue.name,
+      enqueueOptions: { queuePartitionKey: partitionB, deduplicationID: dedupID },
+      duplicationPolicy: 'return-existing',
+    })();
+    expect(existing.workflowID).toBe(holder.workflowID);
+    await expect(existing.getStatus()).resolves.toMatchObject({ queuePartitionKey: partitionA });
+
+    // A different key on partition B is unaffected by the held key and runs to completion.
+    const otherKey = await DBOS.startWorkflow(partitionNormalWorkflow, {
+      queueName: partitionQueue.name,
+      enqueueOptions: { queuePartitionKey: partitionB, deduplicationID: `${dedupID}-other` },
+    })();
+    await otherKey.getResult();
+
+    // Once the holder reaches a terminal state the key is released for any partition.
+    partitionDedupBlockingEvent.set();
+    await holder.getResult();
+    const reused = await DBOS.startWorkflow(partitionNormalWorkflow, {
+      queueName: partitionQueue.name,
+      enqueueOptions: { queuePartitionKey: partitionB, deduplicationID: dedupID },
+    })();
+    expect(reused.workflowID).not.toBe(holder.workflowID);
+    await expect(reused.getStatus()).resolves.toMatchObject({
+      queuePartitionKey: partitionB,
+      deduplicationID: dedupID,
+    });
+    await reused.getResult();
+  });
+
+  test('partitioned-queue-worker-concurrency', async () => {
+    partitionWorkerConcurrencyBlockingEvent.clear();
+    partitionWorkerConcurrencyStartedEvent.clear();
+    partitionWorkerConcurrencyStartedCount = 0;
+
+    const partitionKey = 'same-partition';
+    const handles = await Promise.all(
+      Array.from({ length: 3 }, () =>
+        DBOS.startWorkflow(partitionWorkerConcurrencyWorkflow, {
+          queueName: partitionWorkerConcurrencyQueue.name,
+          enqueueOptions: { queuePartitionKey: partitionKey },
+        })(),
+      ),
+    );
+
+    try {
+      await partitionWorkerConcurrencyStartedEvent.wait();
+      await sleepms(500);
+      expect(partitionWorkerConcurrencyStartedCount).toBe(1);
+      const statuses = await Promise.all(handles.map((h) => h.getStatus()));
+      expect(statuses.filter((s) => s?.status === StatusString.PENDING)).toHaveLength(1);
+      expect(statuses.filter((s) => s?.status === StatusString.ENQUEUED)).toHaveLength(2);
+      for (const status of statuses) {
+        expect(status?.queuePartitionKey).toBe(partitionKey);
+      }
+    } finally {
+      partitionWorkerConcurrencyBlockingEvent.set();
+    }
+
+    await Promise.all(handles.map((h) => h.getResult()));
   });
 
   test('explicit-queue-listen-test', async () => {
@@ -2012,6 +2298,8 @@ describe('delay-tests', () => {
     expect(completed.workflowID).toBe(waitHandle.workflowID);
     expect((await completed.getStatus())?.status).toBe(StatusString.SUCCESS);
 
+    // Deduplication is not supported on a sharded system database.
+    if (usingSharding()) return;
     // Deduplication: a second enqueue with the same dedup ID should fail while DELAYED
     const dedupID = randomUUID();
     const dedupHandle = await DBOS.startWorkflow(TestDelayWFs, {
@@ -2133,6 +2421,15 @@ describe('database-backed-queue-crud', () => {
 
   test('register-retrieve-delete-and-conflict-resolution', async () => {
     const queueName = `test_crud_queue_${randomUUID()}`;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    // The columns behind the removed priorityEnabled/partitionQueue options are still written.
+    const storedFlags = async () => {
+      const { rows } = await sysdb.pool.query<{ priority_enabled: boolean; partition_queue: boolean }>(
+        `SELECT priority_enabled, partition_queue FROM "${sysdb.schemaName}".queues WHERE name = $1`,
+        [queueName],
+      );
+      return rows[0];
+    };
 
     expect(await DBOS.retrieveQueue(queueName)).toBeNull();
 
@@ -2140,13 +2437,15 @@ describe('database-backed-queue-crud', () => {
       concurrency: 10,
       rateLimit: { limitPerPeriod: 5, periodSec: 1.5 },
       workerConcurrency: 2,
-      priorityEnabled: true,
+      partitionConcurrency: 3,
+      partitionWorkerConcurrency: 2,
+      partitionRateLimit: { limitPerPeriod: 4, periodSec: 2.5 },
       minPollingIntervalMs: 2500,
     });
     expect(registered.name).toBe(queueName);
     expect(registered.databaseBacked).toBe(true);
-    // Database-backed queues are not added to the in-memory registry.
-    expect(wfQueueRunner.wfQueuesByName.has(queueName)).toBe(false);
+    // Database-backed queues are not added to the internal registry.
+    expect(wfQueueRunner.getInternalQueue(queueName)).toBeUndefined();
 
     let retrieved = await DBOS.retrieveQueue(queueName);
     expect(retrieved).not.toBeNull();
@@ -2154,10 +2453,18 @@ describe('database-backed-queue-crud', () => {
     expect(retrieved!.concurrency).toBe(10);
     expect(retrieved!.workerConcurrency).toBe(2);
     expect(retrieved!.rateLimit).toEqual({ limitPerPeriod: 5, periodSec: 1.5 });
-    expect(retrieved!.priorityEnabled).toBe(true);
-    expect(retrieved!.partitionQueue).toBe(false);
+    expect(retrieved!.partitionConcurrency).toBe(3);
+    expect(retrieved!.partitionWorkerConcurrency).toBe(2);
+    expect(retrieved!.partitionRateLimit).toEqual({ limitPerPeriod: 4, periodSec: 2.5 });
+    // Any per-partition limit partitions the queue.
+    expect(isPartitionedQueue(retrieved!)).toBe(true);
+    expect(await storedFlags()).toEqual({ priority_enabled: true, partition_queue: true });
     expect(retrieved!.minPollingIntervalMs).toBe(2500);
     expect(retrieved!.databaseBacked).toBe(true);
+    // The same row reaches the conductor and the dispatcher through listQueues.
+    const listed = (await DBOS.listQueues()).find((q) => q.name === queueName);
+    expect(listed!.partitionConcurrency).toBe(3);
+    expect(listed!.partitionRateLimit).toEqual({ limitPerPeriod: 4, periodSec: 2.5 });
 
     // never_update leaves the existing row alone.
     await DBOS.registerQueue(queueName, { concurrency: 99, onConflict: 'never_update' });
@@ -2172,7 +2479,12 @@ describe('database-backed-queue-crud', () => {
     expect(retrieved!.concurrency).toBe(20);
     expect(retrieved!.workerConcurrency).toBeUndefined();
     expect(retrieved!.rateLimit).toBeUndefined();
-    expect(retrieved!.priorityEnabled).toBe(false);
+    expect(retrieved!.partitionConcurrency).toBeUndefined();
+    expect(retrieved!.partitionWorkerConcurrency).toBeUndefined();
+    expect(retrieved!.partitionRateLimit).toBeUndefined();
+    // Clearing the limits un-partitions the queue along with them.
+    expect(isPartitionedQueue(retrieved!)).toBe(false);
+    expect(await storedFlags()).toEqual({ priority_enabled: true, partition_queue: false });
     expect(retrieved!.minPollingIntervalMs).toBe(1000);
 
     // update_if_latest_version updates when the running version is the latest.
@@ -2181,7 +2493,6 @@ describe('database-backed-queue-crud', () => {
     expect(retrieved!.concurrency).toBe(30);
 
     // If a newer registered version exists, update_if_latest_version no-ops.
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
     const newerVersion = `newer-${randomUUID()}`;
     await sysdb.createApplicationVersion(newerVersion);
     await sysdb.updateApplicationVersionTimestamp(newerVersion, Date.now() + 1_000_000);
@@ -2199,18 +2510,23 @@ describe('database-backed-queue-crud', () => {
 
   test('dynamic-config-via-setters', async () => {
     const queueName = `test_dyn_queue_${randomUUID()}`;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const storedPartitionFlag = async (name: string) => {
+      const { rows } = await sysdb.pool.query<{ partition_queue: boolean }>(
+        `SELECT partition_queue FROM "${sysdb.schemaName}".queues WHERE name = $1`,
+        [name],
+      );
+      return rows[0].partition_queue;
+    };
     const queue = await DBOS.registerQueue(queueName, {
       concurrency: 4,
       workerConcurrency: 2,
-      priorityEnabled: false,
       minPollingIntervalMs: 1000,
     });
 
     await queue.setConcurrency(8);
     await queue.setWorkerConcurrency(3);
     await queue.setRateLimit({ limitPerPeriod: 7, periodSec: 2.0 });
-    await queue.setPriorityEnabled(true);
-    await queue.setPartitionQueue(true);
     await queue.setMinPollingIntervalMs(500);
 
     const fresh = await DBOS.retrieveQueue(queueName);
@@ -2219,37 +2535,66 @@ describe('database-backed-queue-crud', () => {
       expect(q!.concurrency).toBe(8);
       expect(q!.workerConcurrency).toBe(3);
       expect(q!.rateLimit).toEqual({ limitPerPeriod: 7, periodSec: 2.0 });
-      expect(q!.priorityEnabled).toBe(true);
-      expect(q!.partitionQueue).toBe(true);
+      expect(isPartitionedQueue(q!)).toBe(false);
       expect(q!.minPollingIntervalMs).toBe(500);
     }
 
-    // Cross-validation: workerConcurrency cannot exceed concurrency.
-    await expect(queue.setWorkerConcurrency(100)).rejects.toThrow(
-      'workerConcurrency must be less than or equal to concurrency',
-    );
+    // With no per-partition limit set, every limit reads back at queue-wide scope.
+    expect(await queue.getGlobalConcurrency()).toBe(8);
+    expect(await queue.getWorkerConcurrency()).toBe(3);
+    expect(await queue.getRateLimit()).toEqual({ limitPerPeriod: 7, periodSec: 2.0 });
+    expect(await queue.getPartitionConcurrency()).toBeUndefined();
+    expect(await queue.getPartitionWorkerConcurrency()).toBeUndefined();
+    expect(await queue.getPartitionRateLimit()).toBeUndefined();
+
     // Polling interval must be positive.
     await expect(queue.setMinPollingIntervalMs(0)).rejects.toThrow('minPollingIntervalMs must be positive');
 
-    // Rate limit can be cleared.
-    await queue.setRateLimit(undefined);
-    const cleared = await DBOS.retrieveQueue(queueName);
-    expect(cleared!.rateLimit).toBeUndefined();
+    // Setting a per-partition limit partitions the queue; the queue stays partitioned
+    // while any one remains, and un-partitions once the last is cleared.
+    const partName = `partition_dyn_queue_${randomUUID()}`;
+    const part = await DBOS.registerQueue(partName, { globalConcurrency: 8, workerConcurrency: 3 });
+    expect(isPartitionedQueue(part)).toBe(false);
+    await part.setPartitionConcurrency(4);
+    await part.setPartitionWorkerConcurrency(2);
+    await part.setPartitionRateLimit({ limitPerPeriod: 3, periodSec: 1 });
+    expect(await part.getPartitionConcurrency()).toBe(4);
+    expect(await part.getPartitionWorkerConcurrency()).toBe(2);
+    expect(await part.getPartitionRateLimit()).toEqual({ limitPerPeriod: 3, periodSec: 1 });
+    expect(isPartitionedQueue((await DBOS.retrieveQueue(partName))!)).toBe(true);
+    expect(await storedPartitionFlag(partName)).toBe(true);
+    // A per-partition limit may not exceed its queue-wide counterpart.
+    await expect(part.setPartitionConcurrency(100)).rejects.toThrow('less than or equal to globalConcurrency');
+    await expect(part.setPartitionWorkerConcurrency(100)).rejects.toThrow('less than or equal to partitionConcurrency');
+    await part.setPartitionConcurrency(undefined);
+    await part.setPartitionWorkerConcurrency(undefined);
+    expect(isPartitionedQueue((await DBOS.retrieveQueue(partName))!)).toBe(true);
+    await part.setPartitionRateLimit(undefined);
+    expect(isPartitionedQueue((await DBOS.retrieveQueue(partName))!)).toBe(false);
+    // The partition setters keep the persisted flag in step with the limits, as registration does.
+    expect(await storedPartitionFlag(partName)).toBe(false);
 
-    // In-memory queues do not support setters.
-    const legacyName = `legacy_dyn_queue_${randomUUID()}`;
-    const legacy = new WorkflowQueue(legacyName, { concurrency: 2 });
-    expect(legacy.concurrency).toBe(2);
-    expect(legacy.databaseBacked).toBe(false);
-    await expect(legacy.setConcurrency(5)).rejects.toThrow(/dynamic configuration is only supported/);
+    // The queue-wide setters cross-validate against the other limits, and clear.
+    await expect(part.setWorkerConcurrency(100)).rejects.toThrow(
+      'workerConcurrency must be less than or equal to concurrency',
+    );
+    await part.setRateLimit({ limitPerPeriod: 7, periodSec: 2.0 });
+    await part.setRateLimit(undefined);
+    expect((await DBOS.retrieveQueue(partName))!.rateLimit).toBeUndefined();
+    await DBOS.deleteQueue(partName);
+
+    // Internal queues are not persisted, so they do not support setters.
+    const internal = wfQueueRunner.getInternalQueue(INTERNAL_QUEUE_NAME)!;
+    expect(internal.databaseBacked).toBe(false);
+    await expect(internal.setConcurrency(5)).rejects.toThrow(/dynamic configuration is only supported/);
 
     await DBOS.deleteQueue(queueName);
   });
 
   test('supervisor-launches-worker-for-queue-registered-after-launch', async () => {
     const queueName = `supervisor_${randomUUID()}`;
-    // Queue is registered AFTER DBOS launches; the supervisor's discovery
-    // cycle must pick it up and start a worker without a process restart.
+    // Queue is registered AFTER DBOS launches; the dispatcher's reconcile
+    // cycle must pick it up and dispatch it without a process restart.
     await DBOS.registerQueue(queueName, { minPollingIntervalMs: 100 });
 
     const wfid = randomUUID();
@@ -2263,16 +2608,16 @@ describe('database-backed-queue-crud', () => {
     const queueName = `recreate_${randomUUID()}`;
     await DBOS.registerQueue(queueName, { minPollingIntervalMs: 100 });
 
-    // The original worker processes one workflow.
+    // The dispatcher processes one workflow from this queue.
     const h1 = await DBOS.startWorkflow(TestWFs, { workflowID: randomUUID(), queueName }).testWorkflowSimple('a', '1');
     expect(await h1.getResult()).toBe('a1');
 
-    // Deleting the row makes the worker exit on its next iteration.
+    // Deleting the row makes the dispatcher stop dispatching it on its next reconcile.
     await DBOS.deleteQueue(queueName);
     expect(await DBOS.retrieveQueue(queueName)).toBeNull();
 
-    // Re-registering with new config; the supervisor must start a fresh
-    // worker for the new row.
+    // Re-registering with new config; the dispatcher must pick up the new
+    // row on its next reconcile.
     await sleepms(3000);
     await DBOS.registerQueue(queueName, { minPollingIntervalMs: 100, concurrency: 5 });
     expect((await DBOS.retrieveQueue(queueName))!.concurrency).toBe(5);
@@ -2283,44 +2628,35 @@ describe('database-backed-queue-crud', () => {
     await DBOS.deleteQueue(queueName);
   });
 
-  test('listenQueues-mixed-instances-and-strings', async () => {
+  test('listenQueues-restricts-dispatch-to-the-named-queues', async () => {
     // beforeEach already launched DBOS with the default config; reset it so
     // we can launch with a custom listenQueues filter.
     await DBOS.shutdown();
 
-    const inMemQueueName = `inmem_${randomUUID()}`;
-    const allowedDbName = `allowed_db_${randomUUID()}`;
-    const filteredOutDbName = `filtered_db_${randomUUID()}`;
-
-    const inMemQueue = new WorkflowQueue(inMemQueueName, { minPollingIntervalMs: 100 });
+    const allowedName = `listen_allowed_${randomUUID()}`;
+    const filteredOutName = `listen_filtered_${randomUUID()}`;
 
     const cfg = generateDBOSTestConfig();
-    cfg.listenQueues = [inMemQueue, allowedDbName];
+    // Neither queue exists yet: a name that matches nothing at launch is deferred.
+    cfg.listenQueues = [allowedName];
     DBOS.setConfig(cfg);
     await DBOS.launch();
 
-    // Register both DB-backed queues. The supervisor must launch a worker
-    // for the allowed name and skip the filtered one.
-    await DBOS.registerQueue(allowedDbName, { minPollingIntervalMs: 100 });
-    await DBOS.registerQueue(filteredOutDbName, { minPollingIntervalMs: 100 });
+    await DBOS.registerQueue(allowedName, { minPollingIntervalMs: 100 });
+    await DBOS.registerQueue(filteredOutName, { minPollingIntervalMs: 100 });
 
-    // The in-memory queue (passed as an instance) processes its workflow.
-    const h1 = await DBOS.startWorkflow(TestWFs, { queueName: inMemQueueName }).testWorkflowSimple('a', '1');
+    // The listened queue is picked up by a reconcile and runs its workflow.
+    const h1 = await DBOS.startWorkflow(TestWFs, { queueName: allowedName }).testWorkflowSimple('a', '1');
     expect(await h1.getResult()).toBe('a1');
 
-    // The DB-backed queue (passed as a string name) also processes.
-    const h2 = await DBOS.startWorkflow(TestWFs, { queueName: allowedDbName }).testWorkflowSimple('b', '2');
-    expect(await h2.getResult()).toBe('b2');
-
-    // The filtered-out DB-backed queue gets no worker; its workflow stays
-    // ENQUEUED. Wait long enough for several supervisor cycles to confirm
-    // the filter holds.
-    const h3 = await DBOS.startWorkflow(TestWFs, { queueName: filteredOutDbName }).testWorkflowSimple('c', '3');
+    // The filtered-out queue is not dispatched; its workflow stays ENQUEUED.
+    // Wait long enough for several reconcile cycles to confirm the filter holds.
+    const h2 = await DBOS.startWorkflow(TestWFs, { queueName: filteredOutName }).testWorkflowSimple('c', '3');
     await sleepms(2500);
-    expect((await h3.getStatus())?.status).toBe(StatusString.ENQUEUED);
+    expect((await h2.getStatus())?.status).toBe(StatusString.ENQUEUED);
 
-    await DBOS.deleteQueue(allowedDbName);
-    await DBOS.deleteQueue(filteredOutDbName);
+    await DBOS.deleteQueue(allowedName);
+    await DBOS.deleteQueue(filteredOutName);
   });
 
   test('async-getters-reflect-cross-process-changes', async () => {
@@ -2344,59 +2680,51 @@ describe('database-backed-queue-crud', () => {
 
     // A single async getter call refreshes every cached field in one query.
     await q2!.setRateLimit({ limitPerPeriod: 3, periodSec: 1 });
-    await q2!.setPriorityEnabled(true);
+    await q2!.setWorkerConcurrency(4);
     expect(q1!.rateLimit).toBeUndefined();
-    expect(q1!.priorityEnabled).toBe(false);
+    expect(q1!.workerConcurrency).toBeUndefined();
     await q1!.getConcurrency();
     expect(q1!.rateLimit).toEqual({ limitPerPeriod: 3, periodSec: 1 });
-    expect(q1!.priorityEnabled).toBe(true);
+    expect(q1!.workerConcurrency).toBe(4);
 
     // Async getters throw when the row is gone.
     await DBOS.deleteQueue(queueName);
     await expect(q1!.getConcurrency()).rejects.toThrow(/not found in the database/);
 
-    // In-memory queues: getters return cached values without a DB roundtrip.
-    const memName = `test_mem_freshness_${randomUUID()}`;
-    const mem = new WorkflowQueue(memName, { concurrency: 7, priorityEnabled: true });
+    // Internal queues have no row, so their getters return the config they were
+    // registered with rather than throwing the way a deleted queue does.
+    const mem = registerInternalQueue('test_internal_cached_getters', { concurrency: 7, workerConcurrency: 3 });
     expect(await mem.getConcurrency()).toBe(7);
-    expect(await mem.getPriorityEnabled()).toBe(true);
+    expect(await mem.getWorkerConcurrency()).toBe(3);
   });
 
-  test('in-memory-and-db-backed-queues-coexist', async () => {
+  test('unlistened-queue-runs-after-a-restart-that-listens-to-it', async () => {
     // beforeEach already launched DBOS with the default config; restart it
-    // with a custom listenQueues filter so we can exercise mixed listening.
+    // with a custom listenQueues filter so we can exercise selective listening.
     await DBOS.shutdown();
 
-    const listenedMemName = `inmem_listened_${randomUUID()}`;
-    const idleMemName = `inmem_idle_${randomUUID()}`;
-    const dbBackedName = `dbbacked_${randomUUID()}`;
+    const listenedName = `listened_${randomUUID()}`;
+    const idleName = `idle_${randomUUID()}`;
 
-    const listenedMem = new WorkflowQueue(listenedMemName, { minPollingIntervalMs: 100 });
-    new WorkflowQueue(idleMemName, { concurrency: 2, minPollingIntervalMs: 100 });
-
-    // Re-declaring an in-memory queue with the same name throws.
-    expect(() => new WorkflowQueue(listenedMemName)).toThrow(/defined multiple times/);
-
-    // listenQueues accepts a mix of WorkflowQueue instances and string names.
     const cfg = generateDBOSTestConfig();
-    cfg.listenQueues = [listenedMem, dbBackedName];
+    const client = await DBOSClient.create({ systemDatabaseUrl: cfg.systemDatabaseUrl! });
+    await client.registerQueue(listenedName, { minPollingIntervalMs: 100 });
+    await client.registerQueue(idleName, { concurrency: 2, minPollingIntervalMs: 100 });
+    await client.destroy();
+
+    cfg.listenQueues = [listenedName];
     DBOS.setConfig(cfg);
     await DBOS.launch();
 
-    // Register the database-backed queue post-launch; the supervisor picks it
-    // up since it matches the listen filter.
-    await DBOS.registerQueue(dbBackedName, { minPollingIntervalMs: 100 });
+    // The listened queue runs workflows. Priority needs no opt-in on any queue.
+    const listenedHandle = await DBOS.startWorkflow(TestWFs, {
+      queueName: listenedName,
+      enqueueOptions: { priority: 5 },
+    }).testWorkflowSimple('a', '1');
+    expect(await listenedHandle.getResult()).toBe('a1');
 
-    // The listened in-memory queue runs workflows.
-    const memHandle = await DBOS.startWorkflow(TestWFs, { queueName: listenedMemName }).testWorkflowSimple('a', '1');
-    expect(await memHandle.getResult()).toBe('a1');
-
-    // The listened database-backed queue runs workflows.
-    const dbHandle = await DBOS.startWorkflow(TestWFs, { queueName: dbBackedName }).testWorkflowSimple('b', '2');
-    expect(await dbHandle.getResult()).toBe('b2');
-
-    // A workflow enqueued on the un-listened in-memory queue stays ENQUEUED.
-    const idleHandle = await DBOS.startWorkflow(TestWFs, { queueName: idleMemName }).testWorkflowSimple('c', '3');
+    // A workflow enqueued on the un-listened queue stays ENQUEUED.
+    const idleHandle = await DBOS.startWorkflow(TestWFs, { queueName: idleName }).testWorkflowSimple('c', '3');
     await sleepms(2000);
     expect((await idleHandle.getStatus())?.status).toBe(StatusString.ENQUEUED);
 
@@ -2404,14 +2732,15 @@ describe('database-backed-queue-crud', () => {
     // workflow now runs to completion.
     await DBOS.shutdown();
     const cfg2 = generateDBOSTestConfig();
-    cfg2.listenQueues = [idleMemName];
+    cfg2.listenQueues = [idleName];
     DBOS.setConfig(cfg2);
     await DBOS.launch();
 
     const resumed = DBOS.retrieveWorkflow(idleHandle.workflowID);
     expect(await resumed.getResult()).toBe('c3');
 
-    await DBOS.deleteQueue(dbBackedName);
+    await DBOS.deleteQueue(listenedName);
+    await DBOS.deleteQueue(idleName);
   });
 
   class DynConcWFs {
@@ -2446,8 +2775,8 @@ describe('database-backed-queue-crud', () => {
       await sleepms(1000);
       expect(DynConcWFs.startedCount).toBe(1);
 
-      // Bump concurrency. The worker reloads its config from the database on
-      // its next poll iteration and starts the remaining two workflows.
+      // Bump concurrency. The dispatcher reloads config from the database on
+      // its next reconcile cycle and starts the remaining two workflows.
       await queue.setConcurrency(3);
 
       const deadline = Date.now() + 5000;
@@ -2470,7 +2799,7 @@ describe('database-backed-queue-crud', () => {
 
 // Regression test for the "orphan-PENDING" bug in partitioned queue dispatch.
 //
-// Pre-fix: runQueue iterated partition keys, collected wfids from every
+// Pre-fix: the dispatch loop iterated partition keys, collected wfids from every
 // findAndMarkStartableWorkflows call into a single array, and dispatched them
 // after the loop. Each call committed in its own transaction, so the chosen
 // workflow was already PENDING by the time the call returned. If a concurrent
@@ -2501,9 +2830,9 @@ describe('partitioned-queue-orphan-pending', () => {
 
   beforeEach(async () => {
     await DBOS.launch();
+    // partitionConcurrency=2 keeps this queue on the per-partition sweep loop; only 1 uses the batched path.
     await DBOS.registerQueue(STRESS_QUEUE_NAME, {
-      partitionQueue: true,
-      concurrency: 1,
+      partitionConcurrency: 2,
       minPollingIntervalMs: 100,
       onConflict: 'always_update',
     });
@@ -2600,4 +2929,1732 @@ describe('partitioned-queue-orphan-pending', () => {
 
     expect(await queueEntriesAreCleanedUp()).toBe(true);
   }, 20000);
+});
+
+describe('concurrent-queue-dispatches', () => {
+  class ConcurrentDispatchWFs {
+    @DBOS.workflow()
+    static run(value: string): Promise<string> {
+      return Promise.resolve(value);
+    }
+  }
+
+  let config: DBOSConfig;
+  const slowQueueName = 'concurrent-slow-dispatch-queue';
+  const fastQueueName = 'concurrent-fast-dispatch-queue';
+
+  beforeAll(async () => {
+    config = generateDBOSTestConfig();
+    await setUpDBOSTestSysDb(config);
+  });
+
+  afterEach(async () => {
+    clearDebugTriggers();
+    await DBOS.shutdown();
+  });
+
+  async function launchWith(maxConcurrentQueueDispatches: number): Promise<void> {
+    DBOS.setConfig({
+      ...config,
+      maxConcurrentQueueDispatches,
+      listenQueues: [slowQueueName, fastQueueName],
+    });
+    await DBOS.launch();
+  }
+
+  // Register a partitioned "slow" queue plus a normal "fast" queue, enqueue one slow workflow, and
+  // pause its poll mid-partition-dispatch so it holds the slow queue's dispatch lane. Returns the
+  // slow handle and a release function that lets the slow *poll* finish.
+  //
+  // Note the pause point is after the partition's workflows are dispatched, so the slow workflow has
+  // already run by the time the poll parks: only the lane is held, and `slow.getResult()` resolves
+  // whether or not the release happens. Assert on the fast queue to observe lane behavior.
+  async function pauseSlowPoll(): Promise<{ slow: WorkflowHandle<string>; releaseSlowPoll: Event }> {
+    await DBOS.registerQueue(slowQueueName, {
+      // Above 1, so the queue takes the per-partition sweep the pause point lives in.
+      partitionConcurrency: 2,
+      minPollingIntervalMs: 50,
+      onConflict: 'always_update',
+    });
+    await DBOS.registerQueue(fastQueueName, {
+      minPollingIntervalMs: 50,
+      onConflict: 'always_update',
+    });
+
+    const releaseSlowPoll = new Event();
+    let slowPollPaused = false;
+    setDebugTrigger(DEBUG_TRIGGER_BETWEEN_PARTITION_DISPATCHES, {
+      asyncCallback: async () => {
+        slowPollPaused = true;
+        await releaseSlowPoll.wait();
+      },
+    });
+
+    const slow = await DBOS.startWorkflow(ConcurrentDispatchWFs, {
+      queueName: slowQueueName,
+      enqueueOptions: { queuePartitionKey: `partition_${randomUUID()}` },
+    }).run('slow');
+
+    const pauseDeadline = Date.now() + 5000;
+    while (!slowPollPaused && Date.now() < pauseDeadline) {
+      await sleepms(25);
+    }
+    expect(slowPollPaused).toBe(true);
+
+    return { slow, releaseSlowPoll };
+  }
+
+  test('a slow partitioned poll does not block another queue dispatch when a lane is free', async () => {
+    await launchWith(2);
+    const { slow, releaseSlowPoll } = await pauseSlowPoll();
+    try {
+      const fast = await DBOS.startWorkflow(ConcurrentDispatchWFs, { queueName: fastQueueName }).run('fast');
+      // Cancellable timeout so the timer is cleared once the race settles, leaving no dangling handle.
+      let dispatchTimer: ReturnType<typeof setTimeout> | undefined;
+      const dispatchTimeout = new Promise<never>((_resolve, reject) => {
+        dispatchTimer = setTimeout(
+          () => reject(new Error('fast queue did not dispatch while the slow queue poll was in flight')),
+          3000,
+        );
+      });
+      try {
+        await expect(Promise.race([fast.getResult(), dispatchTimeout])).resolves.toBe('fast');
+      } finally {
+        clearTimeout(dispatchTimer);
+      }
+
+      releaseSlowPoll.set();
+      await expect(slow.getResult()).resolves.toBe('slow');
+    } finally {
+      releaseSlowPoll.set();
+      await DBOS.deleteQueue(slowQueueName);
+      await DBOS.deleteQueue(fastQueueName);
+    }
+    // Launch plus the 1s discovery tick already cost seconds before the 3s race below starts.
+  }, 30000);
+
+  test('a slow partitioned poll blocks another queue dispatch at serialized (1) concurrency', async () => {
+    await launchWith(1);
+    const { slow, releaseSlowPoll } = await pauseSlowPoll();
+    try {
+      const fast = await DBOS.startWorkflow(ConcurrentDispatchWFs, { queueName: fastQueueName }).run('fast');
+      const fastResult = fast.getResult();
+      // The single dispatch lane is held by the paused slow poll, so the fast queue cannot be polled:
+      // the timeout must win the race, proving dispatch is serialized at a concurrency of 1.
+      let probeTimer: ReturnType<typeof setTimeout> | undefined;
+      const probe = new Promise<'blocked'>((resolve) => {
+        probeTimer = setTimeout(() => resolve('blocked'), 2000);
+      });
+      try {
+        await expect(Promise.race([fastResult.then(() => 'dispatched' as const), probe])).resolves.toBe('blocked');
+      } finally {
+        clearTimeout(probeTimer);
+      }
+
+      // Releasing the slow poll frees the single lane, which is what finally lets the fast queue be
+      // polled — so `fastResult` is the assertion that proves the lane was the blocker. (`slow` had
+      // already completed before its poll parked; see pauseSlowPoll.)
+      releaseSlowPoll.set();
+      await expect(slow.getResult()).resolves.toBe('slow');
+      await expect(fastResult).resolves.toBe('fast');
+    } finally {
+      releaseSlowPoll.set();
+      await DBOS.deleteQueue(slowQueueName);
+      await DBOS.deleteQueue(fastQueueName);
+    }
+    // Launch plus the 1s discovery tick already cost seconds before the fixed 2s probe starts.
+  }, 30000);
+});
+
+/**
+ * Scheduler-level invariants of the bounded-lane dispatcher, driven against a mock executor:
+ * the lane ceiling, lane release, wake latency, and the shutdown drain. These are properties of
+ * the dispatch loop itself, and the states that expose them (a poll throwing, `stop()` landing
+ * mid-maintenance, N queues contending for fewer lanes) are hard to stage against a real system
+ * database without long sleeps. The `concurrent-queue-dispatches` block above covers the
+ * end-to-end path. Each test's queues reach the dispatcher through the mocked `listQueues`, so
+ * `afterEach` only has to clear the records it served.
+ */
+describe('bounded-lane dispatcher', () => {
+  interface MockHooks {
+    /** Runs inside findAndMarkStartableWorkflows, i.e. while the queue's lane is held. */
+    onPoll?: (queueName: string) => Promise<void>;
+    /** Runs inside listQueues, i.e. while the scheduler loop is mid-body reconciling queues. */
+    onReconcile?: () => Promise<void>;
+  }
+
+  function mockExecutor(hooks: MockHooks): DBOSExecutor {
+    return {
+      executorID: 'lane-test',
+      logger: { info: () => {}, warn: () => {}, debug: () => {}, error: () => {} },
+      dispatchDequeuedWorkflows: () => Promise.resolve(),
+      systemDatabase: {
+        // The dispatcher discovers this test's queues through the queues table.
+        listQueues: async () => {
+          await hooks.onReconcile?.();
+          return laneRecords;
+        },
+        getQueuePartitions: () => Promise.resolve([]),
+        // pollQueue reads this worker's running count before every dequeue.
+        countRunningWorkflowsForQueue: () => 0,
+        // An unsharded database: one unkeyed scope per poll.
+        sharded: false,
+        dequeueScopes: () => Promise.resolve([undefined]),
+        isLockConflict: (e: { code?: string }) => e.code === '55P03',
+        isSerializationConflict: (e: { code?: string }) => e.code === '40001',
+        findAndMarkStartableWorkflows: async (queue: WorkflowQueue) => {
+          // An earlier DBOS.launch() registered the internal queue globally; skip it to keep counters clean.
+          if (queue.name === INTERNAL_QUEUE_NAME) return [];
+          await hooks.onPoll?.(queue.name);
+          return [];
+        },
+      },
+    } as unknown as DBOSExecutor;
+  }
+
+  let seq = 0;
+  let laneRecords: QueueRecord[] = [];
+  /** Build N continuously-due queues under names unique to this test, and return their names. */
+  function makeQueues(count: number): string[] {
+    const tag = `lane-${seq++}`;
+    const records = Array.from({ length: count }, (_, i) =>
+      WorkflowQueue.recordFromParams(`${tag}-q${i}`, { minPollingIntervalMs: 1 }),
+    );
+    laneRecords.push(...records);
+    return records.map((record) => record.name);
+  }
+
+  afterEach(() => {
+    wfQueueRunner.stop();
+    // Restores any global patched via jest.spyOn below; runs even when a test times out.
+    jest.restoreAllMocks();
+    laneRecords = [];
+  });
+
+  test('never runs more concurrent polls than maxConcurrentQueueDispatches', async () => {
+    const LIMIT = 2;
+    let inFlight = 0;
+    let peak = 0;
+
+    const queues = makeQueues(5);
+    const exec = mockExecutor({
+      onPoll: async () => {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        await sleepms(30);
+        inFlight--;
+      },
+    });
+
+    const loop = wfQueueRunner.dispatchLoop(exec, queues, LIMIT);
+    await sleepms(800);
+    wfQueueRunner.stop();
+    await loop;
+
+    // > 1 proves lanes are actually concurrent; <= LIMIT proves they are bounded.
+    // Without the ceiling, all 5 due queues would poll at once.
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThanOrEqual(LIMIT);
+  }, 15000);
+
+  test('defaults to three lanes when no limit is configured', async () => {
+    // The value users get when they set nothing, and the one limit no other test here exercises.
+    let inFlight = 0;
+    let peak = 0;
+
+    const queues = makeQueues(5);
+    const exec = mockExecutor({
+      onPoll: async () => {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        await sleepms(30);
+        inFlight--;
+      },
+    });
+
+    const loop = wfQueueRunner.dispatchLoop(exec, queues);
+    await sleepms(800);
+    wfQueueRunner.stop();
+    await loop;
+
+    // Exact: a default of 1 (or 0, which would stall dispatch entirely) must not pass.
+    expect(peak).toBe(3);
+  }, 15000);
+
+  test('does not spin when more queues are due than there are lanes', async () => {
+    // Lanes stay saturated, so the scheduler must park on the maintenance cadence rather than spin.
+    let polls = 0;
+    let shortParks = 0;
+    const queues = makeQueues(5);
+    const exec = mockExecutor({
+      onPoll: async () => {
+        polls++;
+        await sleepms(30);
+      },
+    });
+
+    // Count every near-instant park, not just 0: without the `Math.max(0, ...)` clamp a spin goes negative.
+    const realSetTimeout = global.setTimeout;
+    jest.spyOn(global, 'setTimeout').mockImplementation(((
+      fn: (...a: unknown[]) => void,
+      delay?: number,
+      ...rest: unknown[]
+    ) => {
+      if (typeof delay === 'number' && delay < 5) shortParks++;
+      return realSetTimeout(fn, delay, ...rest);
+    }) as unknown as typeof global.setTimeout);
+
+    const loop = wfQueueRunner.dispatchLoop(exec, queues, 2);
+    await sleepms(800);
+    wfQueueRunner.stop();
+    await loop;
+
+    // Liveness first: without it a dispatcher that polls nothing would satisfy the bound below.
+    expect(polls).toBeGreaterThan(8);
+    // ~0 while the lanes-busy guard holds; ~800 without it.
+    expect(shortParks).toBeLessThan(20);
+  }, 15000);
+
+  test('never polls the same queue in two lanes at once', async () => {
+    const polling = new Set<string>();
+    let overlapped = false;
+
+    const queues = makeQueues(3);
+    const exec = mockExecutor({
+      onPoll: async (name) => {
+        if (polling.has(name)) overlapped = true;
+        polling.add(name);
+        await sleepms(20);
+        polling.delete(name);
+      },
+    });
+
+    const loop = wfQueueRunner.dispatchLoop(exec, queues, 3);
+    await sleepms(500);
+    wfQueueRunner.stop();
+    await loop;
+
+    expect(overlapped).toBe(false);
+  }, 15000);
+
+  test('serves every queue when more are due than there are lanes', async () => {
+    // Every queue here is perpetually due (1ms interval, 20ms poll), so the due set never
+    // shrinks and the pick order alone decides who runs. Taking the due set in registration
+    // order would re-poll the first two forever and starve the rest; earliest-nextPollAt-first
+    // round-robins, because a queue that just polled carries the newest nextPollAt.
+    const polls = new Map<string, number>();
+
+    const queues = makeQueues(6);
+    const exec = mockExecutor({
+      onPoll: async (name) => {
+        polls.set(name, (polls.get(name) ?? 0) + 1);
+        await sleepms(20);
+      },
+    });
+
+    const loop = wfQueueRunner.dispatchLoop(exec, queues, 2);
+    await sleepms(800);
+    wfQueueRunner.stop();
+    await loop;
+
+    const counts = queues.map((name) => polls.get(name) ?? 0);
+    expect(Math.min(...counts)).toBeGreaterThan(0);
+    // Service is even, not merely non-zero: round-robin leaves at most a poll or two between
+    // the busiest and quietest queue, whereas a biased pick would skew hard.
+    expect(Math.max(...counts) - Math.min(...counts)).toBeLessThanOrEqual(2);
+  }, 15000);
+
+  test('frees a lane as soon as a poll completes, without waiting for the reconcile tick', async () => {
+    // One queue, one lane: every poll after the first requires the completing poll to
+    // wake the scheduler. If the wake handshake is broken the loop instead sleeps until
+    // the next 1s maintenance tick, so throughput collapses to ~1/sec.
+    let polls = 0;
+
+    const queues = makeQueues(1);
+    const exec = mockExecutor({
+      onPoll: async () => {
+        polls++;
+        await sleepms(20);
+      },
+    });
+
+    const loop = wfQueueRunner.dispatchLoop(exec, queues, 1);
+    await sleepms(800);
+    wfQueueRunner.stop();
+    await loop;
+
+    // ~40 polls when wake works; ~1 if it does not. 8 is far outside both distributions.
+    expect(polls).toBeGreaterThan(8);
+  }, 15000);
+
+  test('releases the lane when a poll throws, and keeps dispatching', async () => {
+    // The `'code' in err` guard passes, then reading `.code` throws, escaping pollQueue's catch however it is written.
+    class UnreadableCodeError extends Error {
+      get code(): string {
+        throw new TypeError('unreadable error code');
+      }
+    }
+    let polls = 0;
+
+    const queues = makeQueues(1);
+    const exec = mockExecutor({
+      onPoll: () => {
+        polls++;
+        return Promise.reject(new UnreadableCodeError('poll failed'));
+      },
+    });
+
+    const loop = wfQueueRunner.dispatchLoop(exec, queues, 1);
+    await sleepms(600);
+    wfQueueRunner.stop();
+    await loop;
+
+    // If the throw leaked the lane, dispatch would stop dead after the first poll.
+    expect(polls).toBeGreaterThan(1);
+    // A throw must count as contention, so the lane backs off (2,4,8..256ms => ~9 polls here)
+    // instead of spinning at the 1ms floor (~350+). Without the backoff both spins and
+    // backoffs satisfy the assertion above.
+    expect(polls).toBeLessThan(30);
+  }, 15000);
+
+  test('does not start new polls after stop()', async () => {
+    // stop() lands while the loop is awaiting a global maintenance op, so it resumes
+    // mid-body with isRunning already false.
+    let stopped = false;
+    let reconciles = 0;
+    let pollsAfterStop = 0;
+    let releaseReconcile: (() => void) | undefined;
+
+    // Five queues, two lanes: three stay un-laned and overdue, so the stale `now` cannot make dueness a coin flip.
+    const queues = makeQueues(5);
+    const exec = mockExecutor({
+      onReconcile: async () => {
+        reconciles++;
+        if (reconciles < 2) return; // let the loop reach steady state first
+        await new Promise<void>((resolve) => {
+          releaseReconcile = resolve;
+        });
+      },
+      onPoll: () => {
+        if (stopped) pollsAfterStop++;
+        return Promise.resolve();
+      },
+    });
+
+    const loop = wfQueueRunner.dispatchLoop(exec, queues, 2);
+
+    const deadline = Date.now() + 5000;
+    while (!releaseReconcile && Date.now() < deadline) {
+      await sleepms(10);
+    }
+    expect(releaseReconcile).toBeDefined();
+
+    stopped = true;
+    wfQueueRunner.stop();
+    releaseReconcile!();
+    await loop;
+
+    expect(pollsAfterStop).toBe(0);
+  }, 15000);
+
+  test('waits for in-flight polls to finish before dispatchLoop resolves', async () => {
+    const order: string[] = [];
+    let pollStarted = false;
+
+    const queues = makeQueues(1);
+    const exec = mockExecutor({
+      onPoll: async () => {
+        pollStarted = true;
+        await sleepms(200);
+        order.push('poll-finished');
+      },
+    });
+
+    const loop = wfQueueRunner.dispatchLoop(exec, queues, 1);
+
+    const deadline = Date.now() + 5000;
+    while (!pollStarted && Date.now() < deadline) {
+      await sleepms(5);
+    }
+    expect(pollStarted).toBe(true);
+
+    // stop() while the poll is still in flight; the drain must not abandon it.
+    wfQueueRunner.stop();
+    await loop;
+    order.push('loop-resolved');
+
+    expect(order).toEqual(['poll-finished', 'loop-resolved']);
+  }, 15000);
+
+  /** A sharded mock whose one queue's first poll visits `scopes`; its next poll stops the runner. */
+  function scopedExecutor(
+    scopes: string[],
+    overrides: { claim: () => Promise<string[]>; warn?: (msg: string) => void },
+  ): DBOSExecutor {
+    const base = mockExecutor({});
+    let polls = 0;
+    return {
+      ...base,
+      logger: { ...base.logger, warn: overrides.warn ?? (() => {}) },
+      systemDatabase: {
+        ...base.systemDatabase,
+        sharded: true,
+        isLatestVersion: () => Promise.resolve(true),
+        dequeueScopes: (queueName: string) => {
+          if (queueName === INTERNAL_QUEUE_NAME) return Promise.resolve([]);
+          if (++polls > 1) {
+            wfQueueRunner.stop();
+            return Promise.resolve([]);
+          }
+          return Promise.resolve(scopes);
+        },
+        findAndMarkStartableWorkflows: overrides.claim,
+      },
+    } as unknown as DBOSExecutor;
+  }
+
+  test('backs off once per poll across scopes', async () => {
+    // Serialization conflicts in several scopes back off once, so one contended shard key cannot throttle the others.
+    const name = `lane-${seq++}-contended`;
+    laneRecords.push(WorkflowQueue.recordFromParams(name, { minPollingIntervalMs: 10 }));
+    const warnings: string[] = [];
+    const exec = scopedExecutor(['a', 'b', 'c'], {
+      claim: () => Promise.reject(Object.assign(new Error('could not serialize access'), { code: '40001' })),
+      warn: (msg) => warnings.push(msg),
+    });
+    await wfQueueRunner.dispatchLoop(exec, [name], 1);
+    expect(warnings).toEqual([`Increasing polling interval for queue ${name} to 0.02s due to contention.`]);
+  }, 15000);
+
+  test('stops visiting scopes once the worker is full', async () => {
+    // A poll stops claiming from further scopes once this worker's concurrency is used up.
+    const name = `lane-${seq++}-full`;
+    laneRecords.push(WorkflowQueue.recordFromParams(name, { minPollingIntervalMs: 10, workerConcurrency: 2 }));
+    const claimedScopes: (string | undefined)[] = [];
+    const exec = scopedExecutor(['a', 'b', 'c', 'd'], {
+      // Each scope yields one workflow.
+      claim: () => {
+        claimedScopes.push(scopedShardKey());
+        return Promise.resolve([`wf-${claimedScopes.length}`]);
+      },
+    });
+    await wfQueueRunner.dispatchLoop(exec, [name], 1);
+    expect(claimedScopes).toHaveLength(2);
+    expect(new Set(claimedScopes).size).toBe(2);
+  }, 15000);
+});
+
+// These drive the sweep by hand against unpolled queues (`listenQueues: []` dispatches nothing), so each sweep's exact result set is observable.
+describe('partitioned-batch-dequeue', () => {
+  let config: DBOSConfig;
+  let sysdb: SystemDatabase;
+
+  const batchWorkflow = DBOS.registerWorkflow(async (value: string) => Promise.resolve(value), {
+    name: 'partitionBatchWorkflow',
+  });
+
+  beforeAll(async () => {
+    config = generateDBOSTestConfig();
+    await setUpDBOSTestSysDb(config);
+  });
+
+  beforeEach(async () => {
+    DBOS.setConfig({ ...config, listenQueues: [] });
+    await DBOS.launch();
+    sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+  });
+
+  afterEach(async () => {
+    clearDebugTriggers();
+    await DBOS.shutdown();
+  });
+
+  function registerBatchQueue(name: string, options: QueueParameters = {}): Promise<WorkflowQueue> {
+    return DBOS.registerQueue(name, {
+      partitionConcurrency: 1,
+      onConflict: 'always_update',
+      ...options,
+    });
+  }
+
+  function sweep(queue: WorkflowQueue, executorID: string = 'local'): Promise<string[]> {
+    return sysdb.findAndMarkStartablePartitionedWorkflows(queue, executorID, globalParams.appVersion);
+  }
+
+  // Workflow IDs sort in enqueue order, so a created_at tie still ranks the rows as enqueued.
+  async function enqueuePartitionRows(
+    queueName: string,
+    prefix: string,
+    partitions: string[],
+    perPartition: number,
+  ): Promise<Record<string, string[]>> {
+    const ids: Record<string, string[]> = {};
+    for (const partition of partitions) {
+      ids[partition] = [];
+      for (let i = 0; i < perPartition; i++) {
+        const wfid = `${prefix}-${partition}-${i}`;
+        await DBOS.startWorkflow(batchWorkflow, {
+          workflowID: wfid,
+          queueName,
+          enqueueOptions: { queuePartitionKey: partition },
+        })(wfid);
+        ids[partition].push(wfid);
+      }
+    }
+    return ids;
+  }
+
+  function pinVersion(workflowID: string, version: string | null): Promise<unknown> {
+    return sysdb.pool.query(
+      `UPDATE "${sysdb.schemaName}".workflow_status SET application_version = $1 WHERE workflow_uuid = $2`,
+      [version, workflowID],
+    );
+  }
+
+  test('admits at most the sweep cap per call, rotating onward on the next sweep', async () => {
+    const queueName = `unpolled-sweep-${randomUUID()}`;
+    const queue = await registerBatchQueue(queueName);
+    const partitions = Array.from({ length: 8 }, (_, i) => `p${i}`);
+    const ids = await enqueuePartitionRows(queueName, 'sweep', partitions, 1);
+
+    const originalCap = sysdb.partitionedDequeueSweepCap;
+    sysdb.partitionedDequeueSweepCap = 5;
+    try {
+      // Heads are admitted in partition order; the admitted partitions are then PENDING-gated.
+      expect(await sweep(queue)).toEqual(partitions.slice(0, 5).map((p) => ids[p][0]));
+      expect(await sweep(queue)).toEqual(partitions.slice(5).map((p) => ids[p][0]));
+      expect(await sweep(queue)).toEqual([]);
+    } finally {
+      sysdb.partitionedDequeueSweepCap = originalCap;
+    }
+  });
+
+  test('claims each partition head and admits nothing more until that head finishes', async () => {
+    const queueName = `unpolled-excl-${randomUUID()}`;
+    const queue = await registerBatchQueue(queueName);
+    const partitions = ['p0', 'p1', 'p2'];
+    const ids = await enqueuePartitionRows(queueName, 'excl', partitions, 3);
+
+    // Heads only, one per partition
+    expect(await sweep(queue)).toEqual(partitions.map((p) => ids[p][0]));
+    // Every partition has a PENDING head, so nothing else is admitted
+    expect(await sweep(queue)).toEqual([]);
+    // Completing one partition's head opens that partition alone
+    await sysdb.setWorkflowStatus(ids['p1'][0], StatusString.SUCCESS, false);
+    expect(await sweep(queue)).toEqual([ids['p1'][1]]);
+  });
+
+  test('breaks (priority, created_at) ties by workflow_uuid', async () => {
+    const queueName = `unpolled-tie-${randomUUID()}`;
+    const queue = await registerBatchQueue(queueName);
+    const ids = await enqueuePartitionRows(queueName, 'tie', ['p0'], 3);
+    // Force an exact created_at tie across all three rows
+    await sysdb.pool.query(
+      `UPDATE "${sysdb.schemaName}".workflow_status SET created_at = $1 WHERE workflow_uuid = ANY($2)`,
+      [1234567890, ids['p0']],
+    );
+
+    // Ties resolve by workflow_uuid ascending: "...-0" < "...-1" < "...-2"
+    expect(await sweep(queue)).toEqual([ids['p0'][0]]);
+    await sysdb.setWorkflowStatus(ids['p0'][0], StatusString.SUCCESS, false);
+    expect(await sweep(queue)).toEqual([ids['p0'][1]]);
+  });
+
+  test('drops a candidate that is moved to another queue mid-sweep', async () => {
+    const queueName = `unpolled-requeue-${randomUUID()}`;
+    const queue = await registerBatchQueue(queueName);
+    const ids = await enqueuePartitionRows(queueName, 'requeue', ['p0'], 2);
+    const headID = ids['p0'][0];
+    const resumeTarget = `unpolled-resume-${randomUUID()}`;
+
+    // Fire between the candidate snapshot and the lock select, so the sweep still holds `headID` as its candidate but the claim guard no longer matches the row.
+    let moved = false;
+    setDebugTrigger(DEBUG_TRIGGER_PARTITIONED_DEQUEUE_AFTER_CANDIDATES, {
+      asyncCallback: async () => {
+        if (moved) return;
+        moved = true;
+        await sysdb.resumeWorkflows([headID], resumeTarget);
+      },
+    });
+
+    // The moved head was the sole candidate and must not have been claimed
+    expect(await sweep(queue)).toEqual([]);
+    expect(moved).toBe(true);
+    clearDebugTriggers();
+
+    const status = await sysdb.getWorkflowStatus(headID);
+    expect(status?.status).toBe(StatusString.ENQUEUED);
+    expect(status?.queueName).toBe(resumeTarget);
+
+    // The next sweep sees the remaining row as the partition's new head
+    expect(await sweep(queue)).toEqual([ids['p0'][1]]);
+  });
+
+  test('never co-admits into a partition when two workers sweep concurrently', async () => {
+    const queueName = `unpolled-race-${randomUUID()}`;
+    const queue = await registerBatchQueue(queueName);
+    const partitions = ['p0', 'p1', 'p2', 'p3'];
+    const ids = await enqueuePartitionRows(queueName, 'race', partitions, 2);
+
+    const admitted = (await Promise.all([sweep(queue, 'executor-0'), sweep(queue, 'executor-1')])).flat();
+
+    // Whichever racer wins each head, every head is claimed exactly once and no follower is
+    expect(admitted.sort()).toEqual(partitions.map((p) => ids[p][0]).sort());
+    const { rows } = await sysdb.pool.query<{ queue_partition_key: string; count: string }>(
+      `SELECT queue_partition_key, COUNT(*) AS count
+       FROM "${sysdb.schemaName}".workflow_status
+       WHERE queue_name = $1 AND status = $2
+       GROUP BY queue_partition_key`,
+      [queueName, StatusString.PENDING],
+    );
+    // The returned IDs match the rows actually flipped: one PENDING per partition
+    expect(Object.fromEntries(rows.map((row) => [row.queue_partition_key, Number(row.count)]))).toEqual({
+      p0: 1,
+      p1: 1,
+      p2: 1,
+      p3: 1,
+    });
+  });
+
+  // Issue #1427: sweeps whose heads differ lock disjoint rows, so the partition's lock and the re-picked head keep one PENDING per partition.
+  test.each([
+    ['while the paused sweep holds the partition lock', DEBUG_TRIGGER_PARTITIONED_DEQUEUE_AFTER_CANDIDATES, false],
+    ['before the paused sweep takes the partition lock', DEBUG_TRIGGER_PARTITIONED_DEQUEUE_BEFORE_LOCKS, true],
+  ])('a sweep that misses a new partition head never co-admits into it (%s)', async (_name, trigger, newHeadWins) => {
+    const queueName = `unpolled-newhead-${randomUUID()}`;
+    const queue = await registerBatchQueue(queueName);
+    const partition = 'p0';
+    // Another partition, which the paused sweep's lock must not block.
+    const other = 'p1';
+    const enqueue = async (key: string, priority: number) => {
+      const wfid = `newhead-${key}-${priority}-${randomUUID()}`;
+      await DBOS.startWorkflow(batchWorkflow, {
+        workflowID: wfid,
+        queueName,
+        enqueueOptions: { queuePartitionKey: key, priority },
+      })(wfid);
+      return wfid;
+    };
+    const oldHead = await enqueue(partition, 5);
+
+    let release = () => {};
+    let paused = false;
+    let calls = 0;
+    setDebugTrigger(trigger, {
+      asyncCallback: async () => {
+        if (calls++ === 0) {
+          paused = true;
+          await new Promise<void>((resolve) => (release = resolve));
+        }
+      },
+    });
+    try {
+      const sweepB = sweep(queue, 'executor-b');
+      const deadline = Date.now() + 5000;
+      while (!paused && Date.now() < deadline) await sleepms(10);
+      expect(paused).toBe(true);
+
+      // A head the paused sweep never saw, outranking the one it chose.
+      const newHead = await enqueue(partition, 1);
+      const otherHead = await enqueue(other, 5);
+      const claimedA = await sweep(queue, 'executor-a');
+      release();
+      const claimedB = await sweepB;
+
+      if (newHeadWins) {
+        expect(claimedA).toEqual([newHead, otherHead]);
+        expect(claimedB).toEqual([]);
+      } else {
+        expect(claimedA).toEqual([otherHead]);
+        expect(claimedB).toEqual([oldHead]);
+      }
+      const { rows } = await sysdb.pool.query<{ queue_partition_key: string; count: string }>(
+        `SELECT queue_partition_key, COUNT(*) AS count
+         FROM "${sysdb.schemaName}".workflow_status
+         WHERE queue_name = $1 AND status = $2
+         GROUP BY queue_partition_key`,
+        [queueName, StatusString.PENDING],
+      );
+      expect(Object.fromEntries(rows.map((row) => [row.queue_partition_key, Number(row.count)]))).toEqual({
+        [partition]: 1,
+        [other]: 1,
+      });
+    } finally {
+      release();
+    }
+  });
+
+  test('a batch that fails after an earlier batch committed still returns the committed claims', async () => {
+    const queueName = `unpolled-batchfail-${randomUUID()}`;
+    const queue = await registerBatchQueue(queueName);
+    const partitions = ['p0', 'p1', 'p2'];
+    const ids = await enqueuePartitionRows(queueName, 'batchfail', partitions, 1);
+
+    let calls = 0;
+    setDebugTrigger(DEBUG_TRIGGER_PARTITIONED_DEQUEUE_AFTER_CANDIDATES, {
+      callback: () => {
+        if (calls++ === 1) throw new Error('synthetic batch failure');
+      },
+    });
+    const originalBatchSize = sysdb.partitionedDequeueBatchSize;
+    sysdb.partitionedDequeueBatchSize = 1;
+    try {
+      // The first batch committed, so its claim reaches dispatch; the failed batch and the one after it are left to the next poll.
+      expect(await sweep(queue)).toEqual([ids['p0'][0]]);
+      expect(calls).toBe(2);
+      expect((await sysdb.getWorkflowStatus(ids['p0'][0]))?.status).toBe(StatusString.PENDING);
+      expect((await sysdb.getWorkflowStatus(ids['p1'][0]))?.status).toBe(StatusString.ENQUEUED);
+      expect((await sysdb.getWorkflowStatus(ids['p2'][0]))?.status).toBe(StatusString.ENQUEUED);
+
+      // The rollback released the failed batch's partition lock, so the next sweep claims the rest.
+      clearDebugTriggers();
+      expect(await sweep(queue)).toEqual([ids['p1'][0], ids['p2'][0]]);
+    } finally {
+      sysdb.partitionedDequeueBatchSize = originalBatchSize;
+    }
+  });
+
+  test('a batch that fails before any batch committed throws and claims nothing', async () => {
+    const queueName = `unpolled-batchfail-first-${randomUUID()}`;
+    const queue = await registerBatchQueue(queueName);
+    const partitions = ['p0', 'p1'];
+    const ids = await enqueuePartitionRows(queueName, 'batchfail-first', partitions, 1);
+
+    setDebugTrigger(DEBUG_TRIGGER_PARTITIONED_DEQUEUE_AFTER_CANDIDATES, {
+      callback: () => {
+        throw new Error('synthetic batch failure');
+      },
+    });
+    const originalBatchSize = sysdb.partitionedDequeueBatchSize;
+    sysdb.partitionedDequeueBatchSize = 1;
+    try {
+      await expect(sweep(queue)).rejects.toThrow('synthetic batch failure');
+      for (const p of partitions) {
+        expect((await sysdb.getWorkflowStatus(ids[p][0]))?.status).toBe(StatusString.ENQUEUED);
+      }
+      clearDebugTriggers();
+      expect(await sweep(queue)).toEqual(partitions.map((p) => ids[p][0]));
+    } finally {
+      sysdb.partitionedDequeueBatchSize = originalBatchSize;
+    }
+  });
+
+  test('dequeues only rows eligible for this worker app version', async () => {
+    const queueName = `unpolled-ver-${randomUUID()}`;
+    const queue = await registerBatchQueue(queueName);
+    const ids = await enqueuePartitionRows(queueName, 'ver', ['p0', 'p1'], 3);
+    const newerVersion = `newer-than-this-worker-${randomUUID()}`;
+
+    await pinVersion(ids['p0'][0], 'some-other-version');
+    await pinVersion(ids['p0'][1], globalParams.appVersion);
+    await pinVersion(ids['p0'][2], null);
+    // p1 is entirely ineligible: its head probe yields nothing, so the partition never appears below.
+    for (const wfid of ids['p1']) {
+      await pinVersion(wfid, 'some-other-version');
+    }
+
+    try {
+      // The other-version row is invisible, so the head is row 1; version-less row 2 follows once it completes (this worker is latest).
+      expect(await sweep(queue)).toEqual([ids['p0'][1]]);
+      await sysdb.setWorkflowStatus(ids['p0'][1], StatusString.SUCCESS, false);
+      expect(await sweep(queue)).toEqual([ids['p0'][2]]);
+
+      // Registering a newer version demotes this worker: version-less rows now belong to the newer one.
+      await sysdb.setWorkflowStatus(ids['p0'][2], StatusString.ENQUEUED, false);
+      await pinVersion(ids['p0'][2], null); // dequeueing it above stamped this worker's version on
+      await sysdb.createApplicationVersion(newerVersion);
+      await sysdb.updateApplicationVersionTimestamp(newerVersion, Date.now() + 3_600_000);
+      expect(await sweep(queue)).toEqual([]);
+    } finally {
+      await sysdb.pool.query(`DELETE FROM "${sysdb.schemaName}".application_versions WHERE version_name = $1`, [
+        newerVersion,
+      ]);
+    }
+  });
+});
+
+// Dispatch-level behavior: which queue configurations reach the batched path, and the guarantee it provides end to end.
+describe('partitioned-batch-dequeue-dispatch', () => {
+  let config: DBOSConfig;
+
+  const routedWorkflow = DBOS.registerWorkflow(async (tag: string) => Promise.resolve(tag), {
+    name: 'partitionRoutedWorkflow',
+  });
+
+  const exclusiveOrderLock: string[] = [];
+  const exclusiveBlockingEvent = new Event();
+  const exclusiveWaitingEvent = new Event();
+  const exclusiveHeadWorkflow = DBOS.registerWorkflow(
+    async () => {
+      exclusiveOrderLock.push('head');
+      exclusiveWaitingEvent.set();
+      await exclusiveBlockingEvent.wait();
+      return DBOS.workflowID!;
+    },
+    { name: 'partitionExclusiveHeadWorkflow' },
+  );
+  const exclusiveTaggedWorkflow = DBOS.registerWorkflow(
+    async (tag: string) => {
+      exclusiveOrderLock.push(tag);
+      return Promise.resolve(tag);
+    },
+    { name: 'partitionExclusiveTaggedWorkflow' },
+  );
+
+  beforeAll(async () => {
+    config = generateDBOSTestConfig();
+    await setUpDBOSTestSysDb(config);
+  });
+
+  beforeEach(async () => {
+    DBOS.setConfig(config);
+    await DBOS.launch();
+  });
+
+  afterEach(async () => {
+    exclusiveBlockingEvent.set();
+    await DBOS.shutdown();
+    jest.restoreAllMocks();
+  });
+
+  // Both are per-partition-concurrency-1 queues, so only the limiter / the pause excludes them.
+  test('routes unsupported partitioned configurations away from the batched sweep', async () => {
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const batchedQueues: string[] = [];
+    const sweptQueues: string[] = [];
+    const realBatched = sysdb.findAndMarkStartablePartitionedWorkflows.bind(sysdb);
+    const realSingle = sysdb.findAndMarkStartableWorkflows.bind(sysdb);
+    jest.spyOn(sysdb, 'findAndMarkStartablePartitionedWorkflows').mockImplementation((queue, ...rest) => {
+      batchedQueues.push(queue.name);
+      return realBatched(queue, ...rest);
+    });
+    jest.spyOn(sysdb, 'findAndMarkStartableWorkflows').mockImplementation((queue, ...rest) => {
+      sweptQueues.push(queue.name);
+      return realSingle(queue, ...rest);
+    });
+
+    const limiterQueueName = `limiter_fallback_${randomUUID()}`;
+    const pausedQueueName = `paused_fallback_${randomUUID()}`;
+    await DBOS.registerQueue(limiterQueueName, {
+      partitionConcurrency: 1,
+      partitionRateLimit: { limitPerPeriod: 10, periodSec: 60 },
+      minPollingIntervalMs: 100,
+      onConflict: 'always_update',
+    });
+    await DBOS.registerQueue(pausedQueueName, {
+      partitionConcurrency: 1,
+      workerConcurrency: 0,
+      minPollingIntervalMs: 100,
+      onConflict: 'always_update',
+    });
+
+    const handles = [];
+    for (const partition of ['p0', 'p1']) {
+      handles.push(
+        await DBOS.startWorkflow(routedWorkflow, {
+          queueName: limiterQueueName,
+          enqueueOptions: { queuePartitionKey: partition },
+        })(`limited-${partition}`),
+      );
+    }
+    const pausedHandle = await DBOS.startWorkflow(routedWorkflow, {
+      queueName: pausedQueueName,
+      enqueueOptions: { queuePartitionKey: 'p0' },
+    })('paused');
+
+    // The limiter queue drains through the per-partition sweep.
+    for (const handle of handles) {
+      expect(await handle.getResult()).toBeTruthy();
+    }
+    expect(sweptQueues).toContain(limiterQueueName);
+    expect(batchedQueues).not.toContain(limiterQueueName);
+    // A zero worker limit leaves the worker no budget, so neither path is entered.
+    expect(sweptQueues).not.toContain(pausedQueueName);
+    expect(batchedQueues).not.toContain(pausedQueueName);
+    expect((await pausedHandle.getStatus())?.status).toBe(StatusString.ENQUEUED);
+
+    // The paused workflow never runs, so retire it rather than leave it queued for later tests.
+    await DBOS.cancelWorkflow(pausedHandle.workflowID);
+  }, 30000);
+
+  // Every other batched-path test calls the sweep directly, so this is what pins the dispatch itself.
+  test('runs one workflow at a time per partition, in FIFO order', async () => {
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const batchedQueues: string[] = [];
+    const realBatched = sysdb.findAndMarkStartablePartitionedWorkflows.bind(sysdb);
+    jest.spyOn(sysdb, 'findAndMarkStartablePartitionedWorkflows').mockImplementation((queue, ...rest) => {
+      batchedQueues.push(queue.name);
+      return realBatched(queue, ...rest);
+    });
+
+    exclusiveOrderLock.length = 0;
+    exclusiveBlockingEvent.clear();
+    exclusiveWaitingEvent.clear();
+
+    const queueName = `exclusive_${randomUUID()}`;
+    await DBOS.registerQueue(queueName, {
+      partitionConcurrency: 1,
+      minPollingIntervalMs: 100,
+      onConflict: 'always_update',
+    });
+
+    // Sortable workflow IDs so a created_at tie still ranks partition a as head, a1, a2.
+    const prefix = randomUUID();
+    const headHandle = await DBOS.startWorkflow(exclusiveHeadWorkflow, {
+      workflowID: `${prefix}-0`,
+      queueName,
+      enqueueOptions: { queuePartitionKey: 'a' },
+    })();
+    const follower1 = await DBOS.startWorkflow(exclusiveTaggedWorkflow, {
+      workflowID: `${prefix}-1`,
+      queueName,
+      enqueueOptions: { queuePartitionKey: 'a' },
+    })('a1');
+    const follower2 = await DBOS.startWorkflow(exclusiveTaggedWorkflow, {
+      workflowID: `${prefix}-2`,
+      queueName,
+      enqueueOptions: { queuePartitionKey: 'a' },
+    })('a2');
+    const otherHandle = await DBOS.startWorkflow(exclusiveTaggedWorkflow, {
+      queueName,
+      enqueueOptions: { queuePartitionKey: 'b' },
+    })('b1');
+
+    await exclusiveWaitingEvent.wait();
+    // Partition b drains while a's head blocks; its completion proves a full sweep ran, making the follower assertions meaningful.
+    expect(await otherHandle.getResult()).toBe('b1');
+    expect((await follower1.getStatus())?.status).toBe(StatusString.ENQUEUED);
+    expect((await follower2.getStatus())?.status).toBe(StatusString.ENQUEUED);
+
+    exclusiveBlockingEvent.set();
+    expect(await headHandle.getResult()).toBeTruthy();
+    expect(await follower1.getResult()).toBe('a1');
+    expect(await follower2.getResult()).toBe('a2');
+    expect(exclusiveOrderLock.filter((tag) => tag !== 'b1')).toEqual(['head', 'a1', 'a2']);
+    expect(batchedQueues).toContain(queueName);
+    expect(await queueEntriesAreCleanedUp()).toBe(true);
+  }, 30000);
+});
+
+describe('dequeue-dispatch-cost', () => {
+  const dequeueStarted = new Event();
+  const releaseDequeued = new Event();
+
+  class DispatchCostWF {
+    @DBOS.workflow()
+    static async run(n: number): Promise<number> {
+      return Promise.resolve(n);
+    }
+
+    @DBOS.workflow()
+    static async blockAfterStart(): Promise<void> {
+      dequeueStarted.set();
+      await releaseDequeued.wait();
+    }
+  }
+
+  const QUEUE_NAME = 'dispatch-cost-queue';
+  // Polls one interval out, so the row is observably ENQUEUED before the first claim.
+  const SLOW_QUEUE_NAME = 'dispatch-cost-slow-queue';
+  let config: DBOSConfig;
+
+  beforeAll(async () => {
+    config = generateDBOSTestConfig();
+    await setUpDBOSTestSysDb(config);
+    DBOS.setConfig(config);
+  });
+
+  beforeEach(async () => {
+    dequeueStarted.clear();
+    releaseDequeued.clear();
+    await DBOS.launch();
+    await DBOS.registerQueue(QUEUE_NAME, { onConflict: 'always_update', ...testPolling });
+    await DBOS.registerQueue(SLOW_QUEUE_NAME, { onConflict: 'always_update', minPollingIntervalMs: 3000 });
+  });
+
+  afterEach(async () => {
+    jest.restoreAllMocks();
+    await DBOS.shutdown();
+  });
+
+  test('dispatch-does-not-upsert-workflow-status', async () => {
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const initSpy = jest.spyOn(sysdb, 'initWorkflowStatus');
+
+    const count = 20;
+    const handles: WorkflowHandle<number>[] = [];
+    for (let i = 0; i < count; i++) {
+      handles.push(await DBOS.startWorkflow(DispatchCostWF, { queueName: QUEUE_NAME }).run(i));
+    }
+    for (let i = 0; i < count; i++) {
+      expect(await handles[i].getResult()).toBe(i);
+    }
+
+    // One upsert per enqueue and none per dispatch: dequeuing a claimed row re-reads it, never rewrites it.
+    expect(initSpy).toHaveBeenCalledTimes(count);
+
+    // The claim counts the dispatch exactly once, so a workflow that ran on its first claim sits at 1.
+    for (const handle of handles) {
+      expect((await handle.getStatus())?.recoveryAttempts).toBe(1);
+    }
+    expect(await queueEntriesAreCleanedUp()).toBe(true);
+  }, 30000);
+
+  test('reexecute-helper-fails-fast-on-dispatch-error', async () => {
+    const handle = await DBOS.startWorkflow(DispatchCostWF).run(1);
+    expect(await handle.getResult()).toBe(1);
+
+    // Renamed to a function this process never registered: dispatch throws and the queue only logs it,
+    // leaving the row PENDING. Without a deadline the handle would poll until the jest timeout.
+    const reh = await reexecuteWorkflowById(handle.workflowID, true, 'not-a-registered-workflow', 3000);
+    await expect(reh.getResult()).rejects.toThrow(/produced no result within 3000ms/);
+    expect((await reh.getStatus())?.status).toBe(StatusString.PENDING);
+
+    // Nothing else retires a row stranded this way, and later tests assert the queues are empty.
+    await DBOS.cancelWorkflow(handle.workflowID);
+  }, 30000);
+
+  test('status-fetch-chunks-and-retries-per-chunk', async () => {
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    // Started off-queue so the dispatcher never fetches these rows itself.
+    const handles: WorkflowHandle<number>[] = [];
+    for (let i = 0; i < 5; i++) {
+      handles.push(await DBOS.startWorkflow(DispatchCostWF).run(i));
+    }
+    const ids = handles.map((h) => h.workflowID);
+    for (const handle of handles) {
+      await handle.getResult();
+    }
+
+    const originalChunkSize = sysdb.statusFetchChunkSize;
+    const originalList = sysdb.listWorkflows.bind(sysdb);
+    sysdb.statusFetchChunkSize = 2;
+    let calls = 0;
+    jest.spyOn(sysdb, 'listWorkflows').mockImplementation(async (input, options) => {
+      calls++;
+      if (calls === 2) throw new Error('Connection terminated unexpectedly');
+      return await originalList(input, options);
+    });
+
+    try {
+      const statuses = await sysdb.getWorkflowStatuses(ids);
+      // 5 IDs at chunk size 2 is 3 chunks, plus one refetch of only the chunk that failed.
+      expect(calls).toBe(4);
+      expect([...statuses.keys()].sort()).toEqual([...ids].sort());
+    } finally {
+      jest.restoreAllMocks();
+      sysdb.statusFetchChunkSize = originalChunkSize;
+    }
+  }, 30000);
+
+  test('dequeue-refreshes-updated-at', async () => {
+    const handle = await DBOS.startWorkflow(DispatchCostWF, { queueName: SLOW_QUEUE_NAME }).blockAfterStart();
+
+    try {
+      // Read while the row is still waiting on the first poll; nothing has written it since the enqueue.
+      const enqueued = await handle.getStatus();
+      expect(enqueued?.status).toBe(StatusString.ENQUEUED);
+      const enqueuedUpdatedAt = enqueued!.updatedAt;
+
+      await dequeueStarted.wait();
+      const dequeued = await handle.getStatus();
+      // Still blocked, so the claim is the only write between the two reads.
+      expect(dequeued?.status).toBe(StatusString.PENDING);
+      // Compared against the earlier value of the same column, so app/database clock skew cannot decide it.
+      expect(dequeued!.updatedAt).not.toBe(enqueuedUpdatedAt);
+    } finally {
+      // Released here so a failed assertion fails the test instead of hanging teardown.
+      releaseDequeued.set();
+    }
+
+    await handle.getResult();
+    expect(await queueEntriesAreCleanedUp()).toBe(true);
+  }, 30000);
+
+  test('batch-status-fetch-failure-falls-back-to-single-reads', async () => {
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    // Every batch fetch fails, so each claim is only dispatchable via its own re-read.
+    jest
+      .spyOn(sysdb, 'getWorkflowStatuses')
+      .mockRejectedValue(new Error('Connection terminated unexpectedly') as never);
+
+    const count = 3;
+    const handles: WorkflowHandle<number>[] = [];
+    for (let i = 0; i < count; i++) {
+      handles.push(await DBOS.startWorkflow(DispatchCostWF, { queueName: QUEUE_NAME }).run(i));
+    }
+    for (let i = 0; i < count; i++) {
+      expect(await handles[i].getResult()).toBe(i);
+    }
+    expect(await queueEntriesAreCleanedUp()).toBe(true);
+  }, 30000);
+});
+
+describe('limiter-dequeue-locking', () => {
+  let config: DBOSConfig;
+  let sysdb: SystemDatabase;
+
+  const limitedWorkflow = DBOS.registerWorkflow(async (value: string) => Promise.resolve(value), {
+    name: 'limiterLockWorkflow',
+  });
+
+  beforeAll(async () => {
+    config = generateDBOSTestConfig();
+    await setUpDBOSTestSysDb(config);
+  });
+
+  beforeEach(async () => {
+    // No lane polls these queues, so the rows stay ENQUEUED until this test claims them itself.
+    DBOS.setConfig({ ...config, listenQueues: [] });
+    await DBOS.launch();
+    sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+  });
+
+  afterEach(async () => {
+    await DBOS.shutdown();
+  });
+
+  // A version this executor never runs, so no lane touches these rows.
+  const parkedVersion = 'parked-version';
+  const parkedWorkflow = DBOS.registerWorkflow(() => Promise.resolve('done'), {
+    name: 'limiterParkedWorkflow',
+  });
+
+  async function pendingCount(queueName: string): Promise<number> {
+    const { rows } = await sysdb.pool.query<{ count: string }>(
+      `SELECT COUNT(*) FROM "${sysdb.schemaName}".workflow_status WHERE queue_name = $1 AND status = $2`,
+      [queueName, StatusString.PENDING],
+    );
+    return Number(rows[0].count);
+  }
+
+  test('a peer mid-claim blocks a rate-limited dequeue rather than being skipped past', async () => {
+    const limit = 2;
+    const queueName = `limiter-lock-${randomUUID()}`;
+    const queue = await DBOS.registerQueue(queueName, {
+      rateLimit: { limitPerPeriod: limit, periodSec: 60 },
+      onConflict: 'always_update',
+    });
+
+    // Distinct priorities so the head of the queue is deterministic.
+    const ids: string[] = [];
+    for (let priority = 1; priority <= limit * 2; priority++) {
+      const handle = await DBOS.startWorkflow(limitedWorkflow, {
+        queueName,
+        enqueueOptions: { priority },
+      })(`w${priority}`);
+      ids.push(handle.workflowID);
+    }
+
+    const peer = new Client({ connectionString: config.systemDatabaseUrl });
+    await peer.connect();
+    try {
+      await peer.query('BEGIN');
+      // A peer dequeuer holding an open claim on the whole limiter budget.
+      const head = await peer.query<{ workflow_uuid: string }>(
+        `SELECT workflow_uuid FROM "${sysdb.schemaName}".workflow_status
+         WHERE queue_name = $1 AND status = $2
+         ORDER BY priority ASC, created_at ASC
+         LIMIT ${limit} FOR UPDATE`,
+        [queueName, StatusString.ENQUEUED],
+      );
+      expect(head.rows.map((row) => row.workflow_uuid)).toEqual(ids.slice(0, limit));
+
+      // Under SKIP LOCKED this claims the rows behind the peer, spending the same budget a second time.
+      await expect(
+        sysdb.findAndMarkStartableWorkflows(queue, 'lock-test', globalParams.appVersion, undefined),
+      ).rejects.toMatchObject({ code: '55P03' });
+
+      // Nothing was admitted behind the peer's back.
+      for (const id of ids) {
+        expect((await sysdb.getWorkflowStatus(id))?.status).toBe(StatusString.ENQUEUED);
+      }
+    } finally {
+      await peer.query('ROLLBACK');
+      await peer.end();
+    }
+  }, 30000);
+
+  test.each([
+    ['global-concurrency', { globalConcurrency: 1, partitionConcurrency: 1 }],
+    ['rate-limit', { rateLimit: { limitPerPeriod: 1, periodSec: 60 }, partitionConcurrency: 1 }],
+  ])(
+    'holds a queue-wide limit across executors sweeping different partitions (%s)',
+    async (_name, limits) => {
+      const queueName = `cross_executor_${randomUUID()}`;
+      const queue = await DBOS.registerQueue(queueName, { ...limits, onConflict: 'always_update' });
+
+      let claimedTotal = 0;
+      for (let trial = 0; trial < 5; trial++) {
+        const partitions = [`a${trial}`, `b${trial}`];
+        for (const partition of partitions) {
+          await DBOS.startWorkflow(parkedWorkflow, {
+            queueName,
+            enqueueOptions: { queuePartitionKey: partition, applicationVersion: parkedVersion },
+          })();
+        }
+
+        const claimed = await Promise.all(
+          partitions.map((partition, index) =>
+            sysdb
+              .findAndMarkStartableWorkflows(queue, `executor-${index}`, parkedVersion, partition, 0, 0)
+              // Losing the race is the correct outcome; admitting is not.
+              .catch(() => [] as string[]),
+          ),
+        );
+
+        expect(await pendingCount(queueName)).toBeLessThanOrEqual(1);
+        const trialClaims = claimed.reduce((sum, ids) => sum + ids.length, 0);
+        // One executor always wins: a trial that admits nothing tested an already-spent budget.
+        expect(trialClaims).toBeGreaterThanOrEqual(1);
+        claimedTotal += trialClaims;
+
+        // Retire this trial's claims so the next starts from a free budget. A rate-limit slot is retired
+        // by its window rather than by status, so clear the flag too.
+        for (const id of claimed.flat()) {
+          await sysdb.pool.query(
+            `UPDATE "${sysdb.schemaName}".workflow_status SET status = $1, rate_limited = FALSE WHERE workflow_uuid = $2`,
+            [StatusString.SUCCESS, id],
+          );
+        }
+      }
+      // The limit must bind by admitting work, not by admitting nothing at all.
+      expect(claimedTotal).toBeGreaterThan(0);
+    },
+    30000,
+  );
+
+  // Issue #1427: claimers whose heads differ lock disjoint rows, so only the claim lock keeps them from both spending one budget.
+  test.each([
+    ['higher-priority enqueue', { concurrency: 1 }, undefined, false],
+    ['other application version', { concurrency: 1 }, undefined, true],
+    [
+      'partition, higher-priority enqueue',
+      { partitionConcurrency: 1, partitionRateLimit: { limitPerPeriod: 100, periodSec: 60 } },
+      'p',
+      false,
+    ],
+  ] as const)(
+    'a claimer that misses a new queue head does not overspend the budget (%s)',
+    async (_name, limits, partition, splitVersions) => {
+      const queueName = `claim-lock-${randomUUID()}`;
+      const queue = await DBOS.registerQueue(queueName, { ...limits, onConflict: 'always_update' });
+      const versionB = parkedVersion;
+      const versionA = splitVersions ? `${parkedVersion}-other` : parkedVersion;
+      const enqueue = async (priority: number, applicationVersion: string) =>
+        (
+          await DBOS.startWorkflow(parkedWorkflow, {
+            queueName,
+            enqueueOptions: { priority, applicationVersion, queuePartitionKey: partition },
+          })()
+        ).workflowID;
+
+      const headB = await enqueue(5, versionB);
+
+      // Pause claimer B after it has locked its head, before it marks it PENDING; a background poll of another queue passes through.
+      const claimer = new AsyncLocalStorage<string>();
+      let release = () => {};
+      let paused = false;
+      setDebugTrigger(DEBUG_TRIGGER_FIND_AND_MARK_AFTER_SELECT, {
+        asyncCallback: async () => {
+          if (claimer.getStore() === 'b' && !paused) {
+            paused = true;
+            await new Promise<void>((resolve) => (release = resolve));
+          }
+        },
+      });
+      try {
+        const claimB = claimer.run('b', () =>
+          sysdb.findAndMarkStartableWorkflows(queue, 'executor-b', versionB, partition, 0, 0),
+        );
+        const deadline = Date.now() + 5000;
+        while (!paused && Date.now() < deadline) await sleepms(10);
+        expect(paused).toBe(true);
+
+        // A head the paused claimer cannot see: it outranks the locked one, or only the other version claims it.
+        const headA = await enqueue(1, versionA);
+        const claimA = await sysdb.findAndMarkStartableWorkflows(queue, 'executor-a', versionA, partition, 0, 0);
+        release();
+
+        expect(await claimB).toEqual([headB]);
+        expect(claimA).toEqual([]);
+        expect((await sysdb.getWorkflowStatus(headA))?.status).toBe(StatusString.ENQUEUED);
+        expect(await pendingCount(queueName)).toBe(1);
+      } finally {
+        release();
+        clearDebugTriggers();
+      }
+    },
+    30000,
+  );
+
+  test('saturates deadline on near-maximum timeout to prevent bigint overflow (#1421)', async () => {
+    const queueName = `overflow_timeout_queue_${randomUUID()}`;
+    const queue = await DBOS.registerQueue(queueName, { onConflict: 'always_update' });
+
+    const handle = await DBOS.startWorkflow(parkedWorkflow, {
+      queueName,
+      enqueueOptions: { applicationVersion: parkedVersion },
+    })();
+
+    await sysdb.pool.query(
+      `UPDATE "${sysdb.schemaName}".workflow_status SET workflow_timeout_ms = '9223372036854774807' WHERE workflow_uuid = $1`,
+      [handle.workflowID],
+    );
+
+    const claimed = await sysdb.findAndMarkStartableWorkflows(queue, 'test-executor', parkedVersion);
+    expect(claimed).toContain(handle.workflowID);
+
+    const { rows } = await sysdb.pool.query<{ workflow_deadline_epoch_ms: string }>(
+      `SELECT workflow_deadline_epoch_ms FROM "${sysdb.schemaName}".workflow_status WHERE workflow_uuid = $1`,
+      [handle.workflowID],
+    );
+    expect(rows[0].workflow_deadline_epoch_ms).toBe('9223372036854775807');
+  }, 30000);
+
+  test('saturates deadline on near-maximum timeout in partitioned dequeue (#1421)', async () => {
+    const queueName = `overflow_partitioned_queue_${randomUUID()}`;
+    const queue = await DBOS.registerQueue(queueName, { partitionConcurrency: 1, onConflict: 'always_update' });
+
+    const handle = await DBOS.startWorkflow(parkedWorkflow, {
+      queueName,
+      enqueueOptions: { applicationVersion: parkedVersion, queuePartitionKey: 'p1' },
+    })();
+
+    await sysdb.pool.query(
+      `UPDATE "${sysdb.schemaName}".workflow_status SET workflow_timeout_ms = '9223372036854774807' WHERE workflow_uuid = $1`,
+      [handle.workflowID],
+    );
+
+    const claimed = await sysdb.findAndMarkStartablePartitionedWorkflows(queue, 'test-executor', parkedVersion);
+    expect(claimed).toContain(handle.workflowID);
+
+    const { rows } = await sysdb.pool.query<{ workflow_deadline_epoch_ms: string }>(
+      `SELECT workflow_deadline_epoch_ms FROM "${sysdb.schemaName}".workflow_status WHERE workflow_uuid = $1`,
+      [handle.workflowID],
+    );
+    expect(rows[0].workflow_deadline_epoch_ms).toBe('9223372036854775807');
+  }, 30000);
+});
+
+describe('partition-queue-limits', () => {
+  let config: DBOSConfig;
+
+  const scopeState = {
+    unblock: new Event(),
+    running: new Map<string, number>(),
+    maxRunning: new Map<string, number>(),
+    totalRunning: 0,
+    maxTotalRunning: 0,
+  };
+  const scopeWorkflow = DBOS.registerWorkflow(
+    async (partition: string) => {
+      scopeState.totalRunning += 1;
+      scopeState.maxTotalRunning = Math.max(scopeState.maxTotalRunning, scopeState.totalRunning);
+      const running = (scopeState.running.get(partition) ?? 0) + 1;
+      scopeState.running.set(partition, running);
+      scopeState.maxRunning.set(partition, Math.max(scopeState.maxRunning.get(partition) ?? 0, running));
+      await scopeState.unblock.wait();
+      scopeState.totalRunning -= 1;
+      scopeState.running.set(partition, (scopeState.running.get(partition) ?? 0) - 1);
+      return partition;
+    },
+    { name: 'partitionLimitsScopeWorkflow' },
+  );
+
+  const completedByPartition = new Map<string, number>();
+  const quickWorkflow = DBOS.registerWorkflow(
+    (partition: string) => {
+      completedByPartition.set(partition, (completedByPartition.get(partition) ?? 0) + 1);
+      return Promise.resolve(partition);
+    },
+    { name: 'partitionLimitsQuickWorkflow' },
+  );
+
+  const onePassState = { unblock: new Event(), started: [] as string[] };
+  const onePassWorkflow = DBOS.registerWorkflow(
+    async (partition: string) => {
+      onePassState.started.push(partition);
+      await onePassState.unblock.wait();
+      return partition;
+    },
+    { name: 'partitionLimitsOnePassWorkflow' },
+  );
+
+  const limiterWorkflow = DBOS.registerWorkflow((tag: string) => Promise.resolve(tag), {
+    name: 'partitionLimitsLimiterWorkflow',
+  });
+
+  beforeAll(async () => {
+    config = generateDBOSTestConfig();
+    await setUpDBOSTestSysDb(config);
+  });
+
+  beforeEach(async () => {
+    DBOS.setConfig(config);
+    await DBOS.launch();
+  });
+
+  afterEach(async () => {
+    scopeState.unblock.set();
+    onePassState.unblock.set();
+    await DBOS.shutdown();
+    jest.restoreAllMocks();
+  });
+
+  test('rejects limits that could never bind, or that mix a deprecated option with its replacement', async () => {
+    // Register through the public API, so this covers the path a user actually takes.
+    const register = (params: QueueParameters) => DBOS.registerQueue(`validate_${randomUUID()}`, params);
+    // A deprecated argument cannot be combined with the one replacing it.
+    await expect(register({ concurrency: 1, globalConcurrency: 1 })).rejects.toThrow('set only one of them');
+    // Options removed in 5.0 fail loudly for callers TypeScript cannot check, whatever their value.
+    const removed = (params: Record<string, unknown>) => register(params as QueueParameters);
+    await expect(removed({ partitionQueue: true })).rejects.toThrow(
+      'partitionQueue was removed: set partitionConcurrency',
+    );
+    await expect(removed({ partitionQueue: false })).rejects.toThrow('partitionQueue was removed');
+    await expect(removed({ priorityEnabled: true })).rejects.toThrow(
+      'priorityEnabled was removed: every queue dispatches in priority order',
+    );
+    await expect(removed({ priorityEnabled: undefined })).rejects.toThrow('priorityEnabled was removed');
+    // A per-partition limit above its queue-wide counterpart could never bind.
+    await expect(register({ globalConcurrency: 1, partitionConcurrency: 2 })).rejects.toThrow(
+      'greater than or equal to',
+    );
+    await expect(register({ workerConcurrency: 1, partitionWorkerConcurrency: 2 })).rejects.toThrow(
+      'greater than or equal to',
+    );
+    await expect(register({ partitionConcurrency: 1, partitionWorkerConcurrency: 2 })).rejects.toThrow(
+      'greater than or equal to',
+    );
+    await expect(register({ globalConcurrency: 1, partitionWorkerConcurrency: 2 })).rejects.toThrow(
+      'greater than or equal to',
+    );
+    // Malformed limits are rejected the same way their queue-wide counterparts are.
+    await expect(register({ partitionConcurrency: 0 })).rejects.toThrow('at least 1');
+    await expect(register({ partitionWorkerConcurrency: 0 })).rejects.toThrow('at least 1');
+    await expect(register({ partitionRateLimit: { limitPerPeriod: 1 } as QueueRateLimit })).rejects.toThrow(
+      'both limitPerPeriod and periodSec',
+    );
+  });
+
+  test('rejects a queue name under the prefix reserved for DBOS', async () => {
+    await expect(DBOS.registerQueue('_dbos_my_queue')).rejects.toThrow('is reserved');
+    await expect(DBOS.registerQueue(INTERNAL_QUEUE_NAME, { concurrency: 5 })).rejects.toThrow('is reserved');
+    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    try {
+      await expect(client.registerQueue('_dbos_client_queue')).rejects.toThrow('is reserved');
+    } finally {
+      await client.destroy();
+    }
+    // DBOS's own queues own the prefix: the internal queue is registered under it.
+    expect(wfQueueRunner.getInternalQueue(INTERNAL_QUEUE_NAME)?.name).toBe(INTERNAL_QUEUE_NAME);
+  });
+
+  test.each([
+    // Per-partition concurrency with a queue-wide per-worker limit: the batched sweep.
+    ['partition-and-worker', { partitionConcurrency: 1, workerConcurrency: 3 }, 1, 3],
+    // Per-partition concurrency above one, with a queue-wide global limit: the sweep loop.
+    ['partition-and-global', { partitionConcurrency: 2, globalConcurrency: 3 }, 2, 3],
+    // Both limits on the per-worker axis at once.
+    ['partition-and-worker-axis', { partitionWorkerConcurrency: 2, workerConcurrency: 3 }, 2, 3],
+  ])(
+    'caps each partition and the queue together (%s)',
+    async (_name, limits: QueueParameters, perPartition: number, queueWide: number) => {
+      const partitions = [0, 1, 2, 3].map((i) => `partition-${i}`);
+      scopeState.unblock = new Event();
+      scopeState.running.clear();
+      scopeState.maxRunning.clear();
+      scopeState.totalRunning = 0;
+      scopeState.maxTotalRunning = 0;
+
+      const queueName = `both_scopes_${randomUUID()}`;
+      await DBOS.registerQueue(queueName, { ...limits, ...testPolling, onConflict: 'always_update' });
+
+      const handles: WorkflowHandle<string>[] = [];
+      for (const partition of partitions) {
+        for (let i = 0; i < 3; i++) {
+          handles.push(
+            await DBOS.startWorkflow(scopeWorkflow, {
+              queueName,
+              enqueueOptions: { queuePartitionKey: partition },
+            })(partition),
+          );
+        }
+      }
+
+      // The queue saturates at its queue-wide limit and holds there.
+      await retryUntilSuccess(() => {
+        expect(scopeState.totalRunning).toBe(queueWide);
+      });
+      await sleepms(1000);
+      expect(scopeState.maxTotalRunning).toBe(queueWide);
+      for (const partition of partitions) {
+        expect(scopeState.maxRunning.get(partition) ?? 0).toBeLessThanOrEqual(perPartition);
+      }
+
+      scopeState.unblock.set();
+      for (const handle of handles) {
+        expect(await handle.getResult()).toBeTruthy();
+      }
+      expect(await queueEntriesAreCleanedUp()).toBe(true);
+    },
+    30000,
+  );
+
+  // Measured in units of work, not time, so the assertion does not depend on machine speed.
+  test('does not starve partitions the queue-wide limit cannot serve at once', async () => {
+    const busyBacklog = 60;
+    // The busy partitions sort first, so a fixed sweep order would always prefer them.
+    const busyPartitions = ['aaa-busy-1', 'aaa-busy-2'];
+    const smallPartitions = [0, 1, 2, 3].map((i) => `zzz-small-${i}`);
+    completedByPartition.clear();
+
+    const queueName = `starvation_${randomUUID()}`;
+    await DBOS.registerQueue(queueName, {
+      partitionConcurrency: 1,
+      workerConcurrency: 2,
+      ...testPolling,
+      onConflict: 'always_update',
+    });
+
+    const handles: WorkflowHandle<string>[] = [];
+    for (const partition of busyPartitions) {
+      for (let i = 0; i < busyBacklog; i++) {
+        handles.push(
+          await DBOS.startWorkflow(quickWorkflow, { queueName, enqueueOptions: { queuePartitionKey: partition } })(
+            partition,
+          ),
+        );
+      }
+    }
+    for (const partition of smallPartitions) {
+      handles.push(
+        await DBOS.startWorkflow(quickWorkflow, { queueName, enqueueOptions: { queuePartitionKey: partition } })(
+          partition,
+        ),
+      );
+    }
+
+    await retryUntilSuccess(() => {
+      for (const partition of smallPartitions) {
+        expect(completedByPartition.get(partition) ?? 0).toBeGreaterThan(0);
+      }
+    });
+    // The busy partitions drain at roughly the queue-wide limit per poll, so serving the small ones
+    // promptly leaves most of that backlog outstanding. A fixed order would leave none of it.
+    const busyDone = busyPartitions.reduce((sum, p) => sum + (completedByPartition.get(p) ?? 0), 0);
+    expect(busyDone).toBeLessThan((busyBacklog * busyPartitions.length) / 2);
+
+    for (const handle of handles) {
+      expect(await handle.getResult()).toBeTruthy();
+    }
+    expect(await queueEntriesAreCleanedUp()).toBe(true);
+  }, 60000);
+
+  test('one sweep serves every partition the worker has room for, minus any that is contended', async () => {
+    const workerConcurrency = 8;
+    const partitions = Array.from({ length: workerConcurrency }, (_, i) => `partition-${i}`);
+    const pollingIntervalMs = 3000;
+    onePassState.unblock = new Event();
+    onePassState.started = [];
+
+    // Enqueue before registering, so the queue's first sweep sees the whole backlog rather than racing the poller.
+    const queueName = `one_sweep_${randomUUID()}`;
+    const handles: WorkflowHandle<string>[] = [];
+    for (const partition of partitions) {
+      handles.push(
+        await DBOS.startWorkflow(onePassWorkflow, { queueName, enqueueOptions: { queuePartitionKey: partition } })(
+          partition,
+        ),
+      );
+    }
+
+    // Fail the first partition this queue sweeps, as a peer winning the claim race would.
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const realSingle = sysdb.findAndMarkStartableWorkflows.bind(sysdb);
+    let poisoned = false;
+    jest.spyOn(sysdb, 'findAndMarkStartableWorkflows').mockImplementation((queue, ...rest) => {
+      if (queue.name === queueName && !poisoned) {
+        poisoned = true;
+        const err = new Error('could not obtain lock on row in relation "workflow_status"') as NodeJS.ErrnoException;
+        err.code = '55P03';
+        return Promise.reject(err);
+      }
+      return realSingle(queue, ...rest);
+    });
+
+    await DBOS.registerQueue(queueName, {
+      workerConcurrency,
+      partitionWorkerConcurrency: 1,
+      minPollingIntervalMs: pollingIntervalMs,
+      onConflict: 'always_update',
+    });
+
+    try {
+      await retryUntilSuccess(() => {
+        expect(poisoned).toBe(true);
+      });
+      // Every partition the worker has room for belongs to that one sweep, so they land well
+      // inside a single polling interval: stopping part way, or abandoning the sweep when one
+      // partition is contended, would leave the rest for a later and backed-off poll.
+      await retryUntilSuccess(() => {
+        expect(onePassState.started.length).toBe(workerConcurrency - 1);
+      }, pollingIntervalMs / 2);
+    } finally {
+      // Always release the blocked workflows: leaving them parked would stall shutdown.
+      onePassState.unblock.set();
+    }
+
+    // The contended partition is served by a later poll, so everything still completes.
+    for (const handle of handles) {
+      expect(await handle.getResult()).toBeTruthy();
+    }
+    expect(await queueEntriesAreCleanedUp()).toBe(true);
+  }, 30000);
+
+  test('binds a per-partition rate limit and a queue-wide rate limit at once', async () => {
+    const queueLimit = 3;
+    const partitions = [0, 1, 2, 3].map((i) => `p${i}`);
+
+    const queueName = `partition_and_queue_limiter_${randomUUID()}`;
+    await DBOS.registerQueue(queueName, {
+      rateLimit: { limitPerPeriod: queueLimit, periodSec: 60 },
+      partitionRateLimit: { limitPerPeriod: 1, periodSec: 60 },
+      ...testPolling,
+      onConflict: 'always_update',
+    });
+
+    const ids: string[] = [];
+    for (const partition of partitions) {
+      for (let i = 0; i < 2; i++) {
+        const handle = await DBOS.startWorkflow(limiterWorkflow, {
+          queueName,
+          enqueueOptions: { queuePartitionKey: partition },
+        })(partition);
+        ids.push(handle.workflowID);
+      }
+    }
+
+    const statuses = () => Promise.all(ids.map((id) => DBOS.retrieveWorkflow(id).getStatus()));
+    const succeeded = (all: Awaited<ReturnType<typeof statuses>>) =>
+      all.filter((s) => s?.status === StatusString.SUCCESS).length;
+
+    // The queue-wide window caps the total at three, one from each of three partitions: the
+    // per-partition window admits only one apiece.
+    await retryUntilSuccess(async () => {
+      expect(succeeded(await statuses())).toBe(queueLimit);
+    });
+    await sleepms(1000);
+    const final = await statuses();
+    expect(succeeded(final)).toBe(queueLimit);
+    const startedPartitions = new Set(
+      final.filter((s) => s?.status !== StatusString.ENQUEUED).map((s) => s?.queuePartitionKey),
+    );
+    expect(startedPartitions.size).toBe(queueLimit);
+
+    for (const id of ids) {
+      await DBOS.cancelWorkflow(id);
+    }
+  }, 30000);
 });

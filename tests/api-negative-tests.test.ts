@@ -44,6 +44,11 @@ class TransitionTests {
     await DBOS.sleepms(100);
   }
 
+  @DBOS.workflow()
+  static async sleepStepWF() {
+    return await TransitionTests.sleepStep();
+  }
+
   @knexds.transaction()
   static async oopsCallStep() {
     await TransitionTests.sleepStep();
@@ -59,9 +64,19 @@ class TransitionTests {
     return TransitionTests.leafTransaction();
   }
 
+  @DBOS.workflow()
+  static async oopsCallTransactionFromStepWF() {
+    return await TransitionTests.oopsCallTransactionFromStep();
+  }
+
   @DBOS.step({ retriesAllowed: false })
   static async callStepFromStep() {
     return TransitionTests.sleepStep();
+  }
+
+  @DBOS.workflow()
+  static async callStepFromStepWF() {
+    return await TransitionTests.callStepFromStep();
   }
 
   @knexds.transaction()
@@ -79,6 +94,11 @@ class TransitionTests {
     await DBOS.getEvent('aaa', 'a');
   }
 
+  @DBOS.workflow()
+  static async oopsCallGetFromStepWF() {
+    return await TransitionTests.oopsCallGetFromStep();
+  }
+
   @knexds.transaction()
   static async oopsCallWFFromTransaction() {
     return await TransitionTests.calledWorkflow();
@@ -92,6 +112,11 @@ class TransitionTests {
   @DBOS.step()
   static async oopsCallWFFromStep() {
     return await TransitionTests.calledWorkflow();
+  }
+
+  @DBOS.workflow()
+  static async oopsCallWFFromStepWF() {
+    return await TransitionTests.oopsCallWFFromStep();
   }
 
   @knexds.transaction()
@@ -110,7 +135,13 @@ class TransitionTests {
   }
 
   @DBOS.workflow()
-  static async oopsPatchDisabled() {
+  static async oopsCallStartWFFromStepWF() {
+    return await TransitionTests.oopsCallStartWFFromStep();
+  }
+
+  // Patching needs no flag: a workflow started on this version simply takes the patched branch.
+  @DBOS.workflow()
+  static async patchWithoutFlag() {
     return await DBOS.patch('nope');
   }
 }
@@ -127,36 +158,34 @@ async function main9() {
     await expect(() => TransitionTests.oopsCallSleepWF()).rejects.toThrow(
       'Invalid call to `DBOS.sleep` inside a `transaction`',
     );
-    await TransitionTests.sleepStep();
+    await TransitionTests.sleepStepWF();
     await expect(() => TransitionTests.oopsCallStepWF()).rejects.toThrow(
       'Invalid call to a `step` function from within a `transaction`',
     );
-    await TransitionTests.callStepFromStep();
-    await expect(() => TransitionTests.oopsCallTransactionFromStep()).rejects.toThrow(
+    await TransitionTests.callStepFromStepWF();
+    await expect(() => TransitionTests.oopsCallTransactionFromStepWF()).rejects.toThrow(
       'Invalid call to a `transaction` function from within a `step`',
     );
     await expect(() => TransitionTests.oopsCallGetFromTxWF()).rejects.toThrow(
       'Invalid call to `DBOS.getEvent` inside a `step` or `transaction`',
     );
-    await expect(() => TransitionTests.oopsCallGetFromStep()).rejects.toThrow(
+    await expect(() => TransitionTests.oopsCallGetFromStepWF()).rejects.toThrow(
       'Invalid call to `DBOS.getEvent` inside a `step` or `transaction`',
     );
 
     await expect(() => TransitionTests.oopsCallWFFromTransactionWF()).rejects.toThrow(
       'Invalid call to a `workflow` function from within a `step` or `transaction`',
     );
-    await expect(() => TransitionTests.oopsCallWFFromStep()).rejects.toThrow(
+    await expect(() => TransitionTests.oopsCallWFFromStepWF()).rejects.toThrow(
       'Invalid call to a `workflow` function from within a `step` or `transaction`',
     );
     await expect(() => TransitionTests.oopsCallStartWFFromTransactionWF()).rejects.toThrow(
       'Invalid call to a `workflow` function from within a `step` or `transaction`',
     );
-    await expect(() => TransitionTests.oopsCallStartWFFromStep()).rejects.toThrow(
+    await expect(() => TransitionTests.oopsCallStartWFFromStepWF()).rejects.toThrow(
       'Invalid call to a `workflow` function from within a `step` or `transaction`',
     );
-    await expect(() => TransitionTests.oopsPatchDisabled()).rejects.toThrow(
-      'Patching is not enabled.  See `enablePatching` in `DBOSConfig`',
-    );
+    await expect(TransitionTests.patchWithoutFlag()).resolves.toBe(true);
   } finally {
     await DBOS.shutdown();
   }

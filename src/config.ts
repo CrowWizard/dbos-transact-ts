@@ -1,11 +1,12 @@
-import { readFile } from './utils';
+import { globalParams, readFile } from './utils';
 import { DBOSConfig, DBOSRuntimeConfig, DBOSConfigInternal } from './dbos-executor';
 import YAML from 'yaml';
-import { writeFileSync } from 'fs';
 import path from 'path';
 import assert from 'assert';
 import { maskDatabaseUrl } from './database_utils';
 import { DBOSJSON } from './serialization';
+import { checkExternalStores } from './external_storage';
+import { validateIdleTransactionTimeoutMs, validateObservabilityQueryTimeoutMs } from './system_database';
 
 export const dbosConfigFilePath = 'dbos-config.yaml';
 
@@ -14,22 +15,16 @@ export interface ConfigFile {
   language?: string;
   system_database_url?: string;
   system_database_schema_name?: string;
+  // Whether the system database is sharded; the CLI's database commands then refuse, except `dbos schema --sharding`.
+  sharding?: boolean;
   database?: {
     migrate?: string[];
   };
   telemetry?: {
     logs?: {
-      addContextMetadata?: boolean;
       logLevel?: string;
-      silent?: boolean;
-    };
-    OTLPExporter?: {
-      // naming nit: oltp_exporter
-      logsEndpoint?: string | string[];
-      tracesEndpoint?: string | string[];
     };
   };
-  use_listen_notify?: boolean;
   runtimeConfig?: Partial<DBOSRuntimeConfig>; // naming nit: runtime_config
 }
 
@@ -68,19 +63,6 @@ export async function readConfigFile(dirPath?: string): Promise<ConfigFile> {
         return undefined; // File does not exist
       }
       throw error; // Rethrow other errors
-    }
-  }
-}
-
-export function writeConfigFile(configFile: ConfigFile, configFilePath: string) {
-  try {
-    const configFileContent = YAML.stringify(configFile);
-    writeFileSync(configFilePath, configFileContent);
-  } catch (e) {
-    if (e instanceof Error) {
-      throw new Error(`Failed to write config to ${configFilePath}: ${e.message}`);
-    } else {
-      throw e;
     }
   }
 }
@@ -145,7 +127,6 @@ export function getDbosConfig(
   config: ConfigFile,
   options: {
     logLevel?: string;
-    forceConsole?: boolean;
   } = {},
 ): DBOSConfigInternal {
   assert(
@@ -153,28 +134,46 @@ export function getDbosConfig(
     `Config file specifies invalid language ${config.language}`,
   );
 
-  return translateDbosConfig(
-    {
-      name: config.name,
-      systemDatabaseUrl: config.system_database_url,
-      systemDatabaseSchemaName: config.system_database_schema_name,
-      logLevel: options.logLevel ?? config.telemetry?.logs?.logLevel,
-      addContextMetadata: config.telemetry?.logs?.addContextMetadata,
-      otlpTracesEndpoints: toArray(config.telemetry?.OTLPExporter?.tracesEndpoint),
-      otlpLogsEndpoints: toArray(config.telemetry?.OTLPExporter?.logsEndpoint),
-      runAdminServer: config.runtimeConfig?.runAdminServer,
-      adminPort: config.runtimeConfig?.admin_port,
-      useListenNotify: config.use_listen_notify,
-    },
-    options.forceConsole,
-  );
+  let dbosConfig: Partial<DBOSConfig> = {
+    name: config.name,
+    systemDatabaseUrl: config.system_database_url,
+    systemDatabaseSchemaName: config.system_database_schema_name,
+    logLevel: options.logLevel ?? config.telemetry?.logs?.logLevel,
+  };
+  if (globalParams.dbosCloud) {
+    dbosConfig = overwriteConfigForDBOSCloud(dbosConfig);
+  }
+  return translateDbosConfig(dbosConfig);
 }
 
-function toArray(endpoint: string | string[] | undefined): Array<string> {
-  return endpoint ? (Array.isArray(endpoint) ? endpoint : [endpoint]) : [];
-}
-
-export function translateDbosConfig(options: DBOSConfig, forceConsole: boolean = false): DBOSConfigInternal {
+export function translateDbosConfig(options: Partial<DBOSConfig>): DBOSConfigInternal {
+  if (
+    options.maxConcurrentQueueDispatches !== undefined &&
+    (!Number.isInteger(options.maxConcurrentQueueDispatches) || options.maxConcurrentQueueDispatches <= 0)
+  ) {
+    throw new Error('maxConcurrentQueueDispatches must be a positive integer');
+  }
+  if (
+    options.notificationCoalesceMs !== undefined &&
+    // Reject NaN/inf too (they slip past a bare < 1 check) so the notifier's sleep can't misbehave.
+    (!Number.isFinite(options.notificationCoalesceMs) || options.notificationCoalesceMs < 1)
+  ) {
+    throw new Error('notificationCoalesceMs must be a finite number at least 1 millisecond');
+  }
+  if (
+    options.autoUpgradeIntervalMs !== undefined &&
+    (!Number.isFinite(options.autoUpgradeIntervalMs) || options.autoUpgradeIntervalMs <= 0)
+  ) {
+    throw new Error('autoUpgradeIntervalMs must be a finite positive number of milliseconds');
+  }
+  if (
+    options.autoUpgradeGraceMs !== undefined &&
+    (!Number.isFinite(options.autoUpgradeGraceMs) || options.autoUpgradeGraceMs < 0)
+  ) {
+    throw new Error('autoUpgradeGraceMs must be a finite non-negative number of milliseconds');
+  }
+  validateObservabilityQueryTimeoutMs(options.observabilityQueryTimeoutMs);
+  validateIdleTransactionTimeoutMs(options.systemDatabaseIdleTransactionTimeoutMs);
   const systemDatabaseUrl = getSystemDatabaseUrl({
     system_database_url: options.systemDatabaseUrl,
     name: options.name,
@@ -184,6 +183,7 @@ export function translateDbosConfig(options: DBOSConfig, forceConsole: boolean =
     name: options.name,
     systemDatabaseUrl,
     sysDbPoolSize: options.systemDatabasePoolSize,
+    systemDatabasePollingConcurrency: options.systemDatabasePollingConcurrency,
     systemDatabasePool: options.systemDatabasePool,
     systemDatabaseSchemaName: options.systemDatabaseSchemaName ?? 'dbos',
     serializer: options.serializer ?? DBOSJSON,
@@ -191,7 +191,7 @@ export function translateDbosConfig(options: DBOSConfig, forceConsole: boolean =
       logs: {
         logLevel: options.logLevel || 'info',
         addContextMetadata: options.addContextMetadata,
-        forceConsole,
+        logger: options.logger,
       },
       OTLPExporter: {
         tracesEndpoint: options.otlpTracesEndpoints,
@@ -200,83 +200,41 @@ export function translateDbosConfig(options: DBOSConfig, forceConsole: boolean =
       otelAttributeFormat: options.otelAttributeFormat ?? 'legacy',
     },
     schedulerPollingIntervalMs: options.schedulerPollingIntervalMs,
+    maxConcurrentQueueDispatches: options.maxConcurrentQueueDispatches,
     useListenNotify: options.useListenNotify ?? true,
+    notificationCoalesceMs: options.notificationCoalesceMs,
+    observabilityQueryTimeoutMs: options.observabilityQueryTimeoutMs,
+    systemDatabaseIdleTransactionTimeoutMs: options.systemDatabaseIdleTransactionTimeoutMs,
+    runMigrations: options.runMigrations ?? true,
+    autoUpgrade: options.autoUpgrade === true,
+    autoUpgradeIntervalMs: options.autoUpgradeIntervalMs,
+    autoUpgradeGraceMs: options.autoUpgradeGraceMs,
+    sharding: options.sharding === true,
+    suspendMode: options.suspendMode === true,
+    externalStores: checkExternalStores(options.externalStores),
   };
 }
 
 export function getRuntimeConfig(config: ConfigFile): DBOSRuntimeConfig {
-  return translateRuntimeConfig(config.runtimeConfig);
-}
-
-export function translateRuntimeConfig(
-  config: Partial<DBOSRuntimeConfig & DBOSConfig> /*eww*/ = {},
-): DBOSRuntimeConfig {
   return {
-    runAdminServer: config.runAdminServer ?? true,
-    admin_port: config.admin_port ?? config.adminPort ?? 3001,
-    start: config.start ?? [],
-    setup: config.setup ?? [],
+    start: config.runtimeConfig?.start ?? [],
   };
 }
 
-export function overwriteConfigForDBOSCloud(
-  providedDBOSConfig: DBOSConfigInternal,
-  providedRuntimeConfig: DBOSRuntimeConfig,
-  configFile: ConfigFile,
-): [DBOSConfigInternal, DBOSRuntimeConfig] {
-  // Load the DBOS configuration file and force the use of:
-  // 1. Use the application name from the file. This is a defensive measure to ensure the application name is whatever it was registered with in the cloud
-  // 2. use the database URL from environment var
-  // 3. OTLP traces endpoints (add the config data to the provided config)
-  // 4. Force admin_port and runAdminServer
-
+// DBOS Cloud supplies the registered app name, system database, and OTLP collector through environment variables.
+export function overwriteConfigForDBOSCloud(config: Partial<DBOSConfig>): Partial<DBOSConfig> {
   const systemDatabaseUrl = process.env.DBOS_SYSTEM_DATABASE_URL;
   assert(systemDatabaseUrl, 'DBOS_SYSTEM_DATABASE_URL must be set in DBOS Cloud environment');
 
-  const appName = configFile.name ?? providedDBOSConfig.name;
-
-  const logsSet = new Set(providedDBOSConfig.telemetry.OTLPExporter?.logsEndpoint);
-  const logsEndpoint = configFile.telemetry?.OTLPExporter?.logsEndpoint;
-  if (logsEndpoint) {
-    if (Array.isArray(logsEndpoint)) {
-      logsEndpoint.forEach((endpoint) => logsSet.add(endpoint));
-    } else {
-      logsSet.add(logsEndpoint);
-    }
-  }
-
-  const tracesSet = new Set(providedDBOSConfig.telemetry.OTLPExporter?.tracesEndpoint);
-  const tracesEndpoint = configFile.telemetry?.OTLPExporter?.tracesEndpoint;
-  if (tracesEndpoint) {
-    if (Array.isArray(tracesEndpoint)) {
-      tracesEndpoint.forEach((endpoint) => tracesSet.add(endpoint));
-    } else {
-      tracesSet.add(tracesEndpoint);
-    }
-  }
-
-  const overwritenDBOSConfig: DBOSConfigInternal = {
-    ...providedDBOSConfig,
-    name: appName,
+  return {
+    ...config,
+    name: process.env.DBOS_APP_NAME || config.name,
     systemDatabaseUrl,
-    systemDatabaseSchemaName: configFile.system_database_schema_name ?? providedDBOSConfig.systemDatabaseSchemaName,
-    telemetry: {
-      logs: {
-        ...providedDBOSConfig.telemetry.logs,
-      },
-      OTLPExporter: {
-        logsEndpoint: Array.from(logsSet).filter((e) => !!e),
-        tracesEndpoint: Array.from(tracesSet).filter((e) => !!e),
-      },
-      otelAttributeFormat: providedDBOSConfig.telemetry.otelAttributeFormat,
-    },
+    otlpLogsEndpoints: withEndpoint(config.otlpLogsEndpoints, process.env.DBOS__OTLP_LOGS_ENDPOINT),
+    otlpTracesEndpoints: withEndpoint(config.otlpTracesEndpoints, process.env.DBOS__OTLP_TRACES_ENDPOINT),
   };
+}
 
-  const overwriteDBOSRuntimeConfig: DBOSRuntimeConfig = {
-    ...providedRuntimeConfig,
-    admin_port: 3001,
-    runAdminServer: true,
-  };
-
-  return [overwritenDBOSConfig, overwriteDBOSRuntimeConfig];
+function withEndpoint(endpoints: string[] | undefined, endpoint: string | undefined): string[] {
+  return Array.from(new Set([...(endpoints ?? []), endpoint])).filter((e): e is string => !!e);
 }

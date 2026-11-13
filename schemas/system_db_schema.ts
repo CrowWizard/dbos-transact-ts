@@ -11,7 +11,6 @@ export interface workflow_status {
   error: string;
   assumed_role: string;
   authenticated_roles: string; // Serialized list of roles.
-  request: string; // Serialized event dispatch data (such as HTTPRequest)
   executor_id: string; // Set to "local" for local deployment, set to microVM ID for cloud deployment.
   application_version?: string;
   queue_name?: string;
@@ -28,12 +27,19 @@ export interface workflow_status {
   queue_partition_key?: string; // Partition key for partitioned queues.
   forked_from?: string;
   was_forked_from?: boolean;
-  owner_xid?: string;
+  owner_xid?: string | null; // Token of the execution that currently owns the workflow.
+  creator_xid?: string; // Token of the insert that created the row. Immutable.
   parent_workflow_id?: string;
   serialization: SysDBSerializationFormat | null;
   delay_until_epoch_ms?: number | null;
   rate_limited?: boolean;
   completed_at?: number | null;
+  attributes?: Record<string, unknown> | null; // Custom key-value attributes attached at creation, stored as JSONB.
+  schedule_name?: string | null; // If enqueued by a named schedule, that schedule's name.
+  debounce_deadline_epoch_ms?: number | null; // Absolute cap (epoch ms) beyond which bounces may not extend the delay.
+  is_debounced?: boolean; // True if the deduplication ID is a debounce key cleared on the DELAYED->ENQUEUED transition.
+  application_name?: string | null; // Owning application. NULL means unclaimed: any application may read and claim the row.
+  suspend_key?: string | null; // Topic a SUSPENDED recv waits on; delay_until_epoch_ms holds its wake time.
 }
 
 export interface notifications {
@@ -41,6 +47,7 @@ export interface notifications {
   topic: string;
   message: string;
   consumed: boolean;
+  consumed_by_function_id: number | null;
   serialization: SysDBSerializationFormat | null;
 }
 
@@ -49,6 +56,20 @@ export interface workflow_events {
   key: string;
   value: string;
   serialization: SysDBSerializationFormat | null;
+}
+
+// Split off workflow_status so updating a status no longer rewrites a large input.
+export interface workflow_input {
+  workflow_uuid: string;
+  inputs: string | null;
+  retention_timestamp: number;
+}
+
+export interface workflow_output {
+  workflow_uuid: string;
+  output: string | null;
+  error: string | null;
+  retention_timestamp: number;
 }
 
 export interface operation_outputs {
@@ -61,18 +82,9 @@ export interface operation_outputs {
   started_at_epoch_ms?: number;
   completed_at_epoch_ms?: number;
   serialization: SysDBSerializationFormat | null; // Relevant only to getEvent / recv / etc.
-}
-
-export interface event_dispatch_kv {
-  // Key fields
-  service_name: string;
-  workflow_fn_name: string;
-  key: string;
-
-  // Payload fields
-  value?: string;
-  update_time?: number; // Timestamp of record (for upsert)
-  update_seq?: bigint; // Sequence number of record (for upsert)
+  application_name?: string | null; // Denormalized from the parent so step observability filters without a join.
+  // Sweep order only: the payload sweep deletes by absence of a status row, so this bounds a round rather than deciding what it may delete.
+  retention_timestamp?: number;
 }
 
 export interface streams {
@@ -104,6 +116,15 @@ export interface workflow_schedules {
   automatic_backfill: boolean;
   cron_timezone: string | null;
   queue_name: string | null;
+  application_name?: string | null; // Owning application. NULL means unclaimed; schedule_name stays globally unique.
+}
+
+// Objects stored with DBOS.storeExternalObject; workflow_uuid is the owner.
+export interface external_objects {
+  object_key: string;
+  store_id: string;
+  workflow_uuid: string;
+  created_at: number;
 }
 
 export interface application_versions {
@@ -111,6 +132,7 @@ export interface application_versions {
   version_name: string;
   version_timestamp: number;
   created_at: number;
+  application_name?: string | null; // Owning application. NULL means unclaimed.
 }
 
 export interface queues {
@@ -122,20 +144,15 @@ export interface queues {
   rate_limit_period_sec: number | null;
   priority_enabled: boolean;
   partition_queue: boolean;
+  // Any of these being set partitions the queue; each applies per partition.
+  partition_concurrency: number | null;
+  partition_worker_concurrency: number | null;
+  partition_rate_limit_max: number | null;
+  partition_rate_limit_period_sec: number | null;
   polling_interval_sec: number;
   created_at: number;
   updated_at: number;
-}
-
-// This is the deserialized version of operation_outputs
-export interface step_info {
-  function_id: number;
-  function_name: string;
-  output: unknown;
-  error: Error | null;
-  child_workflow_id: string | null;
-  started_at_epoch_ms?: number;
-  completed_at_epoch_ms?: number;
+  application_name?: string | null; // Owning application. NULL means unclaimed; name stays globally unique.
 }
 
 // This is system DB schema for portable inputs / outputs / messages / events / errors
@@ -154,7 +171,6 @@ export type JsonWorkflowArgs = {
   positionalArgs?: JsonArray;
   namedArgs?: JsonObject;
 };
-export type JsonWorkflowResult = JsonValue;
 export interface JsonWorkflowErrorData {
   name: string; // Error name
   message: string; // Human-readable ;-) string
@@ -172,7 +188,3 @@ export class PortableWorkflowError extends Error {
     super(message);
   }
 }
-
-// --------- Notification(Message) and WF event
-export type JsonMessage = JsonValue;
-export type JsonEvent = JsonValue;

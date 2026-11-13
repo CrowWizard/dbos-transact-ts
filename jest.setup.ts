@@ -1,5 +1,6 @@
+import { workflowTimeoutConfig } from './src/workflow_management';
+
 process.env.PGPASSWORD = process.env.PGPASSWORD ?? 'dbos';
-process.env.FOO = 'foo';
-process.env.BAR = 'bar';
-process.env.BAZ = 'baz';
-process.env.C = 'c';
+
+// Timeout and delay tests assume the background jobs run well within their margins, which the product's 1s interval would not guarantee.
+workflowTimeoutConfig.pollingIntervalMs = 100;

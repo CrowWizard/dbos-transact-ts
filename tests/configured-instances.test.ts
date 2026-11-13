@@ -1,10 +1,14 @@
-import { ConfiguredInstance, DBOS, DBOSConfig } from '../src';
+import { ConfiguredInstance, DBOS, DBOSConfig, StatusString } from '../src';
+import { DBOSExecutor } from '../src/dbos-executor';
+import { DBOSNotRegisteredError } from '../src/error';
 import {
   generateDBOSTestConfig,
   recoverPendingWorkflows,
+  redispatchWorkflowById,
   setUpDBOSTestSysDb,
   setWfAndChildrenToPending,
 } from './helpers';
+import { randomUUID } from 'node:crypto';
 
 class TestFunctions extends ConfiguredInstance {
   constructor(name: string) {
@@ -14,6 +18,11 @@ class TestFunctions extends ConfiguredInstance {
   @DBOS.step()
   async doStep(name: string) {
     return Promise.resolve(`step ${name} done from ${this.name}`);
+  }
+
+  @DBOS.workflow()
+  async doStepWorkflow(name: string) {
+    return await this.doStep(name);
   }
 
   @DBOS.workflow()
@@ -66,40 +75,6 @@ class TestFunctions extends ConfiguredInstance {
   @DBOS.workflow()
   async awaitAPromise() {
     await this.awaitThis;
-  }
-}
-
-@DBOS.defaultRequiredRole(['user'])
-class TestSec extends ConfiguredInstance {
-  constructor(name: string) {
-    super(name);
-  }
-
-  @DBOS.requiredRole([])
-  @DBOS.workflow()
-  async testAuth(name: string) {
-    return Promise.resolve(`hello ${name} from ${this.name}`);
-  }
-
-  @DBOS.workflow()
-  async testWorkflow(name: string) {
-    return Promise.resolve(name);
-  }
-}
-
-class TestSec2 extends ConfiguredInstance {
-  constructor(name: string) {
-    super(name);
-  }
-
-  async initialize() {
-    return Promise.resolve();
-  }
-
-  @DBOS.requiredRole(['user'])
-  @DBOS.workflow()
-  async bye() {
-    return Promise.resolve(`bye ${DBOS.assumedRole} ${DBOS.authenticatedUser} from ${this.name}!`);
   }
 }
 
@@ -170,10 +145,13 @@ async function main4() {
   DBOS.setConfig(config);
   await DBOS.launch();
 
-  const sres1 = await instA.doStep('a');
+  const sres1 = await instA.doStepWorkflow('a');
   expect(sres1).toBe('step a done from A');
-  const sres2 = await instB.doStep('b');
+  const sres2 = await instB.doStepWorkflow('b');
   expect(sres2).toBe('step b done from B');
+
+  // Outside a workflow the same step is a plain call, still bound to its instance.
+  expect(await instA.doStep('a')).toBe('step a done from A');
 
   await DBOS.shutdown();
 }
@@ -252,39 +230,6 @@ async function main6() {
   await DBOS.shutdown();
 }
 
-async function main7() {
-  const testSecInst = new TestSec('Sec1');
-  const testSec2Inst = new TestSec2('Sec2');
-
-  const config = generateDBOSTestConfig();
-  await setUpDBOSTestSysDb(config);
-  DBOS.setConfig(config);
-  await DBOS.launch();
-
-  await expect(async () => {
-    await testSecInst.testWorkflow('unauthorized');
-  }).rejects.toThrow('User does not have a role with permission to call testWorkflow');
-
-  const res = await testSecInst.testAuth('and welcome');
-  expect(res).toBe('hello and welcome from Sec1');
-
-  await expect(async () => {
-    await testSec2Inst.bye();
-  }).rejects.toThrow('User does not have a role with permission to call bye');
-
-  const hijoe = await DBOS.withAuthedContext('joe', ['user'], async () => {
-    return await testSecInst.testWorkflow('joe');
-  });
-  expect(hijoe).toBe('joe');
-
-  const byejoe = await DBOS.withAuthedContext('joe', ['user'], async () => {
-    return await testSec2Inst.bye();
-  });
-  expect(byejoe).toBe('bye user joe from Sec2!');
-
-  await DBOS.shutdown();
-}
-
 // TODO:
 //  Child workflows
 
@@ -301,7 +246,7 @@ describe('dbos-v2api-tests-main', () => {
     await main3();
   });
 
-  test('temp_step_transaction', async () => {
+  test('instance_step', async () => {
     await main4();
   });
 
@@ -311,10 +256,6 @@ describe('dbos-v2api-tests-main', () => {
 
   test('send_recv_get_set', async () => {
     await main6();
-  });
-
-  test('roles', async () => {
-    await main7();
   });
 });
 
@@ -352,6 +293,23 @@ class CCRecovery extends ConfiguredInstance {
 const configA = new CCRecovery('configA', new CCRConfig());
 const configB = new CCRecovery('configB', new CCRConfig());
 
+// Counted outside the instance so it still records a run that reached the body with a null `this`.
+let ccBindingRuns = 0;
+
+class CCBinding extends ConfiguredInstance {
+  constructor(name: string) {
+    super(name);
+  }
+
+  @DBOS.workflow()
+  async boundWorkflow() {
+    ccBindingRuns += 1;
+    return Promise.resolve(this.name);
+  }
+}
+
+const configBind = new CCBinding('configBind');
+
 describe('recovery-cc-tests', () => {
   let config: DBOSConfig;
 
@@ -387,5 +345,32 @@ describe('recovery-cc-tests', () => {
     await expect(handleB.getResult()).resolves.toBe('configB');
     expect(configA.config.count).toBe(10); // Should run twice.
     expect(configB.config.count).toBe(10); // Should run twice.
+  });
+
+  test('dequeue-rejects-an-unregistered-configured-instance', async () => {
+    const handle = await DBOS.startWorkflow(configBind).boundWorkflow();
+    await expect(handle.getResult()).resolves.toBe('configBind');
+    const runsBeforeDispatch = ccBindingRuns;
+
+    // A claimed row is PENDING, which is what the dispatcher hands to executeDequeuedWorkflow.
+    await setWfAndChildrenToPending(handle.workflowID);
+    const sysDB = DBOSExecutor.globalInstance!.systemDatabase;
+    const claimed = (await sysDB.getWorkflowStatus(handle.workflowID))!;
+    expect(claimed.status).toBe(StatusString.PENDING);
+    claimed.workflowConfigName = 'no-such-instance';
+
+    await expect(DBOSExecutor.globalInstance!.executeDequeuedWorkflow(claimed, randomUUID())).rejects.toThrow(
+      DBOSNotRegisteredError,
+    );
+    // Unbound, the body would have run against a null `this` instead of failing to dispatch.
+    expect(ccBindingRuns).toBe(runsBeforeDispatch);
+
+    // Left PENDING, not retired: the instance may be constructed before the next recovery.
+    expect((await sysDB.getWorkflowStatus(handle.workflowID))?.status).toBe(StatusString.PENDING);
+
+    // Dispatched again against the row's real instance name, it still runs to completion.
+    await expect((await redispatchWorkflowById(handle.workflowID)).getResult()).resolves.toBe('configBind');
+    expect(ccBindingRuns).toBe(runsBeforeDispatch + 1);
+    expect((await sysDB.getWorkflowStatus(handle.workflowID))?.status).toBe(StatusString.SUCCESS);
   });
 });

@@ -1,19 +1,36 @@
-import { DBOS, DBOSWorkflowConflictError, FunctionName } from '@dbos-inc/dbos-sdk';
+import { DBOS, FunctionName } from '@dbos-inc/dbos-sdk';
 import {
   type DataSourceTransactionHandler,
   isPGRetriableTransactionError,
-  isPGKeyConflictError,
+  DBOSError,
+  DBOSStepAlreadyRecordedError,
+  DBOSWorkflowConflictError,
+  assertStillOwnsWorkflow,
+  checkpointWorkflowID,
+  replayRecordedStep,
   registerTransaction,
   runTransaction,
   DBOSDataSource,
   registerDataSource,
-  createTransactionCompletionSchemaPG,
-  createTransactionCompletionTablePG,
-  CheckSchemaInstallationReturn,
-  checkSchemaInstallationPG,
+  DataSourceMigrationOptions,
+  DataSourceSQLExecutor,
+  initializeDataSourceSchemaPG,
+  migrateDataSourcePG,
+  verifyDataSourcePG,
 } from '@dbos-inc/dbos-sdk/datasource';
 import { AsyncLocalStorage } from 'async_hooks';
 import { SuperJSON } from 'superjson';
+
+// Prisma reports a failed raw query's SQLSTATE in `meta` rather than on the error itself,
+// and reports a write conflict raised by its own query API as P2034 with no SQLSTATE at all.
+function unwrapPrismaError(error: unknown): unknown {
+  const prismaError = (error as { code?: unknown; meta?: unknown } | null) ?? undefined;
+  if (prismaError?.code === 'P2034') {
+    return { code: '40001' };
+  }
+  const meta = prismaError?.meta;
+  return meta && typeof meta === 'object' && 'code' in meta ? meta : error;
+}
 
 type PrismaLike = {
   $connect: () => Promise<void>;
@@ -43,14 +60,28 @@ export type TransactionConfig = {
 
 const asyncLocalCtx = new AsyncLocalStorage<PrismaDataSourceContext>();
 
+function prismaExecutor(prisma: PrismaLike): DataSourceSQLExecutor {
+  return async (text) => {
+    // Only queries return rows; statements go through $executeRawUnsafe, which decodes no result columns.
+    if (/^\s*SELECT\b/i.test(text)) {
+      return await prisma.$queryRawUnsafe<Record<string, unknown>[]>(text);
+    }
+    await prisma.$executeRawUnsafe(text);
+    return [];
+  };
+}
+
+// Waiting on a concurrent migrator's lock can outlast Prisma's default interactive-transaction timeout.
+const MIGRATION_TRANSACTION_OPTIONS = { maxWait: 60_000, timeout: 60_000 };
+
 class PrismaTransactionHandler implements DataSourceTransactionHandler {
-  readonly dsType = 'PrismaDataSource';
   readonly schemaName: string;
 
   constructor(
     readonly name: string,
     private readonly prismaAccess: PrismaLike | (() => PrismaLike),
     schemaName: string = 'dbos',
+    private readonly options: DataSourceMigrationOptions = {},
   ) {
     this.schemaName = schemaName;
   }
@@ -70,34 +101,38 @@ class PrismaTransactionHandler implements DataSourceTransactionHandler {
   }
 
   async initialize(): Promise<void> {
-    let installed = false;
-    try {
-      const res = await this.#prismaDB.$queryRawUnsafe<CheckSchemaInstallationReturn[]>(
-        checkSchemaInstallationPG(this.schemaName),
-      );
-      installed = !!res[0]?.schema_exists && !!res[0]?.table_exists;
-    } catch (e) {
-      throw new Error(
-        `In initialization of 'PrismaDataSource' ${this.name}: Database could not be queried: ${(e as Error).message}`,
-      );
+    if (this.options.runMigrations === false) {
+      await verifyDataSourcePG(prismaExecutor(this.#prismaDB), this.schemaName, this.name);
+      return;
     }
 
-    // Install
-    if (!installed) {
-      try {
-        await this.#prismaDB.$executeRawUnsafe(createTransactionCompletionSchemaPG(this.schemaName));
-        await this.#prismaDB.$executeRawUnsafe(createTransactionCompletionTablePG(this.schemaName));
-      } catch (err) {
-        throw new Error(
-          `In initialization of 'PrismaDataSource' ${this.name}: The '${this.schemaName}.transaction_completion' table does not exist, and could not be created.  This should be added to your database migrations.
+    try {
+      await (this.#prismaDB as unknown as PrismaLikeTx).$transaction(
+        (tx) => migrateDataSourcePG(prismaExecutor(tx), this.schemaName),
+        MIGRATION_TRANSACTION_OPTIONS,
+      );
+    } catch (err) {
+      throw new Error(
+        `In initialization of 'PrismaDataSource' ${this.name}: The '${this.schemaName}' transaction schema could not be migrated: ${(err as Error).message}. This should be added to your database migrations.
           See: https://docs.dbos.dev/typescript/tutorials/transaction-tutorial#installing-the-dbos-schema`,
-        );
-      }
+      );
     }
   }
 
   destroy(): Promise<void> {
     return Promise.resolve();
+  }
+
+  async deleteCheckpoints(workflowID: string, startStep: number, beforeCommit?: () => Promise<void>): Promise<void> {
+    await (this.#prismaDB as unknown as PrismaLikeTx).$transaction(async (client) => {
+      await client.$executeRawUnsafe(
+        `DELETE FROM "${this.schemaName}".transaction_completion
+        WHERE workflow_id = $1 AND function_num >= $2`,
+        checkpointWorkflowID(workflowID),
+        startStep,
+      );
+      await beforeCommit?.();
+    });
   }
 
   async #checkExecution(
@@ -109,7 +144,7 @@ class PrismaTransactionHandler implements DataSourceTransactionHandler {
     const result = await client.$queryRawUnsafe<Result[]>(
       `SELECT output, error FROM "${this.schemaName}".transaction_completion
       WHERE workflow_id = $1 AND function_num = $2`,
-      workflowID,
+      checkpointWorkflowID(workflowID),
       stepID,
     );
     if (result?.[0] === undefined) {
@@ -120,21 +155,29 @@ class PrismaTransactionHandler implements DataSourceTransactionHandler {
   }
 
   async #recordError(workflowID: string, stepID: number, error: string): Promise<void> {
-    try {
-      await this.#prismaDB.$executeRawUnsafe(
-        `INSERT INTO "${this.schemaName}".transaction_completion (workflow_id, function_num, error) 
-        VALUES ($1, $2, $3)`,
-        workflowID,
-        stepID,
-        error,
-      );
-    } catch (error) {
-      if (isPGKeyConflictError(error)) {
-        throw new DBOSWorkflowConflictError(workflowID);
-      } else {
-        throw error;
-      }
+    // $executeRawUnsafe reports affected rows, so DO NOTHING yields 0 when a duplicate won.
+    const inserted = await this.#prismaDB.$executeRawUnsafe(
+      `INSERT INTO "${this.schemaName}".transaction_completion (workflow_id, function_num, error)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (workflow_id, function_num) DO NOTHING`,
+      checkpointWorkflowID(workflowID),
+      stepID,
+      error,
+    );
+    if (inserted === 0) {
+      throw new DBOSStepAlreadyRecordedError(workflowID, stepID);
     }
+  }
+
+  // A duplicate execution won the race, so its recorded outcome is the durable one.
+  async #replayConflictingStep<Return>(workflowID: string, stepID: number): Promise<Return> {
+    const recorded = await this.#checkExecution(this.#prismaDB, workflowID, stepID);
+    if (recorded === undefined) {
+      throw new DBOSError(
+        `Step ${stepID} of workflow ${workflowID} conflicted with a concurrent execution, but no recorded outcome was found`,
+      );
+    }
+    return replayRecordedStep<Return>(recorded);
   }
 
   static async #recordOutput(
@@ -144,21 +187,19 @@ class PrismaTransactionHandler implements DataSourceTransactionHandler {
     output: string | null,
     schemaName: string,
   ): Promise<void> {
-    try {
-      await client.$executeRawUnsafe(
-        `INSERT INTO "${schemaName}".transaction_completion (workflow_id, function_num, output) 
-         VALUES ($1, $2, $3)`,
-        workflowID,
-        stepID,
-        output,
-      );
-    } catch (error) {
-      if (isPGKeyConflictError(error)) {
-        throw new DBOSWorkflowConflictError(workflowID);
-      } else {
-        throw error;
-      }
+    const inserted = await client.$executeRawUnsafe(
+      `INSERT INTO "${schemaName}".transaction_completion (workflow_id, function_num, output)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (workflow_id, function_num) DO NOTHING`,
+      checkpointWorkflowID(workflowID),
+      stepID,
+      output,
+    );
+    if (inserted === 0) {
+      throw new DBOSStepAlreadyRecordedError(workflowID, stepID);
     }
+    // Holding this step's row, so a later owner's insert waits on our commit.
+    await assertStillOwnsWorkflow(workflowID);
   }
 
   async invokeTransactionFunction<This, Args extends unknown[], Return>(
@@ -185,12 +226,7 @@ class PrismaTransactionHandler implements DataSourceTransactionHandler {
       // Check to see if this tx has already been executed
       const previousResult = saveResults ? await this.#checkExecution(this.#prismaDB, workflowID, stepID!) : undefined;
       if (previousResult) {
-        DBOS.span?.setAttribute('cached', true);
-
-        if ('error' in previousResult) {
-          throw SuperJSON.parse(previousResult.error);
-        }
-        return (previousResult.output ? SuperJSON.parse(previousResult.output) : null) as Return;
+        return replayRecordedStep<Return>(previousResult);
       }
 
       try {
@@ -219,7 +255,12 @@ class PrismaTransactionHandler implements DataSourceTransactionHandler {
 
         return result;
       } catch (error) {
-        if (isPGRetriableTransactionError(error)) {
+        if (saveResults && error instanceof DBOSStepAlreadyRecordedError) {
+          return await this.#replayConflictingStep<Return>(workflowID, stepID!);
+        }
+        // The new owner wins; recording an error here would replay it as this step's outcome.
+        if (error instanceof DBOSWorkflowConflictError) throw error;
+        if (isPGRetriableTransactionError(unwrapPrismaError(error))) {
           DBOS.span?.addEvent('TXN SERIALIZATION FAILURE', { retryWaitMillis: retryWaitMS }, performance.now());
           await new Promise((resolve) => setTimeout(resolve, retryWaitMS));
           retryWaitMS = Math.min(retryWaitMS * backoffFactor, maxRetryWaitMS);
@@ -227,7 +268,14 @@ class PrismaTransactionHandler implements DataSourceTransactionHandler {
         } else {
           if (saveResults) {
             const message = SuperJSON.stringify(error);
-            await this.#recordError(workflowID, stepID!, message);
+            try {
+              await this.#recordError(workflowID, stepID!, message);
+            } catch (recordError) {
+              if (recordError instanceof DBOSStepAlreadyRecordedError) {
+                return await this.#replayConflictingStep<Return>(workflowID, stepID!);
+              }
+              throw recordError;
+            }
           }
 
           throw error;
@@ -254,9 +302,19 @@ export class PrismaDataSource<PrismaClient> implements DBOSDataSource<Transactio
     return PrismaDataSource.#getClient(this.#provider) as PrismaClient;
   }
 
-  static async initializeDBOSSchema(prisma: PrismaLike, schemaName: string = 'dbos') {
-    await prisma.$queryRawUnsafe(createTransactionCompletionSchemaPG(schemaName));
-    await prisma.$queryRawUnsafe(createTransactionCompletionTablePG(schemaName));
+  /**
+   * Create or migrate the DBOS transaction schema, typically with a privileged role,
+   * optionally granting `applicationRole` the minimal permissions to use it.
+   */
+  static async initializeDBOSSchema(
+    prisma: PrismaLike,
+    schemaName: string = 'dbos',
+    options: { applicationRole?: string } = {},
+  ) {
+    await (prisma as unknown as PrismaLikeTx).$transaction(
+      (tx) => initializeDataSourceSchemaPG(prismaExecutor(tx), schemaName, options.applicationRole),
+      MIGRATION_TRANSACTION_OPTIONS,
+    );
   }
 
   static async uninitializeDBOSSchema(prisma: PrismaLike, schemaName: string = 'dbos') {
@@ -270,8 +328,9 @@ export class PrismaDataSource<PrismaClient> implements DBOSDataSource<Transactio
     readonly name: string,
     prismaAccess: PrismaLike | (() => PrismaLike),
     schemaName: string = 'dbos',
+    options: DataSourceMigrationOptions = {},
   ) {
-    this.#provider = new PrismaTransactionHandler(name, prismaAccess, schemaName);
+    this.#provider = new PrismaTransactionHandler(name, prismaAccess, schemaName, options);
     registerDataSource(this.#provider);
   }
 

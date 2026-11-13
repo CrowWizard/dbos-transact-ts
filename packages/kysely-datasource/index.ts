@@ -1,18 +1,25 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 // using https://kysely.dev/
-import { DBOS, DBOSWorkflowConflictError, FunctionName } from '@dbos-inc/dbos-sdk';
+import { DBOS, FunctionName } from '@dbos-inc/dbos-sdk';
 import {
   type DataSourceTransactionHandler,
   isPGRetriableTransactionError,
-  isPGKeyConflictError,
+  DBOSError,
+  DBOSStepAlreadyRecordedError,
+  DBOSWorkflowConflictError,
+  assertStillOwnsWorkflow,
+  checkpointWorkflowID,
+  replayRecordedStep,
   registerTransaction,
   runTransaction,
   DBOSDataSource,
   registerDataSource,
-  createTransactionCompletionSchemaPG,
-  createTransactionCompletionTablePG,
-  CheckSchemaInstallationReturn,
-  checkSchemaInstallationPG,
+  DataSourceMigrationOptions,
+  DataSourceSQLExecutor,
+  initializeDataSourceSchemaPG,
+  migrateDataSourcePG,
+  verifyDataSourcePG,
+  guardDataSourcePoolPG,
 } from '@dbos-inc/dbos-sdk/datasource';
 import { AsyncLocalStorage } from 'async_hooks';
 import { Kysely, sql, Transaction, IsolationLevel, PostgresDialect } from 'kysely';
@@ -44,8 +51,11 @@ interface KyselyDataSourceContext<DB> {
 
 const asyncLocalCtx = new AsyncLocalStorage();
 
+function kyselyExecutor(db: Kysely<any>): DataSourceSQLExecutor {
+  return async (text) => (await sql.raw<Record<string, unknown>>(text).execute(db)).rows;
+}
+
 class KyselyTransactionHandler implements DataSourceTransactionHandler {
-  readonly dsType = 'KyselyDataSource';
   #kyselyDBField: Kysely<DBOSKyselyTables>;
   readonly schemaName: string;
   readonly poolConfig: PoolConfig | undefined;
@@ -54,6 +64,7 @@ class KyselyTransactionHandler implements DataSourceTransactionHandler {
     readonly name: string,
     poolConfigOrKysely: PoolConfig | Kysely<any>,
     schemaName: string = 'dbos',
+    private readonly options: DataSourceMigrationOptions = {},
   ) {
     this.schemaName = schemaName;
 
@@ -63,10 +74,16 @@ class KyselyTransactionHandler implements DataSourceTransactionHandler {
       this.poolConfig = poolConfigOrKysely;
       this.#kyselyDBField = new Kysely<DBOSKyselyTables>({
         dialect: new PostgresDialect({
-          pool: new Pool(poolConfigOrKysely),
+          pool: KyselyTransactionHandler.#createPool(poolConfigOrKysely),
         }),
       });
     }
+  }
+
+  static #createPool(config: PoolConfig): Pool {
+    const pool = new Pool(config);
+    guardDataSourcePoolPG(pool, 'KyselyDataSource');
+    return pool;
   }
 
   async initialize(): Promise<void> {
@@ -74,36 +91,26 @@ class KyselyTransactionHandler implements DataSourceTransactionHandler {
       const kyselyDB = this.#kyselyDBField;
       this.#kyselyDBField = new Kysely<DBOSKyselyTables>({
         dialect: new PostgresDialect({
-          pool: new Pool(this.poolConfig),
+          pool: KyselyTransactionHandler.#createPool(this.poolConfig),
         }),
       });
       await kyselyDB?.destroy();
     }
 
-    // Check for connectivity & the schema
-    let installed = false;
-    try {
-      const { rows } = await sql
-        .raw<CheckSchemaInstallationReturn>(checkSchemaInstallationPG(this.schemaName))
-        .execute(this.#kyselyDBField);
-      const { schema_exists, table_exists } = rows[0];
-      installed = !!schema_exists && !!table_exists;
-    } catch (e) {
-      throw new Error(
-        `In initialization of 'KyselyDataSource' ${this.name}: Database could not be reached: ${(e as Error).message}`,
-      );
+    if (this.options.runMigrations === false) {
+      await verifyDataSourcePG(kyselyExecutor(this.#kyselyDBField), this.schemaName, this.name);
+      return;
     }
 
-    if (!installed) {
-      try {
-        await sql.raw(createTransactionCompletionSchemaPG(this.schemaName)).execute(this.#kyselyDBField);
-        await sql.raw(createTransactionCompletionTablePG(this.schemaName)).execute(this.#kyselyDBField);
-      } catch (err) {
-        throw new Error(
-          `In initialization of 'KyselyDataSource' ${this.name}: The '${this.schemaName}.transaction_completion' table does not exist, and could not be created.  This should be added to your database migrations.
+    try {
+      await this.#kyselyDBField
+        .transaction()
+        .execute((trx) => migrateDataSourcePG(kyselyExecutor(trx), this.schemaName));
+    } catch (err) {
+      throw new Error(
+        `In initialization of 'KyselyDataSource' ${this.name}: The '${this.schemaName}' transaction schema could not be migrated: ${(err as Error).message}. This should be added to your database migrations.
             See: https://docs.dbos.dev/typescript/tutorials/transaction-tutorial#installing-the-dbos-schema`,
-        );
-      }
+      );
     }
   }
 
@@ -118,6 +125,17 @@ class KyselyTransactionHandler implements DataSourceTransactionHandler {
     return this.#kyselyDBField;
   }
 
+  async deleteCheckpoints(workflowID: string, startStep: number, beforeCommit?: () => Promise<void>): Promise<void> {
+    await this.#kyselyDB.transaction().execute(async (client) => {
+      await client
+        .deleteFrom('dbos.transaction_completion')
+        .where('workflow_id', '=', checkpointWorkflowID(workflowID))
+        .where('function_num', '>=', startStep)
+        .execute();
+      await beforeCommit?.();
+    });
+  }
+
   async #checkExecution(
     workflowID: string,
     stepID: number,
@@ -125,7 +143,7 @@ class KyselyTransactionHandler implements DataSourceTransactionHandler {
     const result = await this.#kyselyDB
       .selectFrom('dbos.transaction_completion')
       .select(['output', 'error'])
-      .where('workflow_id', '=', workflowID)
+      .where('workflow_id', '=', checkpointWorkflowID(workflowID))
       .where('function_num', '=', stepID)
       .executeTakeFirst();
     if (result === undefined) {
@@ -136,23 +154,31 @@ class KyselyTransactionHandler implements DataSourceTransactionHandler {
   }
 
   async #recordError(workflowID: string, stepID: number, error: string): Promise<void> {
-    try {
-      await this.#kyselyDB
-        .insertInto('dbos.transaction_completion')
-        .values({
-          workflow_id: workflowID,
-          function_num: stepID,
-          error,
-          output: null,
-        })
-        .execute();
-    } catch (error) {
-      if (isPGKeyConflictError(error)) {
-        throw new DBOSWorkflowConflictError(workflowID);
-      } else {
-        throw error;
-      }
+    const inserted = await this.#kyselyDB
+      .insertInto('dbos.transaction_completion')
+      .values({
+        workflow_id: checkpointWorkflowID(workflowID),
+        function_num: stepID,
+        error,
+        output: null,
+      })
+      .onConflict((oc) => oc.columns(['workflow_id', 'function_num']).doNothing())
+      .returning('workflow_id')
+      .executeTakeFirst();
+    if (inserted === undefined) {
+      throw new DBOSStepAlreadyRecordedError(workflowID, stepID);
     }
+  }
+
+  // A duplicate execution won the race, so its recorded outcome is the durable one.
+  async #replayConflictingStep<Return>(workflowID: string, stepID: number): Promise<Return> {
+    const recorded = await this.#checkExecution(workflowID, stepID);
+    if (recorded === undefined) {
+      throw new DBOSError(
+        `Step ${stepID} of workflow ${workflowID} conflicted with a concurrent execution, but no recorded outcome was found`,
+      );
+    }
+    return replayRecordedStep<Return>(recorded);
   }
 
   static async #recordOutput(
@@ -161,23 +187,22 @@ class KyselyTransactionHandler implements DataSourceTransactionHandler {
     stepID: number,
     output: string | null,
   ): Promise<void> {
-    try {
-      await client
-        .insertInto('dbos.transaction_completion')
-        .values({
-          workflow_id: workflowID,
-          function_num: stepID,
-          output,
-          error: null,
-        })
-        .execute();
-    } catch (error) {
-      if (isPGKeyConflictError(error)) {
-        throw new DBOSWorkflowConflictError(workflowID);
-      } else {
-        throw error;
-      }
+    const inserted = await client
+      .insertInto('dbos.transaction_completion')
+      .values({
+        workflow_id: checkpointWorkflowID(workflowID),
+        function_num: stepID,
+        output,
+        error: null,
+      })
+      .onConflict((oc) => oc.columns(['workflow_id', 'function_num']).doNothing())
+      .returning('workflow_id')
+      .executeTakeFirst();
+    if (inserted === undefined) {
+      throw new DBOSStepAlreadyRecordedError(workflowID, stepID);
     }
+    // Holding this step's row, so a later owner's insert waits on our commit.
+    await assertStillOwnsWorkflow(workflowID);
   }
 
   async invokeTransactionFunction<This, Args extends unknown[], Return>(
@@ -204,12 +229,7 @@ class KyselyTransactionHandler implements DataSourceTransactionHandler {
       // Check to see if this tx has already been executed
       const previousResult = saveResults ? await this.#checkExecution(workflowID, stepID!) : undefined;
       if (previousResult) {
-        DBOS.span?.setAttribute('cached', true);
-
-        if ('error' in previousResult) {
-          throw SuperJSON.parse(previousResult.error);
-        }
-        return (previousResult.output ? SuperJSON.parse(previousResult.output) : null) as Return;
+        return replayRecordedStep<Return>(previousResult);
       }
 
       try {
@@ -236,6 +256,11 @@ class KyselyTransactionHandler implements DataSourceTransactionHandler {
 
         return result;
       } catch (error) {
+        if (saveResults && error instanceof DBOSStepAlreadyRecordedError) {
+          return await this.#replayConflictingStep<Return>(workflowID, stepID!);
+        }
+        // The new owner wins; recording an error here would replay it as this step's outcome.
+        if (error instanceof DBOSWorkflowConflictError) throw error;
         if (isPGRetriableTransactionError(error)) {
           DBOS.span?.addEvent('TXN SERIALIZATION FAILURE', { retryWaitMillis: retryWaitMS }, performance.now());
           await new Promise((resolve) => setTimeout(resolve, retryWaitMS));
@@ -244,7 +269,14 @@ class KyselyTransactionHandler implements DataSourceTransactionHandler {
         } else {
           if (saveResults) {
             const message = SuperJSON.stringify(error);
-            await this.#recordError(workflowID, stepID!, message);
+            try {
+              await this.#recordError(workflowID, stepID!, message);
+            } catch (recordError) {
+              if (recordError instanceof DBOSStepAlreadyRecordedError) {
+                return await this.#replayConflictingStep<Return>(workflowID, stepID!);
+              }
+              throw recordError;
+            }
           }
 
           throw error;
@@ -271,15 +303,27 @@ export class KyselyDataSource<DB> implements DBOSDataSource<TransactionConfig> {
     return KyselyDataSource.#getClient(this.#provider);
   }
 
-  static async initializeDBOSSchema(poolConfig: PoolConfig, schemaName: string = 'dbos') {
+  /**
+   * Create or migrate the DBOS transaction schema, typically with a privileged role,
+   * optionally granting `applicationRole` the minimal permissions to use it.
+   */
+  static async initializeDBOSSchema(
+    poolConfig: PoolConfig,
+    schemaName: string = 'dbos',
+    options: { applicationRole?: string } = {},
+  ) {
     const client = new Kysely({
       dialect: new PostgresDialect({
         pool: new Pool(poolConfig),
       }),
     });
-    await sql.raw(createTransactionCompletionSchemaPG(schemaName)).execute(client);
-    await sql.raw(createTransactionCompletionTablePG(schemaName)).execute(client);
-    await client.destroy();
+    try {
+      await client
+        .transaction()
+        .execute((trx) => initializeDataSourceSchemaPG(kyselyExecutor(trx), schemaName, options.applicationRole));
+    } finally {
+      await client.destroy();
+    }
   }
 
   static async uninitializeDBOSSchema(poolConfig: PoolConfig, schemaName: string = 'dbos') {
@@ -302,8 +346,9 @@ export class KyselyDataSource<DB> implements DBOSDataSource<TransactionConfig> {
     readonly name: string,
     poolConfigOrKysely: PoolConfig | Kysely<any>,
     schemaName: string = 'dbos',
+    options: DataSourceMigrationOptions = {},
   ) {
-    this.#provider = new KyselyTransactionHandler(name, poolConfigOrKysely, schemaName);
+    this.#provider = new KyselyTransactionHandler(name, poolConfigOrKysely, schemaName, options);
     registerDataSource(this.#provider);
   }
 

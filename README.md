@@ -1,6 +1,6 @@
 <div align="center">
 
-[![GitHub Actions](https://img.shields.io/github/actions/workflow/status/dbos-inc/dbos-transact-ts/on_push.yml?query=branch%3Amain)](https://github.com/dbos-inc/dbos-transact-ts/actions/workflows/on_push.yml)
+[![GitHub Actions](https://img.shields.io/github/actions/workflow/status/dbos-inc/dbos-transact-ts/test.yml?query=branch%3Amain)](https://github.com/dbos-inc/dbos-transact-ts/actions/workflows/test.yml)
 [![NPM Version](https://img.shields.io/npm/v/%40dbos-inc%2Fdbos-sdk)](https://www.npmjs.com/package/@dbos-inc/dbos-sdk)
 [![Node Current](https://img.shields.io/node/v/%40dbos-inc%2Fdbos-sdk)](https://www.npmjs.com/package/@dbos-inc/dbos-sdk)
 [![License (MIT)](https://img.shields.io/github/license/dbos-inc/dbos-transact-ts.svg?v)](LICENSE)
@@ -8,7 +8,7 @@
 
 # DBOS Transact: Lightweight Durable Workflows
 
-#### [Documentation](https://docs.dbos.dev/) &nbsp;&nbsp;•&nbsp;&nbsp; [Examples](https://docs.dbos.dev/examples) &nbsp;&nbsp;•&nbsp;&nbsp; [Github](https://github.com/dbos-inc) &nbsp;&nbsp;•&nbsp;&nbsp; [Discord](https://discord.com/invite/jsmC6pXGgX)
+#### [Documentation](https://docs.dbos.dev/) &nbsp;&nbsp;•&nbsp;&nbsp; [Examples](https://docs.dbos.dev/examples) &nbsp;&nbsp;•&nbsp;&nbsp; [GitHub](https://github.com/dbos-inc) &nbsp;&nbsp;•&nbsp;&nbsp; [Discord](https://discord.com/invite/jsmC6pXGgX)
 
 </div>
 
@@ -30,7 +30,7 @@ For example, you might be building a payments service that must reliably process
 
 Handling failures is costly and complicated, requiring complex state management and recovery logic as well as heavyweight tools like external orchestration services.
 DBOS makes it simpler: annotate your code to checkpoint it in Postgres and automatically recover from any failure.
-DBOS also provides powerful Postgres-backed primitives that makes it easier to write and operate reliable code, including durable queues, notifications, scheduling, event processing, and programmatic workflow management.
+DBOS also provides powerful Postgres-backed primitives that make it easier to write and operate reliable code, including durable queues, notifications, scheduling, event processing, and programmatic workflow management.
 
 ## Features
 
@@ -74,7 +74,7 @@ Workflows are particularly useful for
 ####
 
 DBOS queues help you **durably** run tasks in the background.
-You can enqueue a task (which can be a single step or an entire workflow) from a durable workflow and one of your processes will pick it up for execution.
+You can enqueue a workflow from a durable workflow and one of your processes will pick it up for execution.
 DBOS manages the execution of your tasks: it guarantees that tasks complete, and that their callers get their results without needing to resubmit them, even if your application is interrupted.
 
 Queues also provide flow control, so you can limit the concurrency of your tasks on a per-queue or per-process basis.
@@ -84,9 +84,9 @@ You can add queues to your workflows in just a couple lines of code.
 They don't require a separate queueing service or message broker&mdash;just Postgres.
 
 ```ts
-import { DBOS, WorkflowQueue } from '@dbos-inc/dbos-sdk';
+import { DBOS } from '@dbos-inc/dbos-sdk';
 
-const queue = new WorkflowQueue('example_queue');
+const queueName = 'example_queue';
 
 async function taskFunction(task) {
   // ...
@@ -98,7 +98,7 @@ async function queueFunction(tasks) {
 
   // Enqueue each task so all tasks are processed concurrently.
   for (const task of tasks) {
-    handles.push(await DBOS.startWorkflow(taskWorkflow, { queueName: queue.name })(task));
+    handles.push(await DBOS.startWorkflow(taskWorkflow, { queueName })(task));
   }
 
   // Wait for each task to complete and retrieve its result.
@@ -110,6 +110,10 @@ async function queueFunction(tasks) {
   return results;
 }
 const queueWorkflow = DBOS.registerWorkflow(queueFunction, { name: 'queueWorkflow' });
+
+// Queue configuration is stored in Postgres, so register the queue after launch.
+await DBOS.launch();
+await DBOS.registerQueue(queueName);
 ```
 
 [Read more ↗️](https://docs.dbos.dev/typescript/tutorials/queue-tutorial)
@@ -129,7 +133,7 @@ Handle bugs or failures that affect thousands of workflows with power and flexib
 const client = await DBOSClient.create({ systemDatabaseUrl: process.env.DBOS_SYSTEM_DATABASE_URL! });
 
 // Find all workflows that errored between 3:00 and 5:00 AM UTC on 2025-04-22
-const workflows = await DBOS.listWorkflows({
+const workflows = await client.listWorkflows({
   status: 'ERROR',
   startTime: '2025-04-22T03:00:00Z',
   endTime: '2025-04-22T05:00:00Z',
@@ -137,10 +141,10 @@ const workflows = await DBOS.listWorkflows({
 
 for (const workflow of workflows) {
   // Check which workflows failed due to an outage in a service called from Step 2
-  const steps = await DBOS.listWorkflowSteps(workflow.workflowID);
-  if (steps.length >= 3 && steps[2].error instanceof ServiceOutage) {
+  const steps = await client.listWorkflowSteps(workflow.workflowID);
+  if (steps && steps.length >= 3 && steps[2].error instanceof ServiceOutage) {
     // To recover from the outage, restart those workflows from Step 2
-    await DBOS.forkWorkflow(workflow.workflowID, 2);
+    await client.forkWorkflow(workflow.workflowID, 2);
   }
 }
 ```
@@ -159,7 +163,7 @@ Acknowledge the event immediately while reliably processing it in the background
 For example:
 
 ```ts
-async function handleMessage(request: Request): void {
+async function handleMessage(request: Request): Promise<void> {
   const eventId = request.body['event_id'];
   // Use the event ID as an idempotency key to start the workflow exactly-once
   await DBOS.startWorkflow(messageWorkflow, { workflowID: eventId })(request.body['event']);
@@ -176,15 +180,24 @@ async function handleMessage(request: Request): void {
 
 Schedule workflows using cron syntax, or use durable sleep to pause workflows for as long as you like (even days or weeks) before executing.
 
-You can schedule a workflow ina single line of code:
+You can schedule a workflow in a few lines of code:
 
 ```ts
-async function scheduledFunction(schedTime: Date, startTime: Date) {
+async function scheduledFunction(schedTime: Date, context: unknown) {
   DBOS.logger.info(`I am a workflow scheduled to run every 30 seconds`);
 }
 
-const scheduledWorkflow = DBOS.registerWorkflow(scheduledFunction);
-DBOS.registerScheduled(scheduledWorkflow, { crontab: '*/30 * * * * *' });
+const scheduledWorkflow = DBOS.registerWorkflow(scheduledFunction, { name: 'scheduledWorkflow' });
+
+// Schedules are stored in Postgres, so create the schedule after launch.
+await DBOS.launch();
+await DBOS.applySchedules([
+  {
+    scheduleName: 'every-30-seconds',
+    workflowFn: scheduledWorkflow,
+    schedule: '*/30 * * * * *',
+  },
+]);
 ```
 
 You can add a durable sleep to any workflow with a single line of code.
@@ -282,7 +295,7 @@ DBOS provides a similar queue abstraction to dedicated queueing systems like Bul
 However, DBOS queues are **durable and Postgres-backed** and integrate with durable workflows.
 For example, in DBOS you can write a durable workflow that enqueues a thousand tasks and waits for their results.
 DBOS checkpoints the workflow and each of its tasks in Postgres, guaranteeing that even if failures or interruptions occur, the tasks will complete and the workflow will collect their results.
-By contrast, BullMQ is Redis-backed and don't provide workflows, so they provide fewer guarantees but better performance.
+By contrast, BullMQ is Redis-backed and doesn't provide workflows, so it provides fewer guarantees but better performance.
 
 **When to use DBOS:** You need the reliability of enqueueing tasks from durable workflows.
 

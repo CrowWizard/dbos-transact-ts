@@ -1,44 +1,76 @@
-import { DBOSExecutor, DBOSExternalState } from './dbos-executor';
-import { DatabaseError, Pool, PoolClient, Notification, Client, PoolConfig, ClientBase } from 'pg';
+import { DBOSExecutor } from './dbos-executor';
+import { Pool, PoolClient, Notification, Client, PoolConfig, ClientBase } from 'pg';
+import type { DatabaseError } from 'pg';
 import {
   DBOSWorkflowConflictError,
   DBOSNonExistentWorkflowError,
-  DBOSMaxRecoveryAttemptsExceededError,
   DBOSConflictingWorkflowError,
+  DBOSWorkflowIDInUseError,
   DBOSUnexpectedStepError,
   DBOSWorkflowCancelledError,
   DBOSQueueDuplicatedError,
   DBOSInitializationError,
+  DBOSError,
+  DBOSQueryTimeoutError,
+  DBOSStepNondeterminismError,
 } from './error';
-import { GetPendingWorkflowsOutput, GetWorkflowsInput, StatusString } from './workflow';
+import { GetWorkflowsInput, isWorkflowActive, StatusString, WorkflowIDReusePolicy } from './workflow';
 import {
   notifications,
   operation_outputs,
   workflow_status,
   workflow_events,
-  workflow_events_history,
-  streams,
-  event_dispatch_kv,
   workflow_schedules,
   application_versions,
   queues,
   SysDBSerializationFormat,
 } from '../schemas/system_db_schema';
-import { globalParams, cancellableSleep, INTERNAL_QUEUE_NAME, sleepConfig, sleepms } from './utils';
+export type {
+  JsonWorkflowArgs,
+  notifications,
+  operation_outputs,
+  streams,
+  workflow_events,
+  workflow_events_history,
+  workflow_status,
+} from '../schemas/system_db_schema';
+import {
+  globalParams,
+  cancellableSleep,
+  dbRetryConfig,
+  INTERNAL_QUEUE_NAME,
+  interruptibleSleep,
+  Semaphore,
+  sleepConfig,
+  sleepms,
+} from './utils';
 import { GlobalLogger } from './telemetry/logs';
-import { WorkflowQueue } from './wfqueue';
-import { randomUUID } from 'crypto';
+import { currentDbRetryAbortSignal, currentOwnerXid, getCurrentContextStore } from './context';
+import { QueueRateLimit, WorkflowQueue } from './wfqueue';
+import { AsyncResource } from 'async_hooks';
+import { createHash, randomUUID } from 'crypto';
+import { boundShardKey, bindShardKeys, withClearedShardKeyState } from './shard_keys';
+import * as enterprise from './enterprise';
+import type { ShardedSystemDatabaseOptions } from './enterprise';
 import { getClientConfig } from './utils';
-import { connectToPGAndReportOutcome, ensurePGDatabase, maskDatabaseUrl } from './database_utils';
-import { runSysMigrationsPg } from './sysdb_migrations/migration_runner';
+import { ensurePGDatabase, maskDatabaseUrl } from './database_utils';
+import { getCurrentSysDBVersion, runSysMigrationsPg } from './sysdb_migrations/migration_runner';
 import { allMigrations } from './sysdb_migrations/internal/migrations';
 import {
   DEBUG_TRIGGER_STEP_COMMIT,
   DEBUG_TRIGGER_INITWF_COMMIT,
   DEBUG_TRIGGER_FIND_AND_MARK_AFTER_SELECT,
+  DEBUG_TRIGGER_PARTITIONED_DEQUEUE_AFTER_CANDIDATES,
+  DEBUG_TRIGGER_PARTITIONED_DEQUEUE_BEFORE_LOCKS,
   debugTriggerPoint,
 } from './debugpoint';
-import { DBOSPortableJSON, DBOSSerializer, safeParse } from './serialization';
+import {
+  DBOSPortableJSON,
+  DBOSSerializer,
+  deserializeResError,
+  deserializeValue,
+  serializeResErrorWithSerializer,
+} from './serialization';
 
 /* Result from Sys DB */
 export interface SystemDatabaseStoredResult {
@@ -47,17 +79,20 @@ export interface SystemDatabaseStoredResult {
   cancelled?: boolean;
   maxRecoveryAttemptsExceeded?: boolean;
   childWorkflowID?: string | null;
+  // The key that child was recorded under; undefined on an unsharded database
+  childShardKey?: string | null;
   functionName?: string;
-  serialization?: string | null; // Only for WF result, not step
+  serialization?: string | null; // For WF result, and for steps that persist a format (recv/getEvent)
 }
 
-/* Exported workflow format for import/export */
-export interface ExportedWorkflow {
-  workflow_status: workflow_status;
-  operation_outputs: operation_outputs[];
-  workflow_events: workflow_events[];
-  workflow_events_history: workflow_events_history[];
-  streams: streams[];
+/* A running step's view of its workflow's cancellation */
+export interface CancellationWatch {
+  /** Fires on the workflow's cancellation; the first read starts watching for it. */
+  readonly signal: AbortSignal;
+  /** Whether `signal` has fired, without starting to watch. */
+  readonly cancelled: boolean;
+  /** Stop watching; later reads of `signal` do not start watching again. */
+  release(): void;
 }
 
 export const DBOS_FUNCNAME_SEND = 'DBOS.send';
@@ -68,9 +103,84 @@ export const DBOS_FUNCNAME_SLEEP = 'DBOS.sleep';
 export const DBOS_FUNCNAME_GETSTATUS = 'getStatus';
 export const DBOS_FUNCNAME_WRITESTREAM = 'DBOS.writeStream';
 export const DBOS_FUNCNAME_CLOSESTREAM = 'DBOS.closeStream';
+export const DBOS_FUNCNAME_READSTREAM = 'DBOS.readStream';
+export const DBOS_FUNCNAME_READSTREAMOFFSET = 'DBOS.readStreamOffset';
 export const DEFAULT_POOL_SIZE = 10;
 
 export const DBOS_STREAM_CLOSED_SENTINEL = '__DBOS_STREAM_CLOSED__';
+// The sentinel as it is stored: portable JSON, the same bytes every language writes and reads.
+export const DBOS_STREAM_CLOSED_SENTINEL_SERIALIZED = DBOSPortableJSON.stringify(DBOS_STREAM_CLOSED_SENTINEL);
+
+/** Whether a stream value is the marker a closed stream ends with. Takes the deserialized value. */
+export function isStreamClosedSentinel(value: unknown): boolean {
+  return typeof value === 'string' && value === DBOS_STREAM_CLOSED_SENTINEL;
+}
+
+/**
+ * Whether a stored value is the marker as releases before the portable form wrote it: unserialized,
+ * so no deserializer parses it. Callers must test this before deserializing.
+ */
+export function isLegacyClosedSentinel(serializedValue: string): boolean {
+  return serializedValue === DBOS_STREAM_CLOSED_SENTINEL;
+}
+
+// LISTEN/NOTIFY channels. Streams and workflow_events are pushed by the notifier loop off the write path; notifications fires from an in-transaction DB trigger so recv is never woken before its row commits.
+export const DBOS_NOTIFICATIONS_CHANNEL = 'dbos_notifications_channel';
+export const DBOS_WORKFLOW_EVENTS_CHANNEL = 'dbos_workflow_events_channel';
+export const DBOS_STREAMS_CHANNEL = 'dbos_streams_channel';
+
+// Interval for coalescing LISTEN/NOTIFY notifications off the write path; caps the rate of notifying commits regardless of write throughput.
+export const DEFAULT_NOTIFICATION_COALESCE_MS = 10;
+
+// An introspection query scanning a huge table for minutes holds back xmin, stalling autovacuum database-wide.
+export const DEFAULT_OBSERVABILITY_QUERY_TIMEOUT_MS = 30_000;
+
+// PostgreSQL's statement_timeout is an int32 count of milliseconds; anything larger is rejected.
+const MAX_STATEMENT_TIMEOUT_MS = 2_147_483_647;
+
+/** The timeout is rendered into a `SET LOCAL statement_timeout`, which takes only an in-range integer. */
+export function validateObservabilityQueryTimeoutMs(value: number | undefined): void {
+  if (value !== undefined && (!Number.isFinite(value) || value > MAX_STATEMENT_TIMEOUT_MS)) {
+    throw new Error(
+      `observabilityQueryTimeoutMs must be a finite number no greater than ${MAX_STATEMENT_TIMEOUT_MS}, got ${value}`,
+    );
+  }
+}
+
+// Bounds how long a frozen or unreachable client can hold system database locks.
+export const DEFAULT_IDLE_TRANSACTION_TIMEOUT_MS = 60_000;
+
+// How long a background job's lock may sit idle before Postgres ends its holder's session.
+export const BACKGROUND_JOB_LOCK_IDLE_TIMEOUT_MS = 5000;
+
+/** Orders strings by code unit, which matches Postgres's "C" collation outside surrogate pairs. */
+export function compareCodeUnits(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/** Renews a held background job lock in place, so it is never free mid-hold; rejects if the lock was lost. */
+export type BackgroundJobRenew = () => Promise<void>;
+
+/** pg-pool's hook for a new client: the borrower receives it only once `done` is called. */
+type PoolVerify = (client: PoolClient, done: (err?: Error) => void) => void;
+
+/** The timeout is rendered into a `SET idle_in_transaction_session_timeout`, which takes only an in-range integer. */
+export function validateIdleTransactionTimeoutMs(value: number | undefined): void {
+  if (value !== undefined && (!Number.isFinite(value) || value > MAX_STATEMENT_TIMEOUT_MS)) {
+    throw new Error(
+      `systemDatabaseIdleTransactionTimeoutMs must be a finite number no greater than ${MAX_STATEMENT_TIMEOUT_MS}, got ${value}`,
+    );
+  }
+}
+
+/** Whether the connection string already sets idle_in_transaction_session_timeout through libpq options. */
+function setsIdleTransactionTimeout(databaseUrl: string): boolean {
+  try {
+    return new URL(databaseUrl).searchParams.get('options')?.includes('idle_in_transaction_session_timeout') ?? false;
+  } catch {
+    return false;
+  }
+}
 
 export interface WorkflowScheduleInternal {
   scheduleId: string;
@@ -84,6 +194,19 @@ export interface WorkflowScheduleInternal {
   automaticBackfill: boolean;
   cronTimezone: string | null;
   queueName: string | null;
+  // Owning application; undefined leaves it unclaimed. Writers may name another.
+  applicationName?: string;
+  // Shard key the schedule's workflows run under; undefined on an unsharded database.
+  shardKey?: string;
+}
+
+// Definition fields updateSchedule can change in place. Only the keys present are updated; runtime state (schedule_id, status, last_fired_at) is left untouched.
+export interface WorkflowScheduleUpdate {
+  schedule?: string;
+  context?: string; // JSON-serialized
+  automaticBackfill?: boolean;
+  cronTimezone?: string | null;
+  queueName?: string | null;
 }
 
 export interface VersionInfo {
@@ -91,7 +214,21 @@ export interface VersionInfo {
   versionName: string;
   versionTimestamp: number;
   createdAt: number;
+  // Owning application; undefined if unclaimed.
+  applicationName?: string;
 }
+
+/** Rows a rename moved, by table. */
+export interface ApplicationRowCounts {
+  queues: number;
+  schedules: number;
+  versions: number;
+  workflows: number;
+  steps: number;
+}
+
+// Workflows re-owned per transaction by a rename.
+export const DEFAULT_RENAME_BATCH_SIZE = 10_000;
 
 export interface QueueRecord {
   name: string;
@@ -99,23 +236,38 @@ export interface QueueRecord {
   workerConcurrency: number | null;
   rateLimitMax: number | null;
   rateLimitPeriodSec: number | null;
-  priorityEnabled: boolean;
+  /** Derived from the partition limits, which are what partition a queue. */
   partitionQueue: boolean;
+  // Any of these being set partitions the queue; each applies per partition.
+  partitionConcurrency: number | null;
+  partitionWorkerConcurrency: number | null;
+  partitionRateLimitMax: number | null;
+  partitionRateLimitPeriodSec: number | null;
   pollingIntervalSec: number;
+  // Owner from the queues table; undefined for internal and pre-upgrade queues.
+  applicationName?: string;
 }
 
-/** The subset of a queue record that may be changed after creation. */
-export type QueueRecordUpdate = Partial<Omit<QueueRecord, 'name'>>;
+/** The subset of a queue record that may be changed after creation. Ownership moves only by rename. */
+export type QueueRecordUpdate = Partial<Omit<QueueRecord, 'name' | 'applicationName'>>;
 
 const QUEUE_COLUMN_BY_FIELD: Record<keyof QueueRecordUpdate, string> = {
   concurrency: 'concurrency',
   workerConcurrency: 'worker_concurrency',
   rateLimitMax: 'rate_limit_max',
   rateLimitPeriodSec: 'rate_limit_period_sec',
-  priorityEnabled: 'priority_enabled',
   partitionQueue: 'partition_queue',
+  partitionConcurrency: 'partition_concurrency',
+  partitionWorkerConcurrency: 'partition_worker_concurrency',
+  partitionRateLimitMax: 'partition_rate_limit_max',
+  partitionRateLimitPeriodSec: 'partition_rate_limit_period_sec',
   pollingIntervalSec: 'polling_interval_sec',
 };
+
+const QUEUE_COLUMNS =
+  'name, concurrency, worker_concurrency, rate_limit_max, rate_limit_period_sec, ' +
+  'partition_concurrency, partition_worker_concurrency, partition_rate_limit_max, partition_rate_limit_period_sec, ' +
+  'polling_interval_sec, application_name';
 
 function queueRecordFromRow(row: queues): QueueRecord {
   return {
@@ -124,62 +276,17 @@ function queueRecordFromRow(row: queues): QueueRecord {
     workerConcurrency: row.worker_concurrency,
     rateLimitMax: row.rate_limit_max,
     rateLimitPeriodSec: row.rate_limit_period_sec,
-    priorityEnabled: row.priority_enabled,
-    partitionQueue: row.partition_queue,
+    partitionQueue:
+      row.partition_concurrency !== null ||
+      row.partition_worker_concurrency !== null ||
+      (row.partition_rate_limit_max !== null && row.partition_rate_limit_period_sec !== null),
+    partitionConcurrency: row.partition_concurrency,
+    partitionWorkerConcurrency: row.partition_worker_concurrency,
+    partitionRateLimitMax: row.partition_rate_limit_max,
+    partitionRateLimitPeriodSec: row.partition_rate_limit_period_sec,
     pollingIntervalSec: row.polling_interval_sec,
+    applicationName: row.application_name ?? undefined,
   };
-}
-
-export interface WorkflowAggregateRow {
-  group: Record<string, string | null>;
-  count: number | null;
-  minCreatedAt: number | null;
-  maxQueueWaitMs: number | null;
-  maxTotalLatencyMs: number | null;
-}
-
-export interface StepAggregateRow {
-  group: Record<string, string | null>;
-  count: number | null;
-  maxDurationMs: number | null;
-}
-
-export interface GetWorkflowAggregatesInput {
-  groupByStatus?: boolean;
-  groupByName?: boolean;
-  groupByQueueName?: boolean;
-  groupByExecutorId?: boolean;
-  groupByApplicationVersion?: boolean;
-  selectCount?: boolean;
-  selectMinCreatedAt?: boolean;
-  selectMaxQueueWaitMs?: boolean;
-  selectMaxTotalLatencyMs?: boolean;
-  timeBucketSizeMs?: number;
-  status?: string[];
-  startTime?: string;
-  endTime?: string;
-  completedAfter?: string;
-  completedBefore?: string;
-  dequeuedAfter?: string;
-  dequeuedBefore?: string;
-  name?: string[];
-  appVersion?: string[];
-  executorId?: string[];
-  queueName?: string[];
-  workflowIdPrefix?: string[];
-}
-
-export interface GetStepAggregatesInput {
-  groupByFunctionName?: boolean;
-  groupByStatus?: boolean;
-  selectCount?: boolean;
-  selectMaxDurationMs?: boolean;
-  timeBucketSizeMs?: number;
-  status?: string[];
-  functionName?: string[];
-  workflowIdPrefix?: string[];
-  completedAfter?: string;
-  completedBefore?: string;
 }
 
 // For internal use, not serialized status.
@@ -196,11 +303,10 @@ export interface WorkflowStatusInternal {
   input: string | null;
   assumedRole: string;
   authenticatedRoles: string[];
-  request: object;
   executorId: string;
   applicationVersion?: string;
   applicationID: string;
-  createdAt: number;
+  createdAt?: number;
   updatedAt?: number;
   recoveryAttempts?: number;
   timeoutMS?: number;
@@ -215,12 +321,26 @@ export interface WorkflowStatusInternal {
   serialization: string | null;
   delayUntilEpochMS?: number;
   completedAt?: number;
+  // Custom key-value attributes attached to the workflow at creation. Not inherited by child workflows.
+  attributes?: Record<string, unknown>;
+  // If this workflow was enqueued by a named schedule, that schedule's name. Only set by the persistent scheduler.
+  scheduleName?: string;
+  // Absolute cap (epoch ms) beyond which bounces may not extend the delay; unset if not debounced or no timeout.
+  debounceDeadlineEpochMS?: number;
+  // True if this workflow's deduplication ID is a debounce key to clear on the DELAYED->ENQUEUED transition.
+  isDebounced?: boolean;
+  // Owning application; undefined writes an unclaimed row.
+  applicationName?: string;
+  // Shard key the workflow lives under; undefined on an unsharded database.
+  shardKey?: string;
+  // The parent workflow's shard key; undefined on an unsharded database.
+  parentShardKey?: string;
 }
 
 export interface EnqueueOptions {
-  // Unique ID for deduplication on a queue
+  // Unique ID for deduplication on a queue, shared across all of its partitions
   deduplicationID?: string;
-  // Priority of the workflow on the queue, starting from 1 ~ 2,147,483,647. Default 0 (highest priority).
+  // Priority of the workflow on the queue, 0 ~ 2,147,483,647. Default 0 (highest priority).
   priority?: number;
   // Partition key for partitioned queues
   queuePartitionKey?: string;
@@ -228,23 +348,79 @@ export interface EnqueueOptions {
   applicationVersion?: string;
   // Number of seconds to delay the workflow before it starts executing. The workflow will be in DELAYED status until the delay expires.
   delaySeconds?: number;
+  // The application the workflow is enqueued for; undefined means the enqueuer's own.
+  applicationName?: string;
+}
+
+// Enqueue options only the debouncer sets; kept out of the public EnqueueOptions.
+export interface InternalEnqueueOptions extends EnqueueOptions {
+  // Absolute cap (epoch ms) on how far the delay may extend.
+  debounceDeadlineEpochMS?: number;
+  // Marks the deduplication ID as a debounce key.
+  isDebounced?: boolean;
+}
+
+// Arguments to debounceDelayedWorkflow: identify the debounced workflow by
+// (name, class, queue, debounce key) and carry the new delay and inputs.
+export interface DebounceParams {
+  workflowName: string;
+  workflowClassName: string;
+  queueName: string;
+  deduplicationID: string;
+  delayUntilEpochMS: number;
+  input: string | null;
+  serialization: string | null;
+  // The application the bounce acts for; undefined means the enqueuer's own.
+  applicationName?: string;
+}
+
+export interface DebounceResult {
+  // The extended workflow's ID if an existing debounced DELAYED workflow was bounced; null if no bounce occurred.
+  bouncedWorkflowID: string | null;
+  // The current holder of (queue_name, deduplication_id) when no bounce occurred, or null if the key is unheld.
+  holderWorkflowID: string | null;
+  // Whether the holder is itself a debounced workflow.
+  holderIsDebounced: boolean;
+  // The holder's workflow name and class; a mismatch with the caller's means a debounce-key collision between workflows.
+  holderWorkflowName: string | null;
+  holderWorkflowClassName: string | null;
+  // The holder's owning application; a mismatch means the collision is across applications.
+  holderApplicationName: string | null;
 }
 
 // How to handle a collision with another workflow that has the same `enqueueOptions.deduplicationID`
-// on the same queue.
+// on the same queue, in any partition.
 //   'reject' (default): throw `DBOSQueueDuplicatedError`.
 //   'return-existing': return a handle to the existing workflow; arguments passed by the colliding
 //     caller are discarded and the handle resolves with the original workflow's result.
 export type DuplicationPolicy = 'reject' | 'return-existing';
 
-export interface ExistenceCheck {
-  exists: boolean;
-}
+/** The flow-control limit that left a queue claim no room, or `claim_lock` when another worker held the claim's lock. */
+export type DequeueStopReason =
+  | 'worker_concurrency'
+  | 'partition_worker_concurrency'
+  | 'limiter'
+  | 'partition_limiter'
+  | 'concurrency'
+  | 'partition_concurrency'
+  | 'claim_lock';
 
-export interface MetricData {
-  metricType: string;
-  metricName: string;
-  value: number;
+/** The statements granting permissions on all entities in the system schema to a role. */
+export function getDbosSchemaPermissionsSql(schemaName: string, roleName: string): string[] {
+  return [
+    // Grant usage on the system schema
+    `GRANT USAGE ON SCHEMA "${schemaName}" TO "${roleName}"`,
+    // Grant all privileges on all existing tables in the system schema (includes views)
+    `GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA "${schemaName}" TO "${roleName}"`,
+    // Grant all privileges on all sequences in the system schema
+    `GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA "${schemaName}" TO "${roleName}"`,
+    // Grant execute on all functions and procedures in the system schema
+    `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA "${schemaName}" TO "${roleName}"`,
+    // Grant default privileges for future objects in the system schema
+    `ALTER DEFAULT PRIVILEGES IN SCHEMA "${schemaName}" GRANT ALL ON TABLES TO "${roleName}"`,
+    `ALTER DEFAULT PRIVILEGES IN SCHEMA "${schemaName}" GRANT ALL ON SEQUENCES TO "${roleName}"`,
+    `ALTER DEFAULT PRIVILEGES IN SCHEMA "${schemaName}" GRANT EXECUTE ON FUNCTIONS TO "${roleName}"`,
+  ];
 }
 
 export async function grantDbosSchemaPermissions(
@@ -259,44 +435,76 @@ export async function grantDbosSchemaPermissions(
   await client.connect();
 
   try {
-    // Grant usage on the schema
-    const grantUsageSql = `GRANT USAGE ON SCHEMA "${schemaName}" TO "${roleName}"`;
-    logger.info(grantUsageSql);
-    await client.query(grantUsageSql);
-
-    // Grant all privileges on all existing tables in schema (includes views)
-    const grantTablesSql = `GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA "${schemaName}" TO "${roleName}"`;
-    logger.info(grantTablesSql);
-    await client.query(grantTablesSql);
-
-    // Grant all privileges on all sequences in schema
-    const grantSequencesSql = `GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA "${schemaName}" TO "${roleName}"`;
-    logger.info(grantSequencesSql);
-    await client.query(grantSequencesSql);
-
-    // Grant execute on all functions and procedures in schema
-    const grantFunctionsSql = `GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA "${schemaName}" TO "${roleName}"`;
-    logger.info(grantFunctionsSql);
-    await client.query(grantFunctionsSql);
-
-    // Grant default privileges for future objects in schema
-    const alterTablesSql = `ALTER DEFAULT PRIVILEGES IN SCHEMA "${schemaName}" GRANT ALL ON TABLES TO "${roleName}"`;
-    logger.info(alterTablesSql);
-    await client.query(alterTablesSql);
-
-    const alterSequencesSql = `ALTER DEFAULT PRIVILEGES IN SCHEMA "${schemaName}" GRANT ALL ON SEQUENCES TO "${roleName}"`;
-    logger.info(alterSequencesSql);
-    await client.query(alterSequencesSql);
-
-    const alterFunctionsSql = `ALTER DEFAULT PRIVILEGES IN SCHEMA "${schemaName}" GRANT EXECUTE ON FUNCTIONS TO "${roleName}"`;
-    logger.info(alterFunctionsSql);
-    await client.query(alterFunctionsSql);
+    for (const sql of getDbosSchemaPermissionsSql(schemaName, roleName)) {
+      logger.info(sql);
+      await client.query(sql);
+    }
   } catch (e) {
     logger.error(`Failed to grant permissions to role ${roleName}: ${(e as Error).message}`);
     throw e;
   } finally {
     await client.end();
   }
+}
+
+/**
+ * Check out a connection carrying our own error handler, so a socket death while we hold it is
+ * logged instead of thrown at an emitter with no listener. `release()` takes the handler back off,
+ * so nothing we attach outlives the checkout and the pool itself is never touched.
+ */
+async function borrowClient(pool: Pool, onError: (err: Error) => void): Promise<PoolClient> {
+  const client = await pool.connect();
+  // Nothing awaits between the checkout and this attach, nor between the removal and release()
+  // below, so there is no turn of the event loop in which we hold the connection unguarded.
+  client.on('error', onError);
+  const release = client.release.bind(client);
+  client.release = (err?: Error | boolean) => {
+    client.removeListener('error', onError);
+    release(err);
+  };
+  return client;
+}
+
+/** Connect to the system database without creating it. The caller releases the client. */
+async function connectToSystemDatabase(sysDbUrl: string, logger: GlobalLogger, customPool?: Pool): Promise<ClientBase> {
+  if (customPool) {
+    return await borrowClient(customPool, (err: Error) =>
+      logger.warn(`Unexpected error in system database client: ${err}`),
+    );
+  }
+  const sysClient = new Client(getClientConfig(sysDbUrl));
+  // An 'error' event with no listener would take down the process.
+  sysClient.on('error', (err: Error) => logger.warn(`Unexpected error in system database client: ${err}`));
+  try {
+    await sysClient.connect();
+  } catch (e) {
+    await sysClient.end().catch(() => {});
+    throw new DBOSInitializationError(
+      `Unable to connect to system database at ${maskDatabaseUrl(sysDbUrl)}: ${(e as Error).message}`,
+      e instanceof Error ? e : undefined,
+    );
+  }
+  return sysClient;
+}
+
+async function releaseSystemDatabaseClient(client: ClientBase, customPool?: Pool): Promise<void> {
+  try {
+    if (customPool) {
+      (client as PoolClient).release();
+    } else {
+      await (client as Client).end();
+    }
+  } catch (e) {}
+}
+
+/** A Postgres advisory lock key: the leading 8 bytes of SHA-256 over `lockName`, as a signed big-endian integer. */
+export function advisoryLockKey(lockName: string): bigint {
+  return createHash('sha256').update(lockName).digest().readBigInt64BE(0);
+}
+
+export async function isCockroachDB(client: ClientBase): Promise<boolean> {
+  const versionRes = await client.query<{ version: string }>('SELECT version() AS version');
+  return /cockroachdb/i.test(versionRes.rows[0]?.version ?? '');
 }
 
 export async function ensureSystemDatabase(
@@ -306,48 +514,105 @@ export async function ensureSystemDatabase(
   schemaName: string = 'dbos',
   useListenNotify: boolean = true,
 ) {
-  let client: ClientBase | null = null;
-  if (customPool) {
-    // If a custom pool is passed in, assume the database already exists and create
-    // a client to run migrations.
-    client = await customPool.connect();
-  } else {
-    // Otherwise, create the system database if it does not exist.
-    const res = await ensurePGDatabase({
-      urlToEnsure: sysDbUrl,
-      logger: (msg: string) => logger.debug(msg),
-    });
-    if (res.status === 'failed') {
-      logger.warn(
-        `Database could not be verified / created: ${maskDatabaseUrl(sysDbUrl)}: ${res.message} ${res.hint ?? ''}\n  ${res.notes.join('\n')}`,
-      );
-    }
-    const cconnect = await connectToPGAndReportOutcome(sysDbUrl, () => {}, 'System Database');
-    if (cconnect.result !== 'ok') {
-      logger.warn(
-        `Unable to connect to system database at ${maskDatabaseUrl(sysDbUrl)}
-        ${cconnect.message}: (${cconnect.code ? cconnect.code : 'connectivity problem'})`,
-      );
-      throw new DBOSInitializationError(`Unable to connect to system database at ${maskDatabaseUrl(sysDbUrl)}`);
-    }
-    client = cconnect.client;
+  if (!customPool) {
+    // A custom pool means the database already exists; otherwise, create it if it does not.
+    await ensurePGDatabase(sysDbUrl, logger);
   }
+  const client = await connectToSystemDatabase(sysDbUrl, logger, customPool);
 
   try {
-    const versionRes = await client.query<{ version: string }>('SELECT version() AS version');
-    const isCockroach = /cockroachdb/i.test(versionRes.rows[0]?.version ?? '');
+    await refuseShardedSchema(client, schemaName);
+    const isCockroach = await isCockroachDB(client);
     await runSysMigrationsPg(client, allMigrations(schemaName, { useListenNotify, isCockroach }), schemaName, {
       onWarn: (e: string) => logger.info(e),
       isCockroach,
     });
   } finally {
-    try {
-      if (customPool) {
-        (client as PoolClient).release();
-      } else {
-        await (client as Client).end();
-      }
-    } catch (e) {}
+    await releaseSystemDatabaseClient(client, customPool);
+  }
+}
+
+/** Create or migrate the system database, then grant `applicationRole`, if given, access to its schema. */
+export async function migrateSystemDatabase(
+  sysDbUrl: string,
+  logger: GlobalLogger,
+  schemaName: string = 'dbos',
+  applicationRole?: string,
+): Promise<void> {
+  await ensureSystemDatabase(sysDbUrl, logger, undefined, schemaName);
+  if (applicationRole) {
+    await grantDbosSchemaPermissions(sysDbUrl, applicationRole, logger, schemaName);
+  }
+}
+
+/** Check the system database is migrated to the version this build requires, creating and changing nothing. */
+export async function verifySystemDatabase(
+  sysDbUrl: string,
+  logger: GlobalLogger,
+  customPool?: Pool,
+  schemaName: string = 'dbos',
+  useListenNotify: boolean = true,
+) {
+  const client = await connectToSystemDatabase(sysDbUrl, logger, customPool);
+
+  try {
+    await refuseShardedSchema(client, schemaName);
+    const isCockroach = await isCockroachDB(client);
+    const requiredVersion = allMigrations(schemaName, { useListenNotify, isCockroach }).length;
+    const currentVersion = await getCurrentSysDBVersion(client, schemaName);
+    // A database ahead of this build belongs to a newer peer, which the migration runner also tolerates.
+    if (currentVersion < requiredVersion) {
+      throw new DBOSInitializationError(
+        `System database ${maskDatabaseUrl(sysDbUrl)} is at schema version ${currentVersion}, but this version ` +
+          `of DBOS requires ${requiredVersion}. This process is configured with runMigrations disabled, so it ` +
+          `will not migrate it: either migrate the system database out of band (\`npx dbos schema\`) or launch ` +
+          `with runMigrations enabled.`,
+      );
+    }
+    logger.debug(`System database schema version ${currentVersion} satisfies the required version ${requiredVersion}`);
+  } finally {
+    await releaseSystemDatabaseClient(client, customPool);
+  }
+}
+
+/** Throw if this schema is sharded: an unsharded handle's statements would span every tenant's rows. */
+async function refuseShardedSchema(client: ClientBase, schemaName: string): Promise<void> {
+  const { rows } = await client.query(
+    `SELECT 1 FROM information_schema.columns
+     WHERE table_schema = $1 AND table_name = 'workflow_status' AND column_name = 'shard_key'`,
+    [schemaName],
+  );
+  if (rows.length > 0) {
+    throw new DBOSError(
+      `The DBOS system schema ${schemaName} is sharded. Enable sharding to use it: ` +
+        'set sharding in your DBOS configuration, or pass sharding: true to DBOSClient.',
+    );
+  }
+}
+
+/** Whether this database holds a sharded DBOS system schema (this one, if named); false if it can't be reached. */
+export async function holdsShardedSchema(databaseUrl: string, schemaName?: string): Promise<boolean> {
+  let client: Client;
+  try {
+    // Bounded, so an unreachable host fails as fast as the caller's own connection would.
+    client = new Client({ ...getClientConfig(databaseUrl), connectionTimeoutMillis: 10_000 });
+  } catch {
+    // A malformed URL, for the caller's own connection to report.
+    return false;
+  }
+  client.on('error', () => {});
+  try {
+    await client.connect();
+    const { rows } = await client.query(
+      `SELECT 1 FROM information_schema.columns
+       WHERE table_name = 'workflow_status' AND column_name = 'shard_key'${schemaName !== undefined ? ' AND table_schema = $1' : ''} LIMIT 1`,
+      schemaName !== undefined ? [schemaName] : [],
+    );
+    return rows.length > 0;
+  } catch {
+    return false;
+  } finally {
+    await client.end().catch(() => {});
   }
 }
 
@@ -383,17 +648,78 @@ class NotificationMap<T> {
   }
 }
 
-interface InsertWorkflowResult {
-  recovery_attempts: number;
+/** A workflow recovery moved back onto a queue, and the shard key it lives under. */
+export interface RecoveredWorkflow {
+  workflowID: string;
+  shardKey?: string;
+}
+
+/** One execution registered as running in this process. */
+export interface RunningWorkflowEntry {
+  promise: Promise<unknown>;
+  queueName?: string;
+  queuePartitionKey?: string;
+  release: () => void;
+}
+
+export interface InsertWorkflowResult {
   status: string;
   name: string;
   class_name: string;
   config_name: string;
   queue_name: string | null;
-  workflow_deadline_epoch_ms: number | null;
   executor_id: string | null;
-  owner_xid: string | null;
+  creator_xid: string | null;
   serialization: string | null;
+}
+
+function mapVersionInfo(row: application_versions): VersionInfo {
+  return {
+    versionId: row.version_id,
+    versionName: row.version_name,
+    versionTimestamp: Number(row.version_timestamp),
+    createdAt: Number(row.created_at),
+    applicationName: row.application_name ?? undefined,
+  };
+}
+
+const SCHEDULE_COLUMNS =
+  'schedule_id, schedule_name, workflow_name, workflow_class_name, schedule, status, context, last_fired_at, automatic_backfill, cron_timezone, queue_name, application_name';
+
+/** A schedule's own columns, as a new row stores them. */
+function scheduleRow(schedule: WorkflowScheduleInternal, owner: string | undefined): Record<string, unknown> {
+  return {
+    schedule_id: schedule.scheduleId,
+    schedule_name: schedule.scheduleName,
+    workflow_name: schedule.workflowName,
+    workflow_class_name: schedule.workflowClassName,
+    schedule: schedule.schedule,
+    status: schedule.status,
+    context: schedule.context,
+    last_fired_at: schedule.lastFiredAt,
+    automatic_backfill: schedule.automaticBackfill,
+    cron_timezone: schedule.cronTimezone,
+    queue_name: schedule.queueName,
+    application_name: owner ?? null,
+  };
+}
+
+function mapWorkflowSchedule(row: workflow_schedules): WorkflowScheduleInternal {
+  return {
+    scheduleId: row.schedule_id,
+    scheduleName: row.schedule_name,
+    workflowName: row.workflow_name,
+    workflowClassName: row.workflow_class_name,
+    schedule: row.schedule,
+    status: row.status,
+    context: row.context,
+    lastFiredAt: row.last_fired_at ?? null,
+    automaticBackfill: !!row.automatic_backfill,
+    cronTimezone: row.cron_timezone ?? null,
+    queueName: row.queue_name ?? null,
+    applicationName: row.application_name ?? undefined,
+    shardKey: (row as ShardKeyColumns).workflow_shard_key ?? undefined,
+  };
 }
 
 function mapWorkflowStatus(row: workflow_status): WorkflowStatusInternal {
@@ -409,7 +735,6 @@ function mapWorkflowStatus(row: workflow_status): WorkflowStatusInternal {
     authenticatedUser: row.authenticated_user,
     assumedRole: row.assumed_role,
     authenticatedRoles: JSON.parse(row.authenticated_roles) as string[],
-    request: row.request ? (JSON.parse(row.request) as object) : {},
     executorId: row.executor_id,
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
@@ -418,7 +743,10 @@ function mapWorkflowStatus(row: workflow_status): WorkflowStatusInternal {
     recoveryAttempts: Number(row.recovery_attempts),
     input: row.inputs ? row.inputs : null,
     timeoutMS: row.workflow_timeout_ms ? Number(row.workflow_timeout_ms) : undefined,
-    deadlineEpochMS: row.workflow_deadline_epoch_ms ? Number(row.workflow_deadline_epoch_ms) : undefined,
+    // Cap at the largest exact JS integer: a saturated bigint deadline would otherwise round past the bigint maximum and be rejected when a child workflow inherits it.
+    deadlineEpochMS: row.workflow_deadline_epoch_ms
+      ? Math.min(Number(row.workflow_deadline_epoch_ms), Number.MAX_SAFE_INTEGER)
+      : undefined,
     deduplicationID: row.deduplication_id ?? undefined,
     priority: row.priority ?? 0,
     queuePartitionKey: row.queue_partition_key ?? undefined,
@@ -429,7 +757,28 @@ function mapWorkflowStatus(row: workflow_status): WorkflowStatusInternal {
     serialization: row.serialization,
     delayUntilEpochMS: row.delay_until_epoch_ms ? Number(row.delay_until_epoch_ms) : undefined,
     completedAt: row.completed_at ? Number(row.completed_at) : undefined,
+    attributes: row.attributes ?? undefined,
+    scheduleName: row.schedule_name ?? undefined,
+    debounceDeadlineEpochMS: row.debounce_deadline_epoch_ms ? Number(row.debounce_deadline_epoch_ms) : undefined,
+    isDebounced: row.is_debounced ?? false,
+    applicationName: row.application_name ?? undefined,
+    // Read back only from a sharded system database, whose rows carry them.
+    shardKey: (row as ShardKeyColumns).shard_key ?? undefined,
+    parentShardKey: (row as ShardKeyColumns).parent_shard_key ?? undefined,
   };
+}
+
+/** The shard key columns a sharded system database's rows carry. */
+export interface ShardKeyColumns {
+  shard_key?: string | null;
+  parent_shard_key?: string | null;
+  child_shard_key?: string | null;
+  workflow_shard_key?: string | null;
+}
+
+/** `column`, qualified by `alias` if one is given. */
+export function qualify(alias: string | undefined, column: string): string {
+  return alias ? `${alias}.${column}` : column;
 }
 
 type AnyErr = { code?: string; errno?: number; message?: string; stack?: string; cause?: unknown };
@@ -444,6 +793,8 @@ const RETRY_SQLSTATE_PREFIXES = new Set([
 
 const RETRY_SQLSTATE_CODES = new Set([
   '40003', // statement_completion_unknown
+  '25P03', // idle_in_transaction_session_timeout, when the kill lands on an in-flight query; an idle kill surfaces as a message match below
+  '40P01', // deadlock_detected: the victim's transaction rolled back, so rerunning it is safe
 ]);
 
 // Node.js transient network error codes (system call level)
@@ -454,16 +805,19 @@ const RETRY_NODE_ERRNOS = new Set([
   'ENETUNREACH',
   'ETIMEDOUT',
   'ECONNABORTED',
+  'EAI_AGAIN', // DNS lookup failed temporarily, e.g. while a container's hostname is briefly unresolvable
 ]);
 
-function isPgDatabaseError(e: AnyErr): e is DatabaseError & AnyErr {
-  // DatabaseError has 'code' (SQLSTATE)
-  return !!e && typeof e === 'object' && typeof e.code === 'string' && e.code.length === 5;
+export function isPgDatabaseError(e: unknown): e is DatabaseError & AnyErr {
+  // Matched by shape, not instanceof: a user-supplied pool may throw another pg copy's DatabaseError.
+  return !!e && typeof e === 'object' && typeof (e as AnyErr).code === 'string' && (e as AnyErr).code!.length === 5;
 }
 
 function sqlStateLooksRetryable(sqlstate: string | undefined): boolean {
   if (!sqlstate) return false;
   if (RETRY_SQLSTATE_CODES.has(sqlstate)) return true;
+  // query_canceled (a statement timeout or an explicit cancel); retrying would undo it
+  if (sqlstate === '57014') return false;
   const prefix = sqlstate.toString().slice(0, 2);
   return RETRY_SQLSTATE_PREFIXES.has(prefix);
 }
@@ -487,7 +841,7 @@ function messageLooksRetryable(msg: string): boolean {
   );
 }
 
-function* unwrapErrors(e: unknown): Generator<unknown, void, void> {
+export function* unwrapErrors(e: unknown): Generator<unknown, void, void> {
   // Walk through AggregateError.errors and cause chains
   const queue: unknown[] = [e];
   const seen = new Set<unknown>();
@@ -511,7 +865,7 @@ function* unwrapErrors(e: unknown): Generator<unknown, void, void> {
 }
 
 // "What could possibly go wrong?"
-function retriablePostgresException(err: unknown): boolean {
+export function retriablePostgresException(err: unknown): boolean {
   // Dig into AggregateErrors of various types
   for (const e of unwrapErrors(err)) {
     const anyErr = e as AnyErr;
@@ -537,11 +891,58 @@ function retriablePostgresException(err: unknown): boolean {
   return false;
 }
 
+/** 57014 is query_canceled, which is how statement_timeout cancels a query. */
+function isStatementTimeout(err: unknown): boolean {
+  return !!err && typeof err === 'object' && (err as AnyErr).code === '57014';
+}
+
+/** Run `operation` under the {@link dbRetry} policy, for code that cannot take the decorator. */
+export async function withDbRetry<T>(
+  operation: () => Promise<T>,
+  options: { initialBackoff?: number; maxBackoff?: number } = {},
+): Promise<T> {
+  // Read the defaults per call so the backoff stays tunable after the decorator is applied.
+  const maxBackoff = options.maxBackoff ?? dbRetryConfig.maxBackoffSec;
+  let retries = 0;
+  let backoff = options.initialBackoff ?? dbRetryConfig.initialBackoffSec;
+  const abortSignal = currentDbRetryAbortSignal();
+  while (true) {
+    try {
+      return await operation();
+    } catch (e) {
+      if (retriablePostgresException(e)) {
+        if (abortSignal?.aborted) throw e;
+        retries++;
+        // Calculate backoff with jitter
+        const actualBackoff = backoff * (0.5 + Math.random());
+        DBOSExecutor.globalInstance?.logger.warn(
+          `Database connection failed: ${e instanceof Error ? e.message : String(e)}. ` +
+            `Retrying in ${actualBackoff.toFixed(2)}s (attempt ${retries})`,
+        );
+        // Sleep with backoff
+        if (abortSignal) {
+          await interruptibleSleep(actualBackoff * 1000, abortSignal);
+          if (abortSignal.aborted) throw e;
+        } else {
+          await sleepms(actualBackoff * 1000); // Convert to milliseconds
+        }
+        // Increase backoff for next attempt (exponential)
+        backoff = Math.min(backoff * 2, maxBackoff);
+      } else {
+        throw e;
+      }
+    }
+  }
+}
+
 /**
  * If a workflow encounters a database connection issue while performing an operation,
  * block the workflow and retry the operation until it reconnects and succeeds.
  * In other words, if DBOS loses its database connection, everything pauses until the connection is recovered,
  * trading off availability for correctness.
+ *
+ * The exception is a background DBOS loop run under `runWithAbortableDbRetries`: once its stop signal
+ * aborts, the last connection error is rethrown, so stopping the loop (e.g. at shutdown) cannot hang.
  */
 function dbRetry(
   options: {
@@ -549,7 +950,6 @@ function dbRetry(
     maxBackoff?: number;
   } = {},
 ) {
-  const { initialBackoff = 1.0, maxBackoff = 60.0 } = options;
   return function <T extends (...args: never[]) => Promise<unknown>>(
     target: unknown,
     propertyName: string,
@@ -557,32 +957,60 @@ function dbRetry(
   ): TypedPropertyDescriptor<T> {
     const method = descriptor.value!;
     descriptor.value = async function (this: never, ...args: never): Promise<unknown> {
-      let retries = 0;
-      let backoff = initialBackoff;
-      while (true) {
-        try {
-          return await method.apply(this, args);
-        } catch (e) {
-          if (retriablePostgresException(e)) {
-            retries++;
-            // Calculate backoff with jitter
-            const actualBackoff = backoff * (0.5 + Math.random());
-            DBOSExecutor.globalInstance?.logger.warn(
-              `Database connection failed: ${e instanceof Error ? e.message : String(e)}. ` +
-                `Retrying in ${actualBackoff.toFixed(2)}s (attempt ${retries})`,
-            );
-            // Sleep with backoff
-            await sleepms(actualBackoff * 1000); // Convert to milliseconds
-            // Increase backoff for next attempt (exponential)
-            backoff = Math.min(backoff * 2, maxBackoff);
-          } else {
-            throw e;
-          }
-        }
-      }
+      return withDbRetry(() => method.apply(this, args), options);
     } as T;
     return descriptor;
   };
+}
+
+/** How to build a system database: core's Postgres one, or with `sharding`, Transact Enterprise's sharded one. */
+export interface SystemDatabaseOptions extends ShardedSystemDatabaseOptions {
+  useListenNotify?: boolean;
+  notificationCoalesceMs?: number;
+  sharding?: boolean;
+  suspendMode?: boolean;
+}
+
+/** Build the system database these options describe. */
+export function createSystemDatabase(options: SystemDatabaseOptions): SystemDatabase {
+  const sysdb = createBaseSystemDatabase(options);
+  if (options.suspendMode) {
+    const { Suspend } = enterprise.load(enterprise.SUSPEND.description);
+    sysdb.suspend = new Suspend(sysdb);
+  }
+  return sysdb;
+}
+
+function createBaseSystemDatabase(options: SystemDatabaseOptions): SystemDatabase {
+  if (options.sharding) {
+    const { ShardedSystemDatabase } = enterprise.load(enterprise.SHARDING.description);
+    return new ShardedSystemDatabase({
+      systemDatabaseUrl: options.systemDatabaseUrl,
+      logger: options.logger,
+      serializer: options.serializer,
+      sysDbPoolSize: options.sysDbPoolSize,
+      systemDatabasePool: options.systemDatabasePool,
+      schemaName: options.schemaName,
+      pollingConcurrency: options.pollingConcurrency,
+      appName: options.appName,
+      observabilityQueryTimeoutMs: options.observabilityQueryTimeoutMs,
+      idleTransactionTimeoutMs: options.idleTransactionTimeoutMs,
+    });
+  }
+  return new SystemDatabase(
+    options.systemDatabaseUrl,
+    options.logger,
+    options.serializer,
+    options.sysDbPoolSize,
+    options.systemDatabasePool,
+    options.schemaName,
+    options.useListenNotify,
+    options.pollingConcurrency,
+    options.notificationCoalesceMs,
+    options.appName,
+    options.observabilityQueryTimeoutMs,
+    options.idleTransactionTimeoutMs,
+  );
 }
 
 /**
@@ -622,17 +1050,63 @@ export class SystemDatabase {
   notificationsClient: PoolClient | null = null;
   dbPollingIntervalResultMs: number = 1000;
   dbPollingIntervalEventMs: number = 10000;
+  dbPollingIntervalStreamMs: number = 1000;
+  dbPollingIntervalCancelMs: number = 1000;
   shouldUseDBNotifications: boolean = true;
+  // How long a background job's lock may sit idle before Postgres ends its holder's session.
+  backgroundJobLockIdleTimeoutMs: number = BACKGROUND_JOB_LOCK_IDLE_TIMEOUT_MS;
   readonly notificationsMap: NotificationMap<void> = new NotificationMap();
   readonly workflowEventsMap: NotificationMap<void> = new NotificationMap();
-  readonly cancelWakeupMap: NotificationMap<void> = new NotificationMap();
+  suspend?: enterprise.Suspend = undefined;
+  readonly streamsMap: NotificationMap<void> = new NotificationMap();
   customPool: boolean = false;
 
-  readonly runningWorkflowMap: Map<
+  // Interval for coalescing LISTEN/NOTIFY notifications pushed off the write path (Postgres + L/N only).
+  readonly notificationCoalesceMs: number = DEFAULT_NOTIFICATION_COALESCE_MS;
+  // Statement timeout for observability reads, in ms; undefined disables the cap.
+  readonly observabilityQueryTimeoutMs: number | undefined;
+  // idle_in_transaction_session_timeout set on each connection of a pool we own, in ms; undefined leaves the server's.
+  readonly idleTransactionTimeoutMs: number | undefined;
+  // Coalesced NOTIFY payloads keyed by channel, flushed by the notifier loop; soft-private so tests can drive a flush.
+  private pendingNotifications: Map<string, Set<string>> = new Map();
+  #notifierActive: boolean = false;
+  // Wakes the notifier out of its coalescing sleep so shutdown flushes promptly.
+  #notifierWake: (() => void) | null = null;
+  // The notifier loop's completion, awaited on destroy so a final flush precedes closing the pool.
+  #notifierLoop: Promise<void> | undefined = undefined;
+
+  /**
+   * Caps how many DB-backed polling reads (from wait operations) may run
+   * concurrently against the pool, so a polling storm cannot check out every
+   * client and starve control-plane operations. See {@link #pollWithLimiter}.
+   */
+  readonly pollLimiter: Semaphore;
+
+  /** Executions running in this process, by workflow ID; a re-dispatch runs alongside its stale execution, which parks at its next write. */
+  readonly runningWorkflowMap: Map<string, RunningWorkflowEntry[]> = new Map();
+
+  // Keyed by waiter key, as one ID can live under several shard keys.
+  readonly #cancelWatchers: Map<
     string,
-    { promise: Promise<unknown>; queueName?: string; queuePartitionKey?: string }
-  > = new Map(); // Map from workflowID to workflow promise, queue name and partition key
-  readonly workflowCancellationMap: Map<string, boolean> = new Map(); // Map from workflowID to its cancellation status.
+    { workflowID: string; shardKey: string | undefined; controllers: Set<AbortController> }
+  > = new Map();
+  #cancelPollerLoop: Promise<void> | undefined = undefined;
+  #cancelPollerWake: (() => void) | null = null;
+  // Runs the lazily started cancel poller outside the async context of the step that happens to start it
+  readonly #cancelPollerScope = new AsyncResource('DBOSCancelPoller');
+
+  // Per-partition-key created_at cursors: keep per-key queue order monotonic across batches
+  readonly #batchCreatedAtCursors: Map<string, number> = new Map();
+
+  // Set by destroy(), so polling waits end instead of running on against a pool that outlives this handle.
+  #destroyed: boolean = false;
+  get destroyed(): boolean {
+    return this.#destroyed;
+  }
+
+  // Connections a retention round holds right now. destroy() cuts them, since closing the
+  // pool would otherwise wait on the lock session and on any statement in flight.
+  readonly retentionClients: Set<PoolClient> = new Set();
 
   constructor(
     readonly systemDatabaseUrl: string,
@@ -642,36 +1116,491 @@ export class SystemDatabase {
     systemDatabasePool?: Pool,
     schemaName: string = 'dbos',
     useListenNotify: boolean = true,
+    pollingConcurrency?: number,
+    notificationCoalesceMs: number = DEFAULT_NOTIFICATION_COALESCE_MS,
+    // The application this handle acts for; undefined writes unclaimed rows.
+    readonly appName?: string,
+    observabilityQueryTimeoutMs: number = DEFAULT_OBSERVABILITY_QUERY_TIMEOUT_MS,
+    idleTransactionTimeoutMs: number = DEFAULT_IDLE_TRANSACTION_TIMEOUT_MS,
   ) {
     this.schemaName = schemaName;
     this.shouldUseDBNotifications = useListenNotify;
+    this.notificationCoalesceMs = notificationCoalesceMs;
+    validateObservabilityQueryTimeoutMs(observabilityQueryTimeoutMs);
+    validateIdleTransactionTimeoutMs(idleTransactionTimeoutMs);
+    // Floor at 1ms: PostgreSQL reads 0 as "no timeout".
+    this.idleTransactionTimeoutMs =
+      idleTransactionTimeoutMs > 0 && !systemDatabasePool && !setsIdleTransactionTimeout(systemDatabaseUrl)
+        ? Math.max(1, Math.round(idleTransactionTimeoutMs))
+        : undefined;
+    // Floor at 1ms: PostgreSQL reads 0 as "no timeout", the loosest cap rather than the tightest.
+    this.observabilityQueryTimeoutMs =
+      observabilityQueryTimeoutMs > 0 ? Math.max(1, Math.round(observabilityQueryTimeoutMs)) : undefined;
+
     if (systemDatabasePool) {
       this.pool = systemDatabasePool;
       this.customPool = true;
     } else {
-      const systemPoolConfig: PoolConfig = {
+      const timeoutMs = this.idleTransactionTimeoutMs;
+      const systemPoolConfig: PoolConfig & { verify?: PoolVerify } = {
         ...getClientConfig(systemDatabaseUrl),
         // This sets the application_name column in pg_stat_activity
         application_name: `dbos_transact_${globalParams.executorID}_${globalParams.appVersion}`,
         max: sysDbPoolSize,
       };
+      if (timeoutMs !== undefined) {
+        // A SET, not a startup parameter, which session-mode PgBouncer rejects; awaited before the borrower gets the client.
+        systemPoolConfig.verify = (client, done) => {
+          // pg-pool has detached its listener and the borrower's comes after done, so a socket death here needs a guard.
+          let socketError: Error | undefined;
+          const onError = (err: Error) => {
+            socketError = err;
+          };
+          client.on('error', onError);
+          client.query(`SET idle_in_transaction_session_timeout = ${timeoutMs}`).then(
+            () => {
+              client.removeListener('error', onError);
+              done();
+            },
+            (err: Error) => {
+              client.removeListener('error', onError);
+              // A dead connection fails the checkout with a retryable error; pg-pool discards it.
+              if (socketError) return done(socketError);
+              this.logger.warn(
+                `Could not set idle_in_transaction_session_timeout on a system database connection: ${err}`,
+              );
+              done();
+            },
+          );
+        };
+      }
       this.pool = new Pool(systemPoolConfig);
     }
 
-    this.pool.on('error', (err: Error) => {
-      this.logger.warn(`Unexpected error in pool: ${err}`);
-    });
-    this.pool.on('connect', (client: PoolClient) => {
-      client.on('error', (err: Error) => {
-        this.logger.warn(`Unexpected error in idle client: ${err}`);
+    // Default the polling limit to half the pool (minimum 1), reserving the rest
+    // of the pool for control-plane operations.
+    const effectivePoolSize = this.pool.options.max ?? sysDbPoolSize;
+    const pollingLimit = pollingConcurrency ?? Math.max(1, Math.floor(effectivePoolSize / 2));
+    this.pollLimiter = new Semaphore(pollingLimit);
+
+    // Only ever attach listeners to a pool we own; a caller's pool is theirs to instrument. Idle
+    // connections are all this covers, since #connect guards the ones we are holding.
+    if (!this.customPool) {
+      this.pool.on('error', (err: Error) => {
+        this.logger.warn(`Unexpected error in pool: ${err}`);
       });
-    });
-  }
-  getSerializer(): DBOSSerializer {
-    return this.serializer;
+    }
   }
 
-  async init() {
+  readonly #onClientError = (err: Error) => {
+    this.logger.warn(`Unexpected error on a system database connection: ${err}`);
+  };
+
+  /** Check out a pool connection guarded for as long as we hold it. See {@link borrowClient}. */
+  connect(): Promise<PoolClient> {
+    return borrowClient(this.pool, this.#onClientError);
+  }
+
+  /**
+   * Cap an introspection read with a statement timeout, so one scanning a huge table cannot hold a
+   * snapshot for minutes and stall autovacuum database-wide. Soft-private so tests can assert the cap
+   * from inside the transaction.
+   *
+   * `fn` must only run queries: node-postgres leaves the unnamed portal, and the snapshot registered
+   * with it, alive until commit, so anything else it awaits extends the very hold this bounds.
+   */
+  async observabilityQuery<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
+    const timeoutMs = this.observabilityQueryTimeoutMs;
+    const client = await this.connect();
+    try {
+      if (timeoutMs === undefined) {
+        return await fn(client);
+      }
+      try {
+        // Never inherit default_transaction_isolation: a repeatable-read snapshot would outlive its statement.
+        await client.query('BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY');
+        // SET LOCAL, so the cap dies with its transaction instead of riding the pooled connection into unrelated queries.
+        await client.query(`SET LOCAL statement_timeout = ${timeoutMs}`);
+        const result = await fn(client);
+        await client.query('COMMIT');
+        return result;
+      } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        // No `cause`: the typed timeout replaces the driver's query_canceled error.
+        throw isStatementTimeout(e) ? new DBOSQueryTimeoutError(timeoutMs) : e;
+      }
+    } finally {
+      client.release();
+    }
+  }
+
+  // ==================== Application Ownership ====================
+
+  /**
+   * A predicate matching rows owned by these applications plus unclaimed ones, which belong to
+   * every application; unset or empty matches everything. Appends its bind parameter to `params`.
+   */
+  appNameFilter(column: string, value: string | string[] | null | undefined, params: unknown[]): string {
+    // An empty name is no name: it is not a value any application could be configured with.
+    const names = !value ? [] : Array.isArray(value) ? value : [value];
+    if (names.length === 0) return 'TRUE';
+    params.push(names);
+    return `(${column} = ANY($${params.length}) OR ${column} IS NULL)`;
+  }
+
+  /**
+   * The filter above defaulted to this handle's own application: an unset filter scopes to what
+   * this application owns, not to every application's rows. A handle with no application of its
+   * own still matches every one.
+   */
+  observabilityFilter(column: string, value: string | string[] | null | undefined, params: unknown[]): string {
+    return this.appNameFilter(column, value ?? this.appName, params);
+  }
+
+  // ==================== Shard Keys ====================
+  // Statements locate rows through these, so a sharded subclass adds its key; each appends to `params` and returns SQL.
+
+  /** Whether this handle routes every statement by shard key. */
+  get sharded(): boolean {
+    return false;
+  }
+
+  #rejectShardKey(workflowID: string, shardKey: string | undefined): void {
+    if ((shardKey !== undefined && shardKey !== null) || boundShardKey(workflowID) !== undefined) {
+      throw new DBOSError('A shard key was given, but this system database is not sharded');
+    }
+  }
+
+  /** Predicate selecting one workflow's rows: those whose `column` is `workflowID`. */
+  wf(
+    alias: string | undefined,
+    workflowID: string,
+    params: unknown[],
+    column = 'workflow_uuid',
+    shardKey?: string,
+  ): string {
+    this.#rejectShardKey(workflowID, shardKey);
+    params.push(workflowID);
+    return `${qualify(alias, column)} = $${params.length}`;
+  }
+
+  /** Predicate selecting several workflows' rows. */
+  wfIn(alias: string | undefined, workflowIDs: string[], params: unknown[]): string {
+    for (const workflowID of workflowIDs) {
+      this.#rejectShardKey(workflowID, undefined);
+    }
+    params.push(workflowIDs);
+    return `${qualify(alias, 'workflow_uuid')} = ANY($${params.length}::text[])`;
+  }
+
+  /** Condition joining two tables' rows of the same workflow. */
+  wfJoin(left: string, right: string): string {
+    return `${left}.workflow_uuid = ${right}.workflow_uuid`;
+  }
+
+  /** Extra column values for a new row of this workflow. */
+  wfValues(workflowID: string, shardKey?: string): Record<string, unknown> {
+    this.#rejectShardKey(workflowID, shardKey);
+    return {};
+  }
+
+  /** Extra column values storing the shard key of a new workflow's parent. */
+  parentValues(_parentWorkflowID: string | undefined): Record<string, unknown> {
+    return {};
+  }
+
+  /** Extra column values storing the shard key of the workflow a step refers to. */
+  childValues(_childWorkflowID: string | null | undefined): Record<string, unknown> {
+    return {};
+  }
+
+  /** Extra (column, expression) pairs for an INSERT ... SELECT of this workflow's rows. */
+  wfColumns(_workflowID: string, _params: unknown[]): [string, string][] {
+    return [];
+  }
+
+  /** Conflict target for a unique key of a workflow table. */
+  keyConflict(...columns: string[]): string {
+    return columns.join(', ');
+  }
+
+  /** Insert rows into `table` in one statement, returning the RETURNING rows; a sharded subclass inserts row by row. */
+  async insertRows<T extends object = object>(
+    client: ClientBase | Pool,
+    table: string,
+    columns: string[],
+    rows: unknown[][],
+    suffix: string = '',
+  ): Promise<T[]> {
+    if (rows.length === 0) return [];
+    const params: unknown[] = [];
+    const tuples = rows.map((row) => `(${row.map((value) => `$${params.push(value)}`).join(', ')})`);
+    const { rows: returned } = await client.query<T>(
+      `INSERT INTO "${this.schemaName}".${table} (${columns.join(', ')}) VALUES ${tuples.join(', ')} ${suffix}`,
+      params,
+    );
+    return returned;
+  }
+
+  /** Predicate a queue claim must also meet, evaluated once before it scans; sharded, it caps claimers per key. */
+  claimGate(_queueName: string, _partitionKey: string | undefined, _params: unknown[]): string {
+    return 'TRUE';
+  }
+
+  /** Statement whose `acquired` says whether a claim took its budget scope's transaction lock; no row means nothing to claim. */
+  claimLockQuery(queueName: string, partitionKey: string | undefined, params: unknown[]): string {
+    const name = JSON.stringify(['dbos.queue_claim', this.schemaName, queueName, partitionKey ?? null]);
+    params.push(advisoryLockKey(name).toString());
+    return `SELECT pg_try_advisory_xact_lock($${params.length}) AS acquired`;
+  }
+
+  /** Statement whose `held` lists which of `partitionKeys` a sweep's transaction locked; no row means nothing to claim. */
+  partitionLockQuery(queueName: string, partitionKeys: string[], params: unknown[]): string {
+    const name = JSON.stringify(['dbos.partition_claim', this.schemaName, queueName]);
+    // Two-int keys: the queue, then the partition, hashed so every worker computes the same lock.
+    const lockIDs = partitionKeys.map((pk) => createHash('sha256').update(pk).digest().readInt32BE(0));
+    params.push(partitionKeys, lockIDs, Number(BigInt.asIntN(32, advisoryLockKey(name))));
+    const n = params.length;
+    return `SELECT coalesce(array_agg(p.pk), '{}') AS held
+            FROM unnest($${n - 2}::text[], $${n - 1}::int4[]) AS p(pk, lock_id)
+            WHERE pg_try_advisory_xact_lock($${n}::int4, p.lock_id)`;
+  }
+
+  /** Predicate confining a statement that names no single workflow to the current shard. */
+  scoped(_alias: string | undefined, _params: unknown[]): string {
+    return 'TRUE';
+  }
+
+  /** Extra (column, expression) pairs for an INSERT ... SELECT confined to the current shard. */
+  scopedColumns(_params: unknown[]): [string, string][] {
+    return [];
+  }
+
+  /** Predicate selecting a global table's rows (queues, schedules, versions). */
+  global(_alias: string | undefined, _params: unknown[]): string {
+    return 'TRUE';
+  }
+
+  /** Extra column values for a new row of a global table. */
+  globalValues(): Record<string, unknown> {
+    return {};
+  }
+
+  /** Predicate selecting rows whose `column` holds one of these shard keys. */
+  keyIn(_alias: string | undefined, _shardKeys: string[], _params: unknown[], _column = 'shard_key'): string {
+    throw new DBOSError('Filtering by shard key requires a sharded system database');
+  }
+
+  /** A shard key column to read back with a row, if this handle has one. */
+  keyColumn(_alias: string | undefined, _column = 'shard_key'): string | undefined {
+    return undefined;
+  }
+
+  /** Extra column values storing the shard key a schedule's workflows run under. */
+  scheduleValues(schedule: WorkflowScheduleInternal): Record<string, unknown> {
+    if (schedule.shardKey !== undefined && schedule.shardKey !== null) {
+      throw new DBOSError('Scheduling under a shard key requires a sharded system database');
+    }
+    return {};
+  }
+
+  /** The column holding the shard key a schedule's workflows run under, if any. */
+  scheduleKeyColumn(): string | undefined {
+    return undefined;
+  }
+
+  /** This workflow's shard key, resolved now for a statement or waiter that needs it later. */
+  keyHint(workflowID: string): string | undefined {
+    this.#rejectShardKey(workflowID, undefined);
+    return undefined;
+  }
+
+  /** The notification-map key for a workflow's topic or key, distinct per shard key as IDs repeat across keys. */
+  waiter(workflowID: string, name: string): string {
+    const key = this.keyHint(workflowID);
+    const payload = `${workflowID}::${name}`;
+    return key === undefined ? payload : `${[...key].length}:${key}:${payload}`;
+  }
+
+  /** Bind a workflow to `key`, else to the running workflow's own key even where a same-ID target is bound. */
+  ownKey<R>(workflowID: string, key: string | undefined, callback: () => R): R {
+    if (key === undefined) {
+      const ctx = getCurrentContextStore();
+      if (ctx !== undefined && ctx.workflowId === workflowID) {
+        key = ctx.shardKey;
+      }
+    }
+    return bindShardKeys([[workflowID, key]], callback);
+  }
+
+  /** Run `callback` under this application's lock for a background job, passing undefined if refused, else a call renewing it in place. */
+  async backgroundJobLock<T>(
+    jobName: string,
+    callback: (renew: BackgroundJobRenew | undefined) => Promise<T>,
+  ): Promise<T> {
+    // CockroachDB grants every advisory lock, so each process runs every job.
+    if (await this.#isCockroach()) {
+      return await callback(() => Promise.resolve());
+    }
+    // Leading 8 bytes of SHA-256, big-endian signed, as for the retention lock.
+    const key = advisoryLockKey(`dbos.background_job.${this.schemaName}.${this.appName ?? ''}.${jobName}`);
+    const timeout = `'${Math.trunc(this.backgroundJobLockIdleTimeoutMs)}'`;
+    return await this.lockedBackgroundJob(
+      jobName,
+      `SELECT pg_try_advisory_xact_lock(${key}) FROM set_config('idle_in_transaction_session_timeout', ${timeout}, true)`,
+      // Snapshot-free, so a concurrent index build never waits on it; fails if the session ended.
+      async (client) => {
+        await client.query(`SET LOCAL idle_in_transaction_session_timeout = ${timeout}`);
+      },
+      callback,
+    );
+  }
+
+  /** Take a transaction-scoped lock with literal `lockQuery` (its first column says if taken), as a bound statement's portal keeps its snapshot (an xmin) while the session idles. */
+  protected async lockedBackgroundJob<T>(
+    jobName: string,
+    lockQuery: string,
+    renew: (client: PoolClient) => Promise<void>,
+    callback: (renew: BackgroundJobRenew | undefined) => Promise<T>,
+  ): Promise<T> {
+    const client = await this.connect();
+    try {
+      await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+      // The local idle timeout ends a frozen holder's session, releasing its lock.
+      const { rows } = await client.query<[boolean]>({ text: lockQuery, rowMode: 'array' });
+      return await callback(rows[0]?.[0] === true ? () => renew(client) : undefined);
+    } finally {
+      try {
+        await client.query('ROLLBACK');
+        client.release();
+      } catch (e) {
+        // A session the idle timeout ended has released the lock already.
+        this.logger.debug(`Could not release the ${jobName} lock: ${String(e)}`);
+        client.release(e instanceof Error ? e : true);
+      }
+    }
+  }
+
+  #cockroach: Promise<boolean> | undefined = undefined;
+
+  /** Whether this handle's database is CockroachDB, read on first use. */
+  #isCockroach(): Promise<boolean> {
+    this.#cockroach ??= (async () => {
+      const client = await this.connect();
+      try {
+        return await isCockroachDB(client);
+      } finally {
+        client.release();
+      }
+    })();
+    // A failed read is retried on next use, rather than cached.
+    this.#cockroach.catch(() => {
+      this.#cockroach = undefined;
+    });
+    return this.#cockroach;
+  }
+
+  /** Scopes a queue's workers dequeue from in turn; one unkeyed scope unless sharded. */
+  dequeueScopes(_queueName: string): Promise<(string | undefined)[]> {
+    return Promise.resolve([undefined]);
+  }
+
+  /** Whether a dequeue failed because another worker holds the rows it needs. */
+  isLockConflict(e: unknown): boolean {
+    return isPgDatabaseError(e) && e.code === '55P03';
+  }
+
+  /** Whether a dequeue failed on a serialization conflict with a concurrent one. */
+  isSerializationConflict(e: unknown): boolean {
+    return isPgDatabaseError(e) && e.code === '40001';
+  }
+
+  /** Whether `appVersion` is this application's latest registered version, or none is registered. */
+  async isLatestVersion(appVersion: string, client?: PoolClient | Pool): Promise<boolean> {
+    // Own plus unclaimed: a named peer's deploy must not demote this one.
+    const latest = await this.#latestApplicationVersionName(client ?? this.pool);
+    return latest === undefined || latest === appVersion;
+  }
+
+  /**
+   * The version name a dequeue treats as latest: this application's own plus unclaimed
+   * ones, so a named peer's deploy does not demote this one.
+   */
+  async #latestApplicationVersionName(client: PoolClient | Pool): Promise<string | undefined> {
+    return (await this.#latestApplicationVersion(client, this.appName))?.version_name;
+  }
+
+  async #latestApplicationVersion(
+    client: PoolClient | Pool,
+    applicationName?: string,
+  ): Promise<application_versions | undefined> {
+    const columns = 'version_id, version_name, version_timestamp, created_at, application_name';
+    const table = `"${this.schemaName}".application_versions`;
+    const params: unknown[] = applicationName ? [applicationName] : [];
+    const scope = this.global(undefined, params);
+    // Probe each eligible owner separately; an OR filter can scan an unbounded history of newer peer versions.
+    // Keep the constant owner in the ordering so the IS NULL probe uses the composite index too.
+    const query = applicationName
+      ? `(SELECT ${columns} FROM ${table} WHERE ${scope} AND application_name = $1 ORDER BY application_name, version_timestamp DESC LIMIT 1)
+         UNION ALL
+         (SELECT ${columns} FROM ${table} WHERE ${scope} AND application_name IS NULL ORDER BY application_name, version_timestamp DESC LIMIT 1)
+         ORDER BY version_timestamp DESC LIMIT 1`
+      : `SELECT ${columns} FROM ${table} WHERE ${scope} ORDER BY version_timestamp DESC LIMIT 1`;
+    const { rows } = await client.query<application_versions>(query, params);
+    return rows[0];
+  }
+
+  /**
+   * The owner to persist when writing a row that may already exist. A nameless writer
+   * leaves the owner intact; a named one collides only with a different name.
+   */
+  async #resolveRowOwner(
+    client: PoolClient | Pool,
+    table: string,
+    keyColumn: string,
+    name: string,
+    owner: string | undefined,
+    kind: string,
+  ): Promise<string | undefined> {
+    const params: unknown[] = [name];
+    const { rows } = await client.query<{ application_name: string | null }>(
+      `SELECT application_name FROM "${this.schemaName}".${table} WHERE ${this.global(undefined, params)} AND ${keyColumn} = $1`,
+      params,
+    );
+    const current = rows[0]?.application_name ?? null;
+    if (current === null) return owner;
+    if (owner === undefined || current === owner) return current;
+    // A version name is computed or pinned, so "pick another" is config advice, not a rename.
+    const takeANewName =
+      kind === 'Application version'
+        ? `set a distinct applicationVersion for '${owner}'`
+        : `give '${owner}' a different ${kind.toLowerCase()} name`;
+    throw new DBOSError(
+      `${kind} '${name}' is already registered by application '${current}' in this system database. ` +
+        `${kind} names must be unique across applications sharing a system database. ` +
+        `Either ${takeANewName}, or, if '${current}' was renamed to '${owner}', ` +
+        `re-own its rows first with dbos rename-application`,
+    );
+  }
+
+  /** Migrates the system database, or, when `runMigrations` is false, verifies it is already migrated. */
+  async init(runMigrations: boolean = true) {
+    if (runMigrations) {
+      await this.runMigrations();
+    } else {
+      await this.verifyMigrations();
+    }
+
+    if (this.shouldUseDBNotifications) {
+      await this.#listenForNotifications();
+      // Push coalesced stream and event notifications off the write path.
+      this.#notifierActive = true;
+      this.#notifierLoop = this.#runNotifier();
+    }
+  }
+
+  /** Create or migrate the system database. */
+  async runMigrations(): Promise<void> {
     await ensureSystemDatabase(
       this.systemDatabaseUrl,
       this.logger,
@@ -679,107 +1608,112 @@ export class SystemDatabase {
       this.schemaName,
       this.shouldUseDBNotifications,
     );
+  }
 
-    if (this.shouldUseDBNotifications) {
-      await this.#listenForNotifications();
+  /** Throw if this unsharded handle's schema is sharded; an unreachable database is left for its first statement. */
+  async checkShardedSchema(): Promise<void> {
+    if (this.sharded) return;
+    let client: PoolClient;
+    try {
+      client = await this.connect();
+    } catch {
+      return;
     }
+    try {
+      await refuseShardedSchema(client, this.schemaName);
+    } finally {
+      client.release();
+    }
+  }
+
+  /** Check the system database is migrated, creating and changing nothing. */
+  async verifyMigrations(): Promise<void> {
+    await verifySystemDatabase(
+      this.systemDatabaseUrl,
+      this.logger,
+      this.customPool ? this.pool : undefined,
+      this.schemaName,
+      this.shouldUseDBNotifications,
+    );
   }
 
   async destroy() {
+    // Set synchronously, before any await, so no reconnect is scheduled or published after this point.
+    this.#notificationsStopped = true;
+    this.#destroyed = true;
     if (this.reconnectTimeout) {
       clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = null;
+    }
+    // Stop the notifier and await its final flush before the pool closes.
+    this.#notifierActive = false;
+    this.#notifierWake?.();
+    if (this.#notifierLoop) {
+      await this.#notifierLoop;
+      this.#notifierLoop = undefined;
+    }
+    this.#cancelPollerWake?.();
+    if (this.#cancelPollerLoop) {
+      await this.#cancelPollerLoop;
     }
     if (this.notificationsClient) {
+      this.#retireNotificationsClient(this.notificationsClient);
+    }
+    // A retention round still running is cut here rather than waited for: returned with an
+    // error, each connection is destroyed at once, the idle lock session lets go of the
+    // advisory lock, and the round fails on its next statement instead of holding shutdown.
+    for (const client of this.retentionClients) {
+      // Cover the release() call itself, which tears the connection down and can surface a socket error.
+      client.on('error', () => {});
       try {
-        this.notificationsClient.release(true);
+        client.release(new Error('System database shutting down'));
       } catch (e) {
-        this.logger.warn(`Error ending notifications client: ${String(e)}`);
+        this.logger.warn(`Error releasing a retention connection: ${String(e)}`);
       }
     }
-    await this.pool.end();
+    this.retentionClients.clear();
+    // We attached nothing to the pool object itself, so there is nothing to unpick; only close one we own.
+    if (!this.customPool) {
+      await this.pool.end();
+    }
   }
 
   // ==================== Workflow Status ====================
-  @dbRetry()
+  /** Runs on `client` if given, joining its transaction; otherwise in its own retried transaction. */
   async initWorkflowStatus(
     initStatus: WorkflowStatusInternal,
-    ownerXid: string | null,
-    options?: {
-      isRecoveryRequest?: boolean;
-      isDequeuedRequest?: boolean;
-      maxRetries?: number;
-    },
+    creatorXid: string | null,
+    client?: ClientBase,
+    reusePolicy: WorkflowIDReusePolicy = 'return-existing',
   ): Promise<{
     status: string;
     shouldExecuteOnThisExecutor: boolean;
-    deadlineEpochMS?: number;
     serialization: SysDBSerializationFormat | null;
   }> {
-    const client = await this.pool.connect();
+    if (client !== undefined) {
+      return await this.initWorkflowStatusInternal(client, initStatus, creatorXid, reusePolicy);
+    }
+    return await this.initWorkflowStatusStandalone(initStatus, creatorXid, reusePolicy);
+  }
+
+  @dbRetry()
+  private async initWorkflowStatusStandalone(
+    initStatus: WorkflowStatusInternal,
+    creatorXid: string | null,
+    reusePolicy: WorkflowIDReusePolicy,
+  ): Promise<{
+    status: string;
+    shouldExecuteOnThisExecutor: boolean;
+    serialization: SysDBSerializationFormat | null;
+  }> {
+    const client = await this.connect();
     let shouldCommit = false;
     try {
       await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
-
-      // Moving from enqueued to pending asks to increment recovery attempts... rather than in the recovery process
-      //  where it moves from pending back to enqueued.
-      const resRow = await this.insertWorkflowStatus(
-        client,
-        initStatus,
-        ownerXid,
-        !!options?.isRecoveryRequest || !!options?.isDequeuedRequest,
-      );
-      if (resRow.name !== initStatus.workflowName) {
-        const msg = `Workflow already exists with a different function name: ${resRow.name}, but the provided function name is: ${initStatus.workflowName}`;
-        throw new DBOSConflictingWorkflowError(initStatus.workflowUUID, msg);
-      } else if (resRow.class_name !== initStatus.workflowClassName) {
-        const msg = `Workflow already exists with a different class name: ${resRow.class_name}, but the provided class name is: ${initStatus.workflowClassName}`;
-        throw new DBOSConflictingWorkflowError(initStatus.workflowUUID, msg);
-      } else if ((resRow.config_name || '') !== (initStatus.workflowConfigName || '')) {
-        const msg = `Workflow already exists with a different class configuration: ${resRow.config_name}, but the provided class configuration is: ${initStatus.workflowConfigName}`;
-        throw new DBOSConflictingWorkflowError(initStatus.workflowUUID, msg);
-      } else if ((resRow.queue_name ?? undefined) !== (initStatus.queueName ?? undefined)) {
-        // This is a warning because a different queue name is not necessarily an error.
-        this.logger.warn(
-          `Workflow (${initStatus.workflowUUID}) already exists in queue: ${resRow.queue_name}, but the provided queue name is: ${initStatus.queueName}. The queue is not updated. ${new Error().stack}`,
-        );
-      }
-
-      const status = resRow.status;
-      const deadlineEpochMS = resRow.workflow_deadline_epoch_ms ?? undefined;
-
-      // If there is an existing DB record and we aren't here to recover it,
-      //  leave it be.  Roll back the change to max recovery attempts.
-      if (ownerXid !== resRow.owner_xid && !options?.isRecoveryRequest && !options?.isDequeuedRequest) {
-        // It is not clear if getting the handle should throw the error, or getting the result from the handle should error.
-        //  Current precedent is the former.
-        if (status === StatusString.MAX_RECOVERY_ATTEMPTS_EXCEEDED) {
-          throw new DBOSMaxRecoveryAttemptsExceededError(initStatus.workflowUUID, options?.maxRetries ?? -1);
-        }
-        return { status, deadlineEpochMS, shouldExecuteOnThisExecutor: false, serialization: resRow.serialization };
-      }
-
-      // Upsert above already set executor assignment and incremented the recovery attempt
-      shouldCommit = true;
-
-      // recovery_attempt means "attempts" (we kept the name for backward compatibility). It's default value is 1.
-      // Every time we init the status, we increment `recovery_attempts` by 1.
-      // Thus, when this number becomes equal to `maxRetries + 1`, we should mark the workflow as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
-      const attempts = resRow.recovery_attempts;
-      if (options?.maxRetries && attempts > options?.maxRetries + 1) {
-        await this.updateWorkflowStatus(client, initStatus.workflowUUID, StatusString.MAX_RECOVERY_ATTEMPTS_EXCEEDED, {
-          where: { status: StatusString.PENDING },
-          throwOnFailure: false,
-          update: { resetDeduplicationID: true },
-        });
-        throw new DBOSMaxRecoveryAttemptsExceededError(initStatus.workflowUUID, options.maxRetries);
-      }
-      this.logger.debug(`Workflow ${initStatus.workflowUUID} attempt number: ${attempts}.`);
-      return {
-        status,
-        deadlineEpochMS,
-        shouldExecuteOnThisExecutor: true,
-        serialization: resRow.serialization,
-      };
+      const result = await this.initWorkflowStatusInternal(client, initStatus, creatorXid, reusePolicy);
+      // If there is an existing DB record and we aren't here to recover it, leave it be.
+      shouldCommit = result.shouldExecuteOnThisExecutor;
+      return result;
     } finally {
       try {
         if (shouldCommit) {
@@ -794,44 +1728,520 @@ export class SystemDatabase {
     }
   }
 
+  /** Insert a child workflow's row and record it as the parent's step in one transaction, so a crash leaves both or neither. */
   @dbRetry()
-  async recordWorkflowOutput(workflowID: string, status: WorkflowStatusInternal): Promise<void> {
-    const client = await this.pool.connect();
+  async initChildWorkflowStatus(
+    initStatus: WorkflowStatusInternal,
+    creatorXid: string,
+    parentWorkflowID: string,
+    parentFunctionID: number,
+    startTimeEpochMs: number,
+    endTimeEpochMs: number,
+    reusePolicy: WorkflowIDReusePolicy = 'return-existing',
+  ): Promise<{
+    status: string;
+    shouldExecuteOnThisExecutor: boolean;
+    serialization: SysDBSerializationFormat | null;
+  }> {
+    const client = await this.connect();
+    let shouldCommit = false;
     try {
-      await this.updateWorkflowStatus(client, workflowID, StatusString.SUCCESS, {
-        update: { output: status.output, resetDeduplicationID: true, setCompletedAt: true },
+      await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+      const parentOwnerXid = currentOwnerXid(parentWorkflowID);
+      if (parentOwnerXid !== undefined) {
+        await this.checkOwner(client, parentWorkflowID, parentOwnerXid);
+      }
+      const result = await this.initWorkflowStatusInternal(client, initStatus, creatorXid, reusePolicy);
+      await this.recordOperationResultInternal(
+        client,
+        parentWorkflowID,
+        parentFunctionID,
+        initStatus.workflowName,
+        true,
+        startTimeEpochMs,
+        endTimeEpochMs,
+        // Unkeyed, as only a sharded database records the child's key, through its own override.
+        { childWorkflowID: initStatus.workflowUUID, ownerChecked: true, childValues: {} },
+      );
+      shouldCommit = true;
+      return result;
+    } finally {
+      try {
+        if (shouldCommit) {
+          await client.query('COMMIT');
+          await debugTriggerPoint(DEBUG_TRIGGER_INITWF_COMMIT);
+        } else {
+          await client.query('ROLLBACK');
+        }
+      } finally {
+        client.release();
+      }
+    }
+  }
+
+  protected async initWorkflowStatusInternal(
+    client: ClientBase,
+    initStatus: WorkflowStatusInternal,
+    creatorXid: string | null,
+    reusePolicy: WorkflowIDReusePolicy,
+  ): Promise<{
+    status: string;
+    shouldExecuteOnThisExecutor: boolean;
+    serialization: SysDBSerializationFormat | null;
+  }> {
+    const resRow = await this.insertWorkflowStatus(client, initStatus, creatorXid);
+    if (reusePolicy === 'reject' && (creatorXid === null || resRow.creator_xid !== creatorXid)) {
+      throw new DBOSWorkflowIDInUseError(initStatus.workflowUUID, resRow.status, resRow.name);
+    }
+    if (resRow.name !== initStatus.workflowName) {
+      const msg = `Workflow already exists with a different function name: ${resRow.name}, but the provided function name is: ${initStatus.workflowName}`;
+      throw new DBOSConflictingWorkflowError(initStatus.workflowUUID, msg);
+    } else if (resRow.class_name !== initStatus.workflowClassName) {
+      const msg = `Workflow already exists with a different class name: ${resRow.class_name}, but the provided class name is: ${initStatus.workflowClassName}`;
+      throw new DBOSConflictingWorkflowError(initStatus.workflowUUID, msg);
+    } else if ((resRow.config_name || '') !== (initStatus.workflowConfigName || '')) {
+      const msg = `Workflow already exists with a different class configuration: ${resRow.config_name}, but the provided class configuration is: ${initStatus.workflowConfigName}`;
+      throw new DBOSConflictingWorkflowError(initStatus.workflowUUID, msg);
+    } else if ((resRow.queue_name ?? undefined) !== (initStatus.queueName ?? undefined)) {
+      // This is a warning because a different queue name is not necessarily an error.
+      this.logger.warn(
+        `Workflow (${initStatus.workflowUUID}) already exists in queue: ${resRow.queue_name}, but the provided queue name is: ${initStatus.queueName}. The queue is not updated. ${new Error().stack}`,
+      );
+    }
+
+    // The upsert above already set executor assignment for a row we own.
+    return {
+      status: resRow.status,
+      shouldExecuteOnThisExecutor: creatorXid === resRow.creator_xid,
+      serialization: resRow.serialization,
+    };
+  }
+
+  /** Dead-letter claimed workflows that exhausted their attempts, keeping their queue; rows others have moved on are left alone. */
+  @dbRetry()
+  async deadLetterWorkflows(workflowIDs: string[], minRecoveryAttempts: number): Promise<void> {
+    if (workflowIDs.length === 0) return;
+    const params: unknown[] = [StatusString.MAX_RECOVERY_ATTEMPTS_EXCEEDED, StatusString.PENDING, minRecoveryAttempts];
+    await this.pool.query(
+      `UPDATE "${this.schemaName}".workflow_status
+       SET status = $1,
+           owner_xid = NULL,
+           deduplication_id = NULL,
+           started_at_epoch_ms = NULL,
+           updated_at = (EXTRACT(EPOCH FROM now()) * 1000)::bigint,
+           completed_at = (EXTRACT(EPOCH FROM now()) * 1000)::bigint
+       WHERE ${this.wfIn(undefined, workflowIDs, params)} AND status = $2 AND recovery_attempts >= $3`,
+      params,
+    );
+  }
+
+  /** Highest created_at among still-active rows per partition key, used to seed the in-memory cursor. */
+  async #maxPartitionKeyCreatedAt(keys: string[]): Promise<Map<string, number>> {
+    const maxima = new Map<string, number>();
+    if (keys.length === 0) return maxima;
+    const params: unknown[] = [keys, [StatusString.ENQUEUED, StatusString.PENDING]];
+    const { rows } = await this.pool.query<{ queue_partition_key: string; max_created_at: string | null }>(
+      `SELECT queue_partition_key, MAX(created_at) AS max_created_at
+       FROM "${this.schemaName}".workflow_status
+       WHERE ${this.scoped(undefined, params)} AND queue_partition_key = ANY($1) AND status = ANY($2)
+       GROUP BY queue_partition_key`,
+      params,
+    );
+    for (const row of rows) {
+      if (row.max_created_at !== null) {
+        maxima.set(row.queue_partition_key, Number(row.max_created_at));
+      }
+    }
+    return maxima;
+  }
+
+  /**
+   * Stamp created_at monotonic within each partition key so per-key order holds across batches.
+   * Unordered rows (no partition key) get wall-clock time and never touch the cursors.
+   */
+  protected async assignBatchCreatedAt(statuses: WorkflowStatusInternal[]): Promise<number[]> {
+    const nowMS = Date.now();
+    const batchKeys = new Set<string>();
+    for (const status of statuses) {
+      if (status.queuePartitionKey !== undefined) {
+        batchKeys.add(status.queuePartitionKey);
+      }
+    }
+    // On first sight of a key, seed its cursor from the DB high-water mark so per-key order
+    // survives a restart or rebalance instead of resetting to wall-clock.
+    const unseen = Array.from(batchKeys).filter((key) => !this.#batchCreatedAtCursors.has(key));
+    const seeds = await this.#maxPartitionKeyCreatedAt(unseen);
+    // Synchronous from here, so a concurrent batch cannot interleave with these cursor updates.
+    for (const [key, seededMax] of seeds) {
+      // max() guards against a concurrent batch that already advanced this key.
+      this.#batchCreatedAtCursors.set(key, Math.max(this.#batchCreatedAtCursors.get(key) ?? 0, seededMax + 1));
+    }
+    const createdAts: number[] = [];
+    const nextForKey = new Map<string, number>();
+    for (const status of statuses) {
+      const key = status.queuePartitionKey;
+      if (key === undefined) {
+        createdAts.push(nowMS);
+        continue;
+      }
+      const value = nextForKey.get(key) ?? Math.max(nowMS, this.#batchCreatedAtCursors.get(key) ?? 0);
+      createdAts.push(value);
+      nextForKey.set(key, value + 1);
+    }
+    for (const [key, next] of nextForKey) {
+      this.#batchCreatedAtCursors.set(key, next);
+    }
+    return createdAts;
+  }
+
+  /**
+   * Batch-insert ENQUEUED workflow status rows in a single transaction.
+   *
+   * Rows whose workflow_uuid already exists are skipped rather than updated, making this
+   * idempotent under redelivery (e.g. Kafka). Returns the IDs of the rows actually inserted.
+   *
+   * Deliberately not `@dbRetry()`-decorated, unlike its neighbours: that loop is unabortable, so a
+   * connection outage would trap the caller in it rather than let it back off and observe a
+   * shutdown. Callers retry this themselves.
+   */
+  async enqueueWorkflows(statuses: WorkflowStatusInternal[]): Promise<Set<string>> {
+    if (statuses.length === 0) return new Set();
+    for (const status of statuses) {
+      if (status.status !== StatusString.ENQUEUED) {
+        throw new DBOSError(
+          `enqueueWorkflows only accepts ${StatusString.ENQUEUED} workflows, but ${status.workflowUUID} is ${status.status}`,
+        );
+      }
+      if (status.deduplicationID !== undefined) {
+        throw new DBOSError(`enqueueWorkflows does not support deduplication IDs, but ${status.workflowUUID} has one`);
+      }
+    }
+    // Stamped before the transaction, as seeding a key's cursor reads on another connection.
+    const createdAts = await this.assignBatchCreatedAt(statuses);
+    const client = await this.connect();
+    try {
+      return await this.inTransaction(client, () => this.insertWorkflowBatch(client, statuses, createdAts));
+    } finally {
+      client.release();
+    }
+  }
+
+  /** Batch-enqueue scheduled runs, skipping existing IDs, stamping last_fired_at from `firedAt` (ID to tick) for those inserted, in one transaction. */
+  @dbRetry()
+  async enqueueScheduledWorkflows(
+    statuses: WorkflowStatusInternal[],
+    firedAt: Map<string, string>,
+  ): Promise<Set<string>> {
+    if (statuses.length === 0) return new Set();
+    // Stamped before the transaction, as seeding a key's cursor reads on another connection.
+    const createdAts = await this.assignBatchCreatedAt(statuses);
+    const client = await this.connect();
+    try {
+      return await this.inTransaction(client, async () => {
+        const inserted = await this.insertWorkflowBatch(client, statuses, createdAts);
+        await this.stampLastFiredAt(client, statuses, firedAt, inserted);
+        return inserted;
       });
     } finally {
       client.release();
     }
   }
 
-  @dbRetry()
-  async recordWorkflowError(workflowID: string, status: WorkflowStatusInternal): Promise<void> {
-    const client = await this.pool.connect();
-    try {
-      await this.updateWorkflowStatus(client, workflowID, StatusString.ERROR, {
-        update: { error: status.error, resetDeduplicationID: true, setCompletedAt: true },
+  /** Set each schedule's last_fired_at to its last inserted tick, `statuses` being in tick order. */
+  protected async stampLastFiredAt(
+    client: ClientBase,
+    statuses: WorkflowStatusInternal[],
+    firedAt: Map<string, string>,
+    inserted: Set<string>,
+  ): Promise<void> {
+    const latest = new Map<string, string>();
+    for (const status of statuses) {
+      const fired = firedAt.get(status.workflowUUID);
+      if (inserted.has(status.workflowUUID) && fired !== undefined && status.scheduleName !== undefined) {
+        latest.set(status.scheduleName, fired);
+      }
+    }
+    if (latest.size === 0) return;
+    // Sorted, like applySchedules, so concurrent writers lock schedule rows in one order.
+    const names = Array.from(latest.keys()).sort(compareCodeUnits);
+    const lockParams: unknown[] = [names];
+    await client.query(
+      `SELECT 1 FROM "${this.schemaName}".workflow_schedules
+       WHERE ${this.global(undefined, lockParams)} AND schedule_name = ANY($1::text[])
+       ORDER BY schedule_name COLLATE "C" FOR UPDATE`,
+      lockParams,
+    );
+    const params: unknown[] = [names];
+    const cases = names.map(
+      (name) => `WHEN schedule_name = $${params.push(name)} THEN $${params.push(latest.get(name))}`,
+    );
+    await client.query(
+      `UPDATE "${this.schemaName}".workflow_schedules SET last_fired_at = CASE ${cases.join(' ')} END
+       WHERE ${this.global(undefined, params)} AND schedule_name = ANY($1::text[])`,
+      params,
+    );
+  }
+
+  /** Insert these ENQUEUED workflows' rows on `client` with `stamped` from assignBatchCreatedAt, skipping existing IDs. Returns the IDs inserted. */
+  protected async insertWorkflowBatch(
+    client: ClientBase,
+    batch: WorkflowStatusInternal[],
+    stamped: number[],
+  ): Promise<Set<string>> {
+    // Inserted in one global order, so batches overlapping across processes wait on each other instead of deadlocking.
+    const order = batch.map((_, i) => i).sort((a, b) => compareCodeUnits(batch[a].workflowUUID, batch[b].workflowUUID));
+    const statuses = order.map((i) => batch[i]);
+    const createdAts = order.map((i) => stamped[i]);
+    const inserted = new Set<string>();
+    const columns = [
+      'workflow_uuid',
+      'status',
+      'name',
+      'class_name',
+      'config_name',
+      'queue_name',
+      'authenticated_user',
+      'assumed_role',
+      'authenticated_roles',
+      'executor_id',
+      'application_version',
+      'application_id',
+      'created_at',
+      'recovery_attempts',
+      'updated_at',
+      'workflow_timeout_ms',
+      'workflow_deadline_epoch_ms',
+      'inputs',
+      'deduplication_id',
+      'priority',
+      'queue_partition_key',
+      'parent_workflow_id',
+      'serialization',
+      'creator_xid',
+      'delay_until_epoch_ms',
+      'attributes',
+      'schedule_name',
+      'application_name',
+    ];
+    // Chunk to stay well under the bind-parameter limit.
+    const chunkSize = 500;
+    for (let start = 0; start < statuses.length; start += chunkSize) {
+      const chunk = statuses.slice(start, start + chunkSize);
+      const keyed = chunk.map((status) => ({
+        ...this.wfValues(status.workflowUUID, status.shardKey),
+        ...this.parentValues(status.parentWorkflowID),
+      }));
+      const rows = chunk.map((status, i) => {
+        const createdAt = createdAts[start + i];
+        return [
+          ...Object.values(keyed[i]),
+          status.workflowUUID,
+          status.status,
+          status.workflowName,
+          // For cross-language compatibility, these MUST be NULL in the database when not set
+          status.workflowClassName === '' ? null : status.workflowClassName,
+          status.workflowConfigName === '' ? null : status.workflowConfigName,
+          status.queueName ?? null,
+          status.authenticatedUser,
+          status.assumedRole,
+          JSON.stringify(status.authenticatedRoles),
+          status.executorId,
+          status.applicationVersion ?? null,
+          status.applicationID,
+          createdAt,
+          0,
+          createdAt,
+          status.timeoutMS ?? null,
+          status.deadlineEpochMS ?? null,
+          // Legacy column: the payload lives in workflow_input.
+          null,
+          null,
+          status.priority,
+          status.queuePartitionKey ?? null,
+          status.parentWorkflowID ?? null,
+          status.serialization,
+          null,
+          status.delayUntilEpochMS ?? null,
+          status.attributes ? JSON.stringify(status.attributes) : null,
+          status.scheduleName ?? null,
+          status.applicationName ?? null,
+        ];
       });
+      const returned = await this.insertRows<{ workflow_uuid: string }>(
+        client,
+        'workflow_status',
+        [...Object.keys(keyed[0]), ...columns],
+        rows,
+        `ON CONFLICT (${this.keyConflict('workflow_uuid')}) DO NOTHING RETURNING workflow_uuid`,
+      );
+      for (const row of returned) {
+        inserted.add(row.workflow_uuid);
+      }
+    }
+    for (let start = 0; start < statuses.length; start += chunkSize) {
+      const chunk = statuses.slice(start, start + chunkSize);
+      const keyed = chunk.map((status) => this.wfValues(status.workflowUUID, status.shardKey));
+      await this.insertRows(
+        client,
+        'workflow_input',
+        [...Object.keys(keyed[0]), 'workflow_uuid', 'inputs', 'retention_timestamp'],
+        chunk.map((status, i) => [
+          ...Object.values(keyed[i]),
+          status.workflowUUID,
+          status.input,
+          createdAts[start + i],
+        ]),
+        `ON CONFLICT (${this.keyConflict('workflow_uuid')}) DO NOTHING`,
+      );
+    }
+    return inserted;
+  }
+
+  @dbRetry()
+  async recordWorkflowOutput(workflowID: string, status: WorkflowStatusInternal, ownerXid?: string): Promise<boolean> {
+    return await this.#recordWorkflowOutcome(workflowID, StatusString.SUCCESS, { output: status.output }, ownerXid);
+  }
+
+  @dbRetry()
+  async recordWorkflowError(workflowID: string, status: WorkflowStatusInternal, ownerXid?: string): Promise<boolean> {
+    return await this.#recordWorkflowOutcome(workflowID, StatusString.ERROR, { error: status.error }, ownerXid);
+  }
+
+  // Record a workflow's terminal outcome (SUCCESS or ERROR), reporting whether
+  // the write landed. The write applies only to a PENDING row still owned by
+  // ownerXid, which defaults to the calling execution's token; a caller
+  // outside the workflow's context passes it explicitly or goes unchecked.
+  //
+  // Returning false means the row was CANCELLED, dead-lettered, already
+  // terminal, handed to another execution (e.g. by a concurrent resume or
+  // recovery), or deleted; the caller resolves which by awaiting the recorded
+  // outcome.
+  async #recordWorkflowOutcome(
+    workflowID: string,
+    status: (typeof StatusString)[keyof typeof StatusString],
+    outcome: { output?: string | null; error?: string | null },
+    ownerXid: string | undefined,
+  ): Promise<boolean> {
+    ownerXid ??= currentOwnerXid(workflowID);
+    if (!(await this.outcomeInOneStatement())) {
+      return await this.#recordWorkflowOutcomeInTransaction(workflowID, status, outcome, ownerXid);
+    }
+    // One autocommit round trip; the upsert reads the UPDATE's rows, so the output lands only with the status.
+    const params: unknown[] = [status, StatusString.PENDING, outcome.output ?? null, outcome.error ?? null];
+    const target = this.wf(undefined, workflowID, params);
+    const owned = ownerXid !== undefined ? `AND owner_xid = $${params.push(ownerXid)}` : '';
+    const keys = this.wfValues(workflowID);
+    const keyColumns = Object.keys(keys);
+    const keyExprs = Object.values(keys).map((value) => `$${params.push(value)}::text`);
+    const workflowParam = `$${params.push(workflowID)}::text`;
+    const { rows } = await this.pool.query<{ count: string }>(
+      `WITH updated AS (
+         UPDATE "${this.schemaName}".workflow_status
+         SET status = $1,
+             -- As the workflow is complete, remove its deduplication ID; a finished workflow has no owner.
+             deduplication_id = NULL,
+             owner_xid = NULL,
+             updated_at = (EXTRACT(EPOCH FROM now()) * 1000)::bigint,
+             completed_at = (EXTRACT(EPOCH FROM now()) * 1000)::bigint
+         WHERE ${target} AND status = $2 ${owned}
+         RETURNING 1
+       ), stored AS (
+         INSERT INTO "${this.schemaName}".workflow_output (${[...keyColumns, 'workflow_uuid', 'output', 'error'].join(', ')})
+         SELECT ${[...keyExprs, workflowParam, '$3::text', '$4::text'].join(', ')}
+         WHERE EXISTS (SELECT 1 FROM updated)
+         -- EXCLUDED is the row this INSERT proposed, so these are the values above.
+         ON CONFLICT (${this.keyConflict('workflow_uuid')}) DO UPDATE SET output = EXCLUDED.output, error = EXCLUDED.error
+         -- CockroachDB refuses a data-modifying CTE without RETURNING.
+         RETURNING 1
+       )
+       -- Selecting from the CTEs rather than inserting at the top level lets a router see the shard key.
+       SELECT count(*) AS count FROM updated`,
+      params,
+    );
+    return Number(rows[0]?.count ?? 0) > 0;
+  }
+
+  /** Whether a workflow's outcome is written in one statement, rather than a transaction of two. */
+  outcomeInOneStatement(): Promise<boolean> {
+    return Promise.resolve(true);
+  }
+
+  /** The outcome write as a transaction of two statements, for a backend that cannot run it as one. */
+  async #recordWorkflowOutcomeInTransaction(
+    workflowID: string,
+    status: (typeof StatusString)[keyof typeof StatusString],
+    outcome: { output?: string | null; error?: string | null },
+    ownerXid: string | undefined,
+  ): Promise<boolean> {
+    const client = await this.connect();
+    let committed = false;
+    try {
+      await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+      const rowCount = await this.updateWorkflowStatus(client, workflowID, status, {
+        // A finished workflow has no owner.
+        update: { resetDeduplicationID: true, setCompletedAt: true, ownerXid: null },
+        where: { status: StatusString.PENDING, ownerXid },
+        throwOnFailure: false,
+      });
+      if (rowCount === 0) {
+        // The outcome was not ours to write, so leave no orphan payload.
+        return false;
+      }
+      const values: Record<string, unknown> = {
+        ...this.wfValues(workflowID),
+        workflow_uuid: workflowID,
+        output: outcome.output ?? null,
+        error: outcome.error ?? null,
+      };
+      const columns = Object.keys(values);
+      await client.query(
+        `INSERT INTO "${this.schemaName}".workflow_output (${columns.join(', ')})
+         VALUES (${columns.map((_, i) => `$${i + 1}`).join(', ')})
+         ON CONFLICT (${this.keyConflict('workflow_uuid')}) DO UPDATE SET output = EXCLUDED.output, error = EXCLUDED.error`,
+        Object.values(values),
+      );
+      committed = true;
+      return true;
     } finally {
-      client.release();
+      try {
+        if (committed) {
+          await client.query('COMMIT');
+        } else {
+          // Swallowed: a rollback failure must not mask why we are rolling back.
+          await client.query('ROLLBACK').catch(() => undefined);
+        }
+      } finally {
+        client.release();
+      }
     }
   }
 
-  async getPendingWorkflows(executorID: string, appVersion: string): Promise<GetPendingWorkflowsOutput[]> {
-    const getWorkflows = await this.pool.query<workflow_status>(
-      `SELECT workflow_uuid, queue_name 
-       FROM "${this.schemaName}".workflow_status 
-       WHERE status=$1 AND executor_id=$2 AND application_version=$3`,
-      [StatusString.PENDING, executorID, appVersion],
+  // Recovery re-enqueues rather than executing directly so the queue's atomic dequeue admits exactly one runner, and the executor ID predicate rejects sweeps for rows a live executor has already claimed.
+  async reenqueueWorkflowsForRecovery(
+    executorID: string,
+    appVersion: string | undefined,
+    recoveryQueueName: string,
+  ): Promise<RecoveredWorkflow[]> {
+    const params: unknown[] = [StatusString.ENQUEUED, recoveryQueueName, StatusString.PENDING, executorID];
+    const versionFilter = appVersion === undefined ? '' : `AND application_version = $${params.push(appVersion)}`;
+    // executor_id defaults to "local", so it collides across applications.
+    const scope = this.appNameFilter('application_name', this.appName, params);
+    const keyColumn = this.keyColumn(undefined);
+    const result = await this.pool.query<{ workflow_uuid: string; shard_key?: string | null }>(
+      `UPDATE "${this.schemaName}".workflow_status
+       SET started_at_epoch_ms = NULL,
+           status = $1,
+           owner_xid = NULL,
+           updated_at = (EXTRACT(EPOCH FROM now()) * 1000)::bigint,
+           queue_name = COALESCE(queue_name, $2)
+       WHERE status = $3
+         AND executor_id = $4
+         ${versionFilter}
+         AND ${scope}
+       RETURNING workflow_uuid${keyColumn !== undefined ? `, ${keyColumn} AS shard_key` : ''}`,
+      params,
     );
-    return getWorkflows.rows.map(
-      (i) =>
-        <GetPendingWorkflowsOutput>{
-          workflowUUID: i.workflow_uuid,
-          queueName: i.queue_name,
-        },
-    );
+    return result.rows.map((row) => ({ workflowID: row.workflow_uuid, shardKey: row.shard_key ?? undefined }));
   }
 
   @dbRetry()
@@ -840,21 +2250,29 @@ export class SystemDatabase {
     callerID?: string,
     callerFN?: number,
   ): Promise<WorkflowStatusInternal | null> {
-    const funcGetStatus = async () => {
-      const statuses = await this.listWorkflows({ workflowIDs: [workflowID] });
+    // Resolved before binding the caller's own key, which a same-ID target would share.
+    const shardKey = this.keyHint(workflowID);
+    // Inside a workflow this runs on the transaction's client: taking a second pool connection while
+    // holding the first deadlocks the pool once every connection is held by a waiting caller.
+    const funcGetStatus = async (client?: PoolClient) => {
+      const statuses = await this.#listWorkflows({ workflowIDs: [workflowID], shardKey }, {}, client);
       const status = statuses.find((s) => s.workflowUUID === workflowID);
       return status ? JSON.stringify(status) : null;
     };
 
-    if (callerID && callerFN) {
-      const client = await this.pool.connect();
-      try {
-        // Check if the operation has been done before for OAOO (only do this inside a workflow).
-        const json = await this.#runAndRecordResult(client, DBOS_FUNCNAME_GETSTATUS, callerID, callerFN, funcGetStatus);
-        return parseStatus(json);
-      } finally {
-        client.release();
-      }
+    if (callerID && callerFN !== undefined) {
+      const json = await this.ownKey(callerID, undefined, async () => {
+        const client = await this.connect();
+        try {
+          // Check if the operation has been done before for OAOO (only do this inside a workflow).
+          return await this.inTransaction(client, () =>
+            this.#runAndRecordResult(client, DBOS_FUNCNAME_GETSTATUS, callerID, callerFN, () => funcGetStatus(client)),
+          );
+        } finally {
+          client.release();
+        }
+      });
+      return parseStatus(json);
     } else {
       const json = await funcGetStatus();
       return parseStatus(json);
@@ -865,6 +2283,28 @@ export class SystemDatabase {
     }
   }
 
+  /** Max IDs per {@link getWorkflowStatuses} fetch: listWorkflows binds one parameter per ID. */
+  statusFetchChunkSize: number = 500;
+
+  // Retried per chunk so a reconnect refetches one chunk, not every chunk before it.
+  @dbRetry()
+  private async fetchWorkflowStatusChunk(workflowIDs: string[]): Promise<WorkflowStatusInternal[]> {
+    return await this.listWorkflows({ workflowIDs, loadInput: true, loadOutput: false }, { keyedIDs: true });
+  }
+
+  /** Fetch many statuses in as few round trips as possible. IDs with no row are omitted. */
+  async getWorkflowStatuses(workflowIDs: string[]): Promise<Map<string, WorkflowStatusInternal>> {
+    const statuses = new Map<string, WorkflowStatusInternal>();
+    for (let start = 0; start < workflowIDs.length; start += this.statusFetchChunkSize) {
+      for (const status of await this.fetchWorkflowStatusChunk(
+        workflowIDs.slice(start, start + this.statusFetchChunkSize),
+      )) {
+        statuses.set(status.workflowUUID, status);
+      }
+    }
+    return statuses;
+  }
+
   // Only used in tests
   async setWorkflowStatus(
     workflowID: string,
@@ -872,12 +2312,21 @@ export class SystemDatabase {
     resetRecoveryAttempts: boolean,
     internalOptions?: {
       updateName?: string;
+      queueName?: string;
+      resetStartedAtEpochMs?: boolean;
+      ownerXid?: string | null;
     },
   ): Promise<void> {
-    const client = await this.pool.connect();
+    const client = await this.connect();
     try {
       await this.updateWorkflowStatus(client, workflowID, status, {
-        update: { resetRecoveryAttempts, resetNameTo: internalOptions?.updateName },
+        update: {
+          resetRecoveryAttempts,
+          resetNameTo: internalOptions?.updateName,
+          queueName: internalOptions?.queueName,
+          resetStartedAtEpochMs: internalOptions?.resetStartedAtEpochMs,
+          ownerXid: internalOptions?.ownerXid,
+        },
       });
     } finally {
       client.release();
@@ -889,18 +2338,33 @@ export class SystemDatabase {
   async getOperationResultAndThrowIfCancelled(
     workflowID: string,
     functionID: number,
+    ownerKey?: string,
   ): Promise<SystemDatabaseStoredResult | undefined> {
-    const client = await this.pool.connect();
-    try {
-      return await this.#getOperationResultAndThrowIfCancelled(client, workflowID, functionID);
-    } finally {
-      client.release();
-    }
+    return await this.ownKey(workflowID, ownerKey, async () => {
+      const client = await this.connect();
+      try {
+        return await this.#getOperationResultAndThrowIfCancelled(client, workflowID, functionID);
+      } finally {
+        client.release();
+      }
+    });
   }
 
-  async getAllOperationResults(workflowID: string, limit?: number, offset?: number): Promise<operation_outputs[]> {
-    let query = `SELECT * FROM "${this.schemaName}".operation_outputs WHERE workflow_uuid=$1 ORDER BY function_id`;
-    const params: unknown[] = [workflowID];
+  @dbRetry()
+  async getAllOperationResults(
+    workflowID: string,
+    limit?: number,
+    offset?: number,
+    loadOutput: boolean = true,
+  ): Promise<operation_outputs[]> {
+    // Skip the output/error payload columns when the caller does not need them,
+    // mirroring how listWorkflows skips its payload joins when loadOutput is false.
+    const childKey = this.keyColumn(undefined, 'child_shard_key');
+    const columns = loadOutput
+      ? '*'
+      : `workflow_uuid, function_id, function_name, child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms, application_name, retention_timestamp${childKey !== undefined ? `, ${childKey}` : ''}`;
+    const params: unknown[] = [];
+    let query = `SELECT ${columns} FROM "${this.schemaName}".operation_outputs WHERE ${this.wf(undefined, workflowID, params)} ORDER BY function_id`;
     if (limit !== undefined) {
       params.push(limit);
       query += ` LIMIT $${params.length}`;
@@ -909,7 +2373,7 @@ export class SystemDatabase {
       params.push(offset);
       query += ` OFFSET $${params.length}`;
     }
-    const { rows } = await this.pool.query<operation_outputs>(query, params);
+    const { rows } = await this.observabilityQuery((client) => client.query<operation_outputs>(query, params));
     return rows;
   }
 
@@ -926,24 +2390,59 @@ export class SystemDatabase {
       output?: string | null;
       error?: string | null;
       serialization?: string | null;
+      // The recording workflow's own shard key, when the ambient context is another workflow's.
+      ownerKey?: string;
     } = {},
   ): Promise<void> {
-    const client = await this.pool.connect();
+    // Resolved before binding the caller's own key, which a same-ID child would share.
+    const childValues = this.childValues(options.childWorkflowID);
+    await this.ownKey(workflowID, options.ownerKey, async () => {
+      const client = await this.connect();
+      try {
+        await this.inTransaction(client, () =>
+          this.recordOperationResultInternal(
+            client,
+            workflowID,
+            functionID,
+            functionName,
+            checkConflict,
+            startTimeEpochMs,
+            endTimeEpochMs,
+            { ...options, childValues },
+          ),
+        );
+      } finally {
+        client.release();
+        await debugTriggerPoint(DEBUG_TRIGGER_STEP_COMMIT);
+      }
+    });
+  }
+
+  /** Checkpoint an operation's failure so a replay re-throws it instead of re-running. */
+  async recordOperationError(
+    workflowID: string,
+    functionID: number,
+    functionName: string,
+    startTimeEpochMs: number,
+    error: unknown,
+    childWorkflowID?: string,
+  ): Promise<void> {
+    let serialized: { serializedValue: string | null; serialization: string | null };
     try {
-      await this.recordOperationResultInternal(
-        client,
-        workflowID,
-        functionID,
-        functionName,
-        checkConflict,
-        startTimeEpochMs,
-        endTimeEpochMs,
-        options,
+      serialized = await serializeResErrorWithSerializer(error as Error, this.serializer, this.serializer.name());
+      await deserializeValue(serialized.serializedValue, serialized.serialization, this.serializer);
+    } catch (serError) {
+      // A checkpoint replay could not load would wedge the workflow; leave it unrecorded so replay re-runs.
+      this.logger.warn(
+        `Not checkpointing ${functionName} failure in workflow ${workflowID}: its error cannot be serialized: ${String(serError)}`,
       );
-    } finally {
-      client.release();
-      await debugTriggerPoint(DEBUG_TRIGGER_STEP_COMMIT);
+      return;
     }
+    await this.recordOperationResult(workflowID, functionID, functionName, true, startTimeEpochMs, Date.now(), {
+      error: serialized.serializedValue,
+      serialization: serialized.serialization,
+      childWorkflowID,
+    });
   }
 
   async runTransactionalStep(
@@ -952,35 +2451,56 @@ export class SystemDatabase {
     functionName: string,
     callback: (client: PoolClient) => Promise<string | null>,
   ): Promise<SystemDatabaseStoredResult | undefined> {
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
-      const existing = await this.#getOperationResultAndThrowIfCancelled(client, workflowID, functionID);
-      if (existing !== undefined) {
+    const startTime = Date.now();
+    // The latest attempt's callback failure, told apart from a check or checkpoint failure.
+    let callbackError: unknown = undefined;
+    const attempt = async (): Promise<SystemDatabaseStoredResult | undefined> => {
+      callbackError = undefined;
+      const client = await this.connect();
+      try {
+        await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+        const existing = await this.#getOperationResultAndThrowIfCancelled(client, workflowID, functionID);
+        if (existing !== undefined) {
+          await client.query('ROLLBACK');
+          return existing;
+        }
+        let output: string | null;
+        try {
+          output = await callback(client);
+        } catch (e) {
+          callbackError = e;
+          throw e;
+        }
+        await this.recordOperationResultInternal(
+          client,
+          workflowID,
+          functionID,
+          functionName,
+          true,
+          startTime,
+          Date.now(),
+          {
+            output,
+          },
+        );
+        await client.query('COMMIT');
+        await debugTriggerPoint(DEBUG_TRIGGER_STEP_COMMIT);
+        return undefined;
+      } catch (e) {
         await client.query('ROLLBACK');
-        return existing;
+        throw e;
+      } finally {
+        client.release();
       }
-      const startTime = Date.now();
-      const output = await callback(client);
-      await this.recordOperationResultInternal(
-        client,
-        workflowID,
-        functionID,
-        functionName,
-        true,
-        startTime,
-        Date.now(),
-        {
-          output,
-        },
-      );
-      await client.query('COMMIT');
-      return undefined;
+    };
+    try {
+      return await withDbRetry(attempt);
     } catch (e) {
-      await client.query('ROLLBACK');
+      // Retries are done and the transaction rolled back, so record the callback's own failure separately.
+      if (e === callbackError) {
+        await this.recordOperationError(workflowID, functionID, functionName, startTime, e);
+      }
       throw e;
-    } finally {
-      client.release();
     }
   }
 
@@ -996,139 +2516,305 @@ export class SystemDatabase {
 
     patchName = `DBOS.patch-${patchName}`;
 
-    const { rows } = await this.pool.query<operation_outputs>(
-      `SELECT function_name
-       FROM "${this.schemaName}".operation_outputs
-      WHERE workflow_uuid=$1 AND function_id=$2`,
-      [workflowID, functionID],
-    );
+    const readCheckpointName = async (queryable: Pool | PoolClient) => {
+      const params: unknown[] = [functionID];
+      const { rows } = await queryable.query<operation_outputs>(
+        `SELECT function_name
+         FROM "${this.schemaName}".operation_outputs
+        WHERE ${this.wf(undefined, workflowID, params)} AND function_id=$1`,
+        params,
+      );
+      return rows.length === 0 ? undefined : rows[0].function_name;
+    };
 
     if (deprecated) {
       // Deprecated does not write anything.  We skip any existing matching patch marker if it matches
-      if (rows.length === 0) {
+      const checkpointName = await readCheckpointName(this.pool);
+      if (checkpointName === undefined) {
         return { isPatched: true, hasEntry: false };
       }
-      return { isPatched: true, hasEntry: rows[0].function_name === patchName };
+      return { isPatched: true, hasEntry: checkpointName === patchName };
     }
 
     // Nondeprecated - skip matching entry, unpatched if nonmatching entry,
-    //  If there is no entry, we insert one that indicates it is patched.
-    if (rows.length !== 0) {
-      if (rows[0].function_name === patchName) {
+    //  If the history ends before this point, we insert an entry that indicates it is patched, as an owner-checked checkpoint.
+    //  If the history has a checkpoint past this point but none here, the execution reached this point on pre-patch code (e.g., recv).
+    //  It is unpatched, and nothing is consumed.
+    const client = await this.connect();
+    try {
+      return await this.inTransaction(client, async () => {
+        const params: unknown[] = [functionID];
+        const { rows } = await client.query<Pick<operation_outputs, 'function_id' | 'function_name'>>(
+          `SELECT function_id, function_name
+           FROM "${this.schemaName}".operation_outputs
+          WHERE ${this.wf(undefined, workflowID, params)} AND function_id>=$1
+          ORDER BY function_id
+          LIMIT 1`,
+          params,
+        );
+        if (rows.length !== 0) {
+          const matches = rows[0].function_id === functionID && rows[0].function_name === patchName;
+          return { isPatched: matches, hasEntry: matches };
+        }
+        const dn = Date.now();
+        await this.recordOperationResultInternal(client, workflowID, functionID, patchName, true, dn, dn);
         return { isPatched: true, hasEntry: true };
-      }
-      return { isPatched: false, hasEntry: false };
+      });
+    } finally {
+      client.release();
     }
-
-    // Insert a patchmarker
-    const dn = Date.now();
-    await this.pool.query<operation_outputs>(
-      `INSERT INTO ${this.schemaName}.operation_outputs
-       (workflow_uuid, function_id, output, error, function_name, child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       ON CONFLICT DO NOTHING;`,
-      [workflowID, functionID, null, null, patchName, null, dn, dn],
-    );
-
-    return { isPatched: true, hasEntry: true };
   }
 
   // ==================== Workflow Management ====================
-  async cancelWorkflows(workflowIDs: string[]): Promise<void> {
+  @dbRetry()
+  async cancelWorkflows(workflowIDs: string[], cancelChildren: boolean = false): Promise<void> {
+    if (!cancelChildren) {
+      await this.#cancelWorkflows(workflowIDs);
+      return;
+    }
+
+    // Cascade cancellation to child workflows level by level.
+    const visited = new Set<string>(workflowIDs);
+    let frontier = workflowIDs;
+    while (frontier.length > 0) {
+      await this.#cancelWorkflows(frontier);
+      const children = await this.getDirectChildren(frontier);
+      frontier = children.filter((id) => !visited.has(id));
+      for (const id of frontier) {
+        visited.add(id);
+      }
+    }
+  }
+
+  async #cancelWorkflows(workflowIDs: string[]): Promise<void> {
+    const params: unknown[] = [StatusString.CANCELLED, StatusString.SUCCESS, StatusString.ERROR];
     await this.pool.query(
       `UPDATE "${this.schemaName}".workflow_status
-       SET status = $1, queue_name = NULL, deduplication_id = NULL, started_at_epoch_ms = NULL,
+       SET status = $1, owner_xid = NULL, deduplication_id = NULL, started_at_epoch_ms = NULL,
+           suspend_key = NULL,
            updated_at = (EXTRACT(EPOCH FROM now()) * 1000)::bigint,
            completed_at = (EXTRACT(EPOCH FROM now()) * 1000)::bigint
-       WHERE workflow_uuid = ANY($2)
-         AND status NOT IN ($3, $4)`,
-      [StatusString.CANCELLED, workflowIDs, StatusString.SUCCESS, StatusString.ERROR],
+       WHERE ${this.wfIn(undefined, workflowIDs, params)}
+         AND status NOT IN ($2, $3)`,
+      params,
     );
-
-    for (const workflowID of workflowIDs) {
-      this.#setWFCancelMap(workflowID);
-    }
   }
 
   @dbRetry()
   async checkIfCanceled(workflowID: string): Promise<void> {
-    const client = await this.pool.connect();
+    // The caller's own workflow, even where a same-ID workflow is bound as a target.
+    await this.ownKey(workflowID, undefined, () => this.#checkIfCanceled(this.pool, workflowID));
+  }
+
+  @dbRetry()
+  async resumeWorkflows(workflowIDs: string[], queueName?: string, queuePartitionKey?: string): Promise<void> {
+    const client = await this.connect();
     try {
-      await this.#checkIfCanceled(client, workflowID);
+      await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+      // Check existence separately: a zero-row update also means "already complete", a legal no-op.
+      const existingParams: unknown[] = [];
+      const { rows } = await client.query<{ workflow_uuid: string }>(
+        `SELECT workflow_uuid FROM "${this.schemaName}".workflow_status WHERE ${this.wfIn(undefined, workflowIDs, existingParams)}`,
+        existingParams,
+      );
+      const existing = new Set(rows.map((r) => r.workflow_uuid));
+      const missing = workflowIDs.filter((id) => !existing.has(id));
+      if (missing.length > 0) {
+        throw new DBOSNonExistentWorkflowError(`Workflow ${missing.join(', ')} does not exist`);
+      }
+      // Only what is passed changes: the row keeps its queue (the internal one if it has none) and key.
+      const updateParams: unknown[] = [
+        StatusString.ENQUEUED,
+        queueName ?? null,
+        StatusString.SUCCESS,
+        StatusString.ERROR,
+        INTERNAL_QUEUE_NAME,
+        queuePartitionKey ?? null,
+      ];
+      await client.query(
+        `UPDATE "${this.schemaName}".workflow_status
+         SET status = $1, owner_xid = NULL, queue_name = COALESCE($2::text, queue_name, $5::text),
+             queue_partition_key = COALESCE($6::text, queue_partition_key), recovery_attempts = 0,
+             workflow_deadline_epoch_ms = NULL, deduplication_id = NULL,
+             started_at_epoch_ms = NULL, suspend_key = NULL,
+             updated_at = (EXTRACT(EPOCH FROM now()) * 1000)::bigint,
+             completed_at = NULL
+         WHERE ${this.wfIn(undefined, workflowIDs, updateParams)}
+           AND status NOT IN ($3, $4)`,
+        updateParams,
+      );
+      await client.query('COMMIT');
+    } catch (e) {
+      // Swallowed: a rollback failure must not mask why we are rolling back.
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw e;
     } finally {
       client.release();
     }
-  }
-
-  async resumeWorkflows(workflowIDs: string[], queueName?: string): Promise<void> {
-    for (const workflowID of workflowIDs) {
-      this.#clearWFCancelMap(workflowID);
-    }
-
-    await this.pool.query(
-      `UPDATE "${this.schemaName}".workflow_status
-       SET status = $1, queue_name = $2, recovery_attempts = 0,
-           workflow_deadline_epoch_ms = NULL, deduplication_id = NULL,
-           started_at_epoch_ms = NULL,
-           updated_at = (EXTRACT(EPOCH FROM now()) * 1000)::bigint,
-           completed_at = NULL
-       WHERE workflow_uuid = ANY($3)
-         AND status NOT IN ($4, $5)`,
-      [StatusString.ENQUEUED, queueName ?? INTERNAL_QUEUE_NAME, workflowIDs, StatusString.SUCCESS, StatusString.ERROR],
-    );
   }
 
   async setWorkflowPriority(workflowID: string, priority: number): Promise<void> {
+    const params: unknown[] = [priority, StatusString.ENQUEUED, StatusString.DELAYED];
     await this.pool.query(
       `UPDATE "${this.schemaName}".workflow_status
-       SET priority = $1, updated_at = $2
-       WHERE workflow_uuid = $3
-         AND status IN ($4, $5)`,
-      [priority, Date.now(), workflowID, StatusString.ENQUEUED, StatusString.DELAYED],
+       SET priority = $1, updated_at = (EXTRACT(EPOCH FROM now()) * 1000)::bigint
+       WHERE ${this.wf(undefined, workflowID, params)}
+         AND status IN ($2, $3)`,
+      params,
     );
   }
 
+  @dbRetry()
   async setWorkflowDelay(workflowID: string, delayUntilEpochMS: number): Promise<void> {
+    const params: unknown[] = [delayUntilEpochMS, StatusString.DELAYED];
     await this.pool.query(
       `UPDATE "${this.schemaName}".workflow_status
-       SET delay_until_epoch_ms = $1, updated_at = $2
-       WHERE workflow_uuid = $3
-         AND status = $4`,
-      [delayUntilEpochMS, Date.now(), workflowID, StatusString.DELAYED],
+       SET delay_until_epoch_ms = $1, updated_at = (EXTRACT(EPOCH FROM now()) * 1000)::bigint
+       WHERE ${this.wf(undefined, workflowID, params)}
+         AND status = $2`,
+      params,
     );
   }
 
-  async getWorkflowChildren(workflowID: string): Promise<string[]> {
-    // BFS to find all descendant workflows
-    const visited = new Set<string>([workflowID]);
-    const queue: string[] = [workflowID];
-    const children: string[] = [];
+  /**
+   * Extend an existing debounced DELAYED workflow's delay and update its inputs, atomically.
+   * The new delay is capped at the workflow's debounce_deadline_epoch_ms, if one is set.
+   * Matching on workflow name and class ensures a debounce-key collision between different
+   * workflows never overwrites another workflow's inputs. The bounce acts for `params.applicationName`:
+   * it extends only that application's holders plus unclaimed ones, claiming those. If nothing matched,
+   * returns the current holder (or that the key is unheld) so the caller can start fresh or surface a conflict.
+   * Runs on `client` if given, joining its transaction (e.g. a transactional step's);
+   * otherwise in its own retried transaction.
+   */
+  async debounceDelayedWorkflow(params: DebounceParams, client?: PoolClient): Promise<DebounceResult> {
+    if (client !== undefined) {
+      return await this.#debounceDelayedWorkflowInternal(client, params);
+    }
+    return await this.debounceDelayedWorkflowStandalone(params);
+  }
 
-    const client = await this.pool.connect();
+  @dbRetry()
+  private async debounceDelayedWorkflowStandalone(params: DebounceParams): Promise<DebounceResult> {
+    const client = await this.connect();
     try {
-      while (queue.length > 0) {
-        const batch = queue.splice(0, queue.length);
-        const result = await client.query<{ child_workflow_id: string }>(
-          `SELECT DISTINCT child_workflow_id
-           FROM "${this.schemaName}".operation_outputs
-           WHERE workflow_uuid = ANY($1)
-             AND child_workflow_id IS NOT NULL`,
-          [batch],
-        );
-        for (const row of result.rows) {
-          if (!visited.has(row.child_workflow_id)) {
-            visited.add(row.child_workflow_id);
-            queue.push(row.child_workflow_id);
-            children.push(row.child_workflow_id);
-          }
-        }
-      }
+      await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+      const result = await this.#debounceDelayedWorkflowInternal(client, params);
+      await client.query('COMMIT');
+      return result;
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
     } finally {
       client.release();
     }
-    return children;
   }
 
+  async #debounceDelayedWorkflowInternal(client: PoolClient, params: DebounceParams): Promise<DebounceResult> {
+    const classNameOrNull = params.workflowClassName === '' ? null : params.workflowClassName;
+    const updateParams: unknown[] = [
+      params.delayUntilEpochMS,
+      params.serialization,
+      params.workflowName,
+      classNameOrNull,
+      params.queueName,
+      params.deduplicationID,
+      StatusString.DELAYED,
+      params.applicationName ?? null,
+    ];
+    // Never extend a workflow the target application doesn't own; falls through to the holder below.
+    const ownScope = this.appNameFilter('application_name', params.applicationName, updateParams);
+    const updated = await client.query<{ workflow_uuid: string }>(
+      `UPDATE "${this.schemaName}".workflow_status
+       SET delay_until_epoch_ms = CASE
+             WHEN debounce_deadline_epoch_ms IS NOT NULL AND debounce_deadline_epoch_ms < $1
+             THEN debounce_deadline_epoch_ms
+             ELSE $1
+           END,
+           serialization = $2,
+           updated_at = (EXTRACT(EPOCH FROM now()) * 1000)::bigint,
+           -- Claim it for the target, as its dequeue would: left unclaimed, every peer coalesces onto the one workflow and the last inputs win.
+           application_name = COALESCE(application_name, $8)
+       WHERE name = $3 AND class_name IS NOT DISTINCT FROM $4
+         AND queue_name = $5 AND deduplication_id = $6
+         AND status = $7 AND is_debounced = TRUE
+         AND ${ownScope}
+       RETURNING workflow_uuid`,
+      updateParams,
+    );
+    if (updated.rows.length > 0) {
+      await client.query(
+        `INSERT INTO "${this.schemaName}".workflow_input (workflow_uuid, inputs, retention_timestamp)
+         VALUES ($1, $2, (EXTRACT(EPOCH FROM now()) * 1000)::bigint)
+         ON CONFLICT (${this.keyConflict('workflow_uuid')}) DO UPDATE SET inputs = EXCLUDED.inputs`,
+        [updated.rows[0].workflow_uuid, params.input],
+      );
+      return {
+        bouncedWorkflowID: updated.rows[0].workflow_uuid,
+        holderWorkflowID: null,
+        holderIsDebounced: false,
+        holderWorkflowName: null,
+        holderWorkflowClassName: null,
+        holderApplicationName: null,
+      };
+    }
+    // No application filter, so a holder that blocked the update above is reportable.
+    const holderParams: unknown[] = [params.queueName, params.deduplicationID];
+    const holder = await client.query<workflow_status>(
+      `SELECT workflow_uuid, is_debounced, name, class_name, application_name
+       FROM "${this.schemaName}".workflow_status
+       WHERE ${this.scoped(undefined, holderParams)} AND queue_name = $1 AND deduplication_id = $2`,
+      holderParams,
+    );
+    if (holder.rows.length === 0) {
+      return {
+        bouncedWorkflowID: null,
+        holderWorkflowID: null,
+        holderIsDebounced: false,
+        holderWorkflowName: null,
+        holderWorkflowClassName: null,
+        holderApplicationName: null,
+      };
+    }
+    return {
+      bouncedWorkflowID: null,
+      holderWorkflowID: holder.rows[0].workflow_uuid,
+      holderIsDebounced: holder.rows[0].is_debounced ?? false,
+      holderWorkflowName: holder.rows[0].name,
+      holderWorkflowClassName: holder.rows[0].class_name ?? null,
+      holderApplicationName: holder.rows[0].application_name ?? null,
+    };
+  }
+
+  // Get the immediate (one-level) child workflow IDs for a set of workflows.
+  protected async getDirectChildren(workflowIDs: string[]): Promise<string[]> {
+    if (workflowIDs.length === 0) {
+      return [];
+    }
+    const result = await this.pool.query<{ workflow_uuid: string }>(
+      `SELECT workflow_uuid
+       FROM "${this.schemaName}".workflow_status
+       WHERE parent_workflow_id = ANY($1)`,
+      [workflowIDs],
+    );
+    return result.rows.map((row) => row.workflow_uuid);
+  }
+
+  @dbRetry()
+  async getWorkflowChildren(workflowID: string): Promise<string[]> {
+    // BFS to find all descendant workflows
+    const descendants = new Set<string>();
+    let frontier = [workflowID];
+    while (frontier.length > 0) {
+      const children = await this.getDirectChildren(frontier);
+      frontier = children.filter((id) => !descendants.has(id));
+      for (const id of frontier) {
+        descendants.add(id);
+      }
+    }
+    return [...descendants];
+  }
+
+  /** Delete workflows and all associated data, and with deleteChildren every workflow they started, recursively. */
   async deleteWorkflows(workflowIDs: string[], deleteChildren: boolean = false): Promise<void> {
     const allIds = [...workflowIDs];
     if (deleteChildren) {
@@ -1136,12 +2822,187 @@ export class SystemDatabase {
         allIds.push(...(await this.getWorkflowChildren(wfid)));
       }
     }
+    await this.deleteWorkflowsInternal(allIds);
+  }
 
-    await this.pool.query(`DELETE FROM "${this.schemaName}".workflow_status WHERE workflow_uuid = ANY($1)`, [allIds]);
+  @dbRetry()
+  protected async deleteWorkflowsInternal(allIds: string[]): Promise<void> {
+    const client = await this.connect();
+    try {
+      await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+      // The payload tables carry no foreign key, so the status delete does not cascade
+      // into them; without this they survive as orphans.
+      for (const table of ['workflow_input', 'workflow_output', 'operation_outputs', 'workflow_status']) {
+        const params: unknown[] = [];
+        await client.query(
+          `DELETE FROM "${this.schemaName}".${table} WHERE ${this.wfIn(undefined, allIds, params)}`,
+          params,
+        );
+      }
+      await client.query('COMMIT');
+    } catch (e) {
+      // Swallowed: a rollback failure must not mask why we are rolling back.
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw e;
+    } finally {
+      client.release();
+    }
 
     for (const wfid of allIds) {
       this.runningWorkflowMap.delete(wfid);
-      this.workflowCancellationMap.delete(wfid);
+    }
+  }
+
+  /**
+   * Drop a workflow's history from `startStep` onwards and re-enqueue it under the same
+   * workflow ID, so a replay re-executes everything from that step.
+   *
+   * Unlike forkWorkflow this writes no new workflow: peers keep addressing the same ID,
+   * and the workflow's mailbox, events, and streams are not copied anywhere. Unlike
+   * resumeWorkflows it applies only to workflows in a terminal state.
+   *
+   * Events published at or past the cut are rolled back to the last value published
+   * below it, using workflow_events_history as an undo log; a key that only the
+   * discarded run ever published is unpublished outright.
+   *
+   * Messages the discarded run consumed or received after the rewind point are deleted.
+   *
+   * Stream entries written by the discarded run remain in place, with the exception of
+   * the close sentinel, which has to go so new entries can be appended.
+   */
+  async rewindWorkflow(
+    workflowID: string,
+    startStep: number,
+    options: {
+      applicationVersion?: string;
+      queueName?: string;
+      queuePartitionKey?: string;
+    } = {},
+  ): Promise<void> {
+    // Function IDs start at 0 in this SDK, so 0 is the whole history, not an error.
+    if (startStep < 0) {
+      throw new DBOSError(`startStep must be >= 0, got ${startStep}`);
+    }
+
+    const schema = this.schemaName;
+    const client = await this.connect();
+    try {
+      await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+
+      const statusParams: unknown[] = [];
+      const { rows: statusRows } = await client.query<{ status: string }>(
+        `SELECT status FROM "${schema}".workflow_status WHERE ${this.wf(undefined, workflowID, statusParams)}`,
+        statusParams,
+      );
+      if (statusRows.length === 0) {
+        throw new DBOSNonExistentWorkflowError(`Workflow ${workflowID} does not exist`);
+      }
+      const status = statusRows[0].status;
+      if (isWorkflowActive(status)) {
+        throw new DBOSError(
+          `Cannot rewind ${workflowID} (${status}): only a workflow in a terminal state can be rewound, so cancel it first`,
+        );
+      }
+
+      // Roll workflow_events back to the last value published before the cut, using
+      // workflow_events_history as an undo log, then rewind that history too.
+      // `publishedPastCut` is the correlated EXISTS both halves key off.
+      const publishedPastCut = (key: string, params: unknown[]) => `EXISTS (
+        SELECT 1 FROM "${schema}".workflow_events_history discarded
+        WHERE ${this.wf('discarded', workflowID, params)} AND discarded.key = ${key} AND discarded.function_id >= $1
+      )`;
+
+      // First unpublish everything the discarded run touched.
+      const unpublishParams: unknown[] = [startStep];
+      await client.query(
+        `DELETE FROM "${schema}".workflow_events
+         WHERE ${this.wf(undefined, workflowID, unpublishParams)}
+           AND ${publishedPastCut('"' + schema + '".workflow_events.key', unpublishParams)}`,
+        unpublishParams,
+      );
+
+      // Then restore those keys, if any, to the value published below the cut.
+      const restoreParams: unknown[] = [startStep];
+      const keyColumns = this.wfColumns(workflowID, restoreParams);
+      await client.query(
+        `INSERT INTO "${schema}".workflow_events (${[...keyColumns.map(([c]) => c), 'workflow_uuid', 'key', 'value', 'serialization'].join(', ')})
+         SELECT ${[...keyColumns.map(([, e]) => e), 'surviving.workflow_uuid', 'surviving.key', 'surviving.value', 'surviving.serialization'].join(', ')}
+         FROM (
+           SELECT weh.workflow_uuid, weh.key, weh.value, weh.serialization,
+                  ROW_NUMBER() OVER (PARTITION BY weh.key ORDER BY weh.function_id DESC) AS rn
+           FROM "${schema}".workflow_events_history weh
+           WHERE ${this.wf('weh', workflowID, restoreParams)} AND weh.function_id < $1
+             AND ${publishedPastCut('weh.key', restoreParams)}
+         ) surviving
+         WHERE surviving.rn = 1`,
+        restoreParams,
+      );
+
+      // Clear the streams' close sentinels so the replay can append again.
+      const sentinelParams: unknown[] = [startStep, DBOS_STREAM_CLOSED_SENTINEL_SERIALIZED, DBOSPortableJSON.name()];
+      await client.query(
+        `DELETE FROM "${schema}".streams
+         WHERE ${this.wf(undefined, workflowID, sentinelParams)} AND function_id >= $1 AND value = $2 AND serialization = $3`,
+        sentinelParams,
+      );
+
+      // Discard the steps and the events history past the cut.
+      for (const table of ['operation_outputs', 'workflow_events_history']) {
+        const params: unknown[] = [startStep];
+        await client.query(
+          `DELETE FROM "${schema}".${table} WHERE ${this.wf(undefined, workflowID, params)} AND function_id >= $1`,
+          params,
+        );
+      }
+
+      // Delete messages consumed or received after the rewind point
+      const messageParams: unknown[] = [startStep];
+      await client.query(
+        `DELETE FROM "${schema}".notifications
+         WHERE ${this.wf(undefined, workflowID, messageParams, 'destination_uuid')}
+           AND (consumed_by_function_id >= $1 OR consumed = false)`,
+        messageParams,
+      );
+
+      const outputParams: unknown[] = [];
+      await client.query(
+        `DELETE FROM "${schema}".workflow_output WHERE ${this.wf(undefined, workflowID, outputParams)}`,
+        outputParams,
+      );
+
+      // Re-enqueue the workflow, keeping its queue and key unless given. Re-asserting the status
+      // we read keeps a workflow that moved on underneath us from being resurrected.
+      const params: unknown[] = [
+        StatusString.ENQUEUED,
+        options.queueName ?? null,
+        options.queuePartitionKey ?? null,
+        status,
+        INTERNAL_QUEUE_NAME,
+      ];
+      const setVersion =
+        options.applicationVersion !== undefined
+          ? `, application_version = $${params.push(options.applicationVersion)}`
+          : '';
+      const { rowCount } = await client.query(
+        `UPDATE "${schema}".workflow_status
+         SET status = $1, owner_xid = NULL, queue_name = COALESCE($2::text, queue_name, $5::text),
+             queue_partition_key = COALESCE($3::text, queue_partition_key), recovery_attempts = 0,
+             workflow_deadline_epoch_ms = NULL, deduplication_id = NULL, started_at_epoch_ms = NULL,
+             suspend_key = NULL, completed_at = NULL, output = NULL, error = NULL,
+             updated_at = (EXTRACT(EPOCH FROM now()) * 1000)::bigint${setVersion}
+         WHERE ${this.wf(undefined, workflowID, params)} AND status = $4`,
+        params,
+      );
+      if (rowCount !== 1) {
+        throw new DBOSError(`Workflow ${workflowID} changed status while being rewound; retry the rewind`);
+      }
+
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw e;
+    } finally {
+      client.release();
     }
   }
 
@@ -1162,77 +3023,7 @@ export class SystemDatabase {
     return result[0];
   }
 
-  async forkFromFailure(
-    workflowIDs: string[],
-    options: {
-      applicationVersion?: string;
-      queueName?: string;
-      queuePartitionKey?: string;
-      fromLastFailure?: boolean;
-      fromLastStep?: boolean;
-      fromStep?: number;
-      fromStepName?: string;
-    } = {},
-  ): Promise<string[]> {
-    const modes = [
-      options.fromLastFailure ?? false,
-      options.fromLastStep ?? false,
-      options.fromStep !== undefined,
-      options.fromStepName !== undefined,
-    ].filter(Boolean).length;
-    if (modes !== 1) {
-      throw new Error('Exactly one of fromLastFailure, fromLastStep, fromStep, or fromStepName must be specified');
-    }
-
-    let startSteps: number[];
-
-    if (options.fromStep !== undefined) {
-      startSteps = Array(workflowIDs.length).fill(options.fromStep) as number[];
-    } else {
-      let query: string;
-      const params: unknown[] = [workflowIDs];
-
-      if (options.fromLastFailure) {
-        query = `SELECT workflow_uuid,
-                        COALESCE(
-                          MAX(function_id) FILTER (WHERE error IS NOT NULL),
-                          MAX(function_id)
-                        ) AS start_step
-                 FROM "${this.schemaName}".operation_outputs
-                 WHERE workflow_uuid = ANY($1)
-                 GROUP BY workflow_uuid`;
-      } else if (options.fromLastStep) {
-        query = `SELECT workflow_uuid, MAX(function_id) AS start_step
-                 FROM "${this.schemaName}".operation_outputs
-                 WHERE workflow_uuid = ANY($1)
-                 GROUP BY workflow_uuid`;
-      } else {
-        // fromStepName
-        query = `SELECT workflow_uuid, MAX(function_id) AS start_step
-                 FROM "${this.schemaName}".operation_outputs
-                 WHERE workflow_uuid = ANY($1) AND function_name = $2
-                 GROUP BY workflow_uuid`;
-        params.push(options.fromStepName);
-      }
-
-      const result = await this.pool.query<{ workflow_uuid: string; start_step: number }>(query, params);
-      const startStepByID = new Map(result.rows.map((r) => [r.workflow_uuid, Number(r.start_step)]));
-      for (const wid of workflowIDs) {
-        if (!startStepByID.has(wid)) {
-          if (options.fromStepName !== undefined) {
-            throw new Error(`Workflow ${wid} has no step named '${options.fromStepName}'`);
-          }
-          throw new Error(`Workflow ${wid} has no steps`);
-        }
-      }
-      startSteps = workflowIDs.map((wid) => startStepByID.get(wid)!);
-    }
-
-    const forkedIDs = workflowIDs.map(() => randomUUID());
-    return this.bulkForkWorkflows(workflowIDs, forkedIDs, startSteps, options);
-  }
-
-  private async bulkForkWorkflows(
+  async bulkForkWorkflows(
     originalWorkflowIDs: string[],
     forkedWorkflowIDs: string[],
     startSteps: number[],
@@ -1251,18 +3042,22 @@ export class SystemDatabase {
       throw new Error('originalWorkflowIDs, forkedWorkflowIDs, and startSteps must have the same length');
     }
 
-    const client = await this.pool.connect();
+    const client = await this.connect();
     try {
       await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
 
       // Fetch the status of all original workflows inside the transaction.
+      const statusParams: unknown[] = [];
       const { rows: statusRows } = await client.query<workflow_status>(
-        `SELECT workflow_uuid, name, class_name, config_name, application_id,
-                authenticated_user, authenticated_roles, assumed_role, inputs, serialization,
-                request, application_version
-         FROM "${this.schemaName}".workflow_status
-         WHERE workflow_uuid = ANY($1)`,
-        [originalWorkflowIDs],
+        `SELECT ws.workflow_uuid, ws.name, ws.class_name, ws.config_name, ws.application_id,
+                ws.authenticated_user, ws.authenticated_roles, ws.assumed_role,
+                COALESCE(wi.inputs, ws.inputs) AS inputs, ws.serialization,
+                ws.application_version, ws.attributes, ws.application_name,
+                ws.queue_name, ws.queue_partition_key, ws.priority
+         FROM "${this.schemaName}".workflow_status ws
+         LEFT JOIN "${this.schemaName}".workflow_input wi ON ${this.wfJoin('ws', 'wi')}
+         WHERE ${this.wfIn('ws', originalWorkflowIDs, statusParams)}`,
+        statusParams,
       );
 
       const statusByID = new Map(statusRows.map((r) => [r.workflow_uuid, r]));
@@ -1271,8 +3066,6 @@ export class SystemDatabase {
           throw new DBOSNonExistentWorkflowError(`Workflow ${wid} does not exist`);
         }
       }
-
-      const queueName = options.queueName ?? INTERNAL_QUEUE_NAME;
 
       // Bulk insert all forked workflow status rows.
       const insertCols = [
@@ -1285,58 +3078,79 @@ export class SystemDatabase {
         'authenticated_user',
         'assumed_role',
         'authenticated_roles',
-        'request',
         'application_version',
         'application_id',
         'inputs',
         'queue_partition_key',
         'forked_from',
         'serialization',
+        'attributes',
+        'application_name',
+        'priority',
       ];
       if (options.timeoutMS !== undefined) {
         insertCols.push('workflow_timeout_ms');
       }
-      const valuesPlaceholders: string[] = [];
-      const params: unknown[] = [];
-      let paramIdx = 1;
-      for (let i = 0; i < originalWorkflowIDs.length; i++) {
-        const origID = originalWorkflowIDs[i];
-        const forkID = forkedWorkflowIDs[i];
-        const ws = statusByID.get(origID)!;
-        const placeholders = insertCols.map(() => `$${paramIdx++}`).join(', ');
-        valuesPlaceholders.push(`(${placeholders})`);
-        params.push(
-          forkID,
-          StatusString.ENQUEUED,
-          ws.name,
-          ws.class_name ?? null,
-          ws.config_name ?? null,
-          queueName,
-          ws.authenticated_user,
-          ws.assumed_role,
-          ws.authenticated_roles,
-          ws.request,
-          options.applicationVersion ?? ws.application_version ?? null,
-          ws.application_id,
-          ws.inputs,
-          options.queuePartitionKey ?? null,
-          origID,
-          ws.serialization,
-        );
-        if (options.timeoutMS !== undefined) {
-          params.push(options.timeoutMS);
-        }
-      }
-      await client.query(
-        `INSERT INTO "${this.schemaName}".workflow_status (${insertCols.join(', ')})
-         VALUES ${valuesPlaceholders.join(', ')}`,
-        params,
+      // One owner per fork, shared by its status row and its copied steps: the source's, or this application claiming an unclaimed one.
+      const forkOwners = new Map<string, string | null>(
+        originalWorkflowIDs.map((origID, i) => [
+          forkedWorkflowIDs[i],
+          statusByID.get(origID)!.application_name ?? this.appName ?? null,
+        ]),
+      );
+
+      const forkKeys = forkedWorkflowIDs.map((forkID) => this.wfValues(forkID));
+      await this.insertRows(
+        client,
+        'workflow_status',
+        [...Object.keys(forkKeys[0]), ...insertCols],
+        originalWorkflowIDs.map((origID, i) => {
+          const forkID = forkedWorkflowIDs[i];
+          const ws = statusByID.get(origID)!;
+          return [
+            ...Object.values(forkKeys[i]),
+            forkID,
+            StatusString.ENQUEUED,
+            ws.name,
+            ws.class_name ?? null,
+            ws.config_name ?? null,
+            // A fork inherits its original's queue, key, and priority, except what is passed.
+            options.queueName ?? ws.queue_name ?? INTERNAL_QUEUE_NAME,
+            ws.authenticated_user,
+            ws.assumed_role,
+            ws.authenticated_roles,
+            options.applicationVersion ?? ws.application_version ?? null,
+            ws.application_id,
+            // Legacy column: the payload lives in workflow_input.
+            null,
+            options.queuePartitionKey ?? ws.queue_partition_key ?? null,
+            origID,
+            ws.serialization,
+            ws.attributes ? JSON.stringify(ws.attributes) : null,
+            forkOwners.get(forkID) ?? null,
+            ws.priority ?? 0,
+            ...(options.timeoutMS !== undefined ? [options.timeoutMS] : []),
+          ];
+        }),
+      );
+
+      await this.insertRows(
+        client,
+        'workflow_input',
+        [...Object.keys(forkKeys[0]), 'workflow_uuid', 'inputs'],
+        originalWorkflowIDs.map((origID, i) => [
+          ...Object.values(forkKeys[i]),
+          forkedWorkflowIDs[i],
+          statusByID.get(origID)!.inputs,
+        ]),
       );
 
       // Mark all original workflows as having been forked from.
+      const forkedFromParams: unknown[] = [];
       await client.query(
-        `UPDATE "${this.schemaName}".workflow_status SET was_forked_from = TRUE WHERE workflow_uuid = ANY($1)`,
-        [originalWorkflowIDs],
+        `UPDATE "${this.schemaName}".workflow_status SET was_forked_from = TRUE
+         WHERE ${this.wfIn(undefined, originalWorkflowIDs, forkedFromParams)}`,
+        forkedFromParams,
       );
 
       // For workflows with start_step > 0, copy checkpoints/events/streams.
@@ -1350,76 +3164,115 @@ export class SystemDatabase {
         const mappingParams: unknown[] = [];
         let mIdx = 1;
         for (const m of forkMappings) {
-          mappingValues.push(`($${mIdx}::text, $${mIdx + 1}::text, $${mIdx + 2}::int)`);
-          mappingParams.push(m.origID, m.forkID, m.startStep);
-          mIdx += 3;
+          // Cast: an unclaimed fork makes owner a bare NULL the VALUES list cannot type.
+          mappingValues.push(`($${mIdx}::text, $${mIdx + 1}::text, $${mIdx + 2}::int, $${mIdx + 3}::text)`);
+          mappingParams.push(m.origID, m.forkID, m.startStep, forkOwners.get(m.forkID) ?? null);
+          mIdx += 4;
         }
-        const mappingCTE = `WITH mapping(orig_id, fork_id, start_step) AS (VALUES ${mappingValues.join(', ')})`;
+        const mappingCTE = `WITH mapping(orig_id, fork_id, start_step, owner) AS (VALUES ${mappingValues.join(', ')})`;
+        // The forks live under their originals' shard key, read from the scope; a copy's params extend the mapping's.
+        const copyParams = () => [...mappingParams];
+        const keyed = (params: unknown[]) => {
+          const columns = this.scopedColumns(params);
+          return { names: columns.map(([c]) => `${c}, `).join(''), exprs: columns.map(([, e]) => `${e}, `).join('') };
+        };
+
+        // A replacement child is a fork, so it shares the replaced child's key.
+        const childKey = this.keyColumn('oo', 'child_shard_key');
+        if (options.replacementChildren && childKey !== undefined) {
+          // A replacement names a child by ID, which can't pick one of several keys.
+          const ambiguityParams = copyParams();
+          const replaced = `$${ambiguityParams.push(Object.keys(options.replacementChildren))}::text[]`;
+          const { rows: ambiguous } = await client.query<{ child_workflow_id: string }>(
+            `${mappingCTE}
+             SELECT oo.child_workflow_id
+             FROM mapping m
+             JOIN "${this.schemaName}".operation_outputs oo
+               ON ${this.scoped('oo', ambiguityParams)} AND oo.workflow_uuid = m.orig_id AND oo.function_id < m.start_step
+             WHERE oo.child_workflow_id = ANY(${replaced})
+             GROUP BY oo.child_workflow_id
+             HAVING COUNT(DISTINCT ${childKey}) > 1
+             LIMIT 1`,
+            ambiguityParams,
+          );
+          if (ambiguous.length > 0) {
+            throw new DBOSError(
+              `Can't replace child workflow ${ambiguous[0].child_workflow_id}: the forked steps refer to children with that ID under more than one shard key`,
+            );
+          }
+        }
 
         // Build the child_workflow_id expression, applying replacements if provided.
+        const ooParams = copyParams();
         let childWfExpr = 'oo.child_workflow_id';
-        const ooParams = [...mappingParams];
         if (options.replacementChildren && Object.keys(options.replacementChildren).length > 0) {
           const whenClauses: string[] = [];
           for (const [oldId, newId] of Object.entries(options.replacementChildren)) {
-            whenClauses.push(`WHEN oo.child_workflow_id = $${mIdx} THEN $${mIdx + 1}::text`);
-            ooParams.push(oldId, newId);
-            mIdx += 2;
+            whenClauses.push(
+              `WHEN oo.child_workflow_id = $${ooParams.push(oldId)} THEN $${ooParams.push(newId)}::text`,
+            );
           }
           childWfExpr = `CASE ${whenClauses.join(' ')} ELSE oo.child_workflow_id END`;
         }
+        const ooKeys = keyed(ooParams);
 
         // Copy operation outputs
         await client.query(
           `${mappingCTE}
            INSERT INTO "${this.schemaName}".operation_outputs
-             (workflow_uuid, function_id, output, error, serialization, function_name, child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms)
-           SELECT m.fork_id, oo.function_id, oo.output, oo.error, oo.serialization, oo.function_name, ${childWfExpr}, oo.started_at_epoch_ms, oo.completed_at_epoch_ms
+             (${ooKeys.names}workflow_uuid, function_id, output, error, serialization, function_name, child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms, application_name, retention_timestamp${childKey !== undefined ? ', child_shard_key' : ''})
+           SELECT ${ooKeys.exprs}m.fork_id, oo.function_id, oo.output, oo.error, oo.serialization, oo.function_name, ${childWfExpr}, oo.started_at_epoch_ms, oo.completed_at_epoch_ms, m.owner, (EXTRACT(EPOCH FROM now()) * 1000)::bigint${childKey !== undefined ? `, ${childKey}` : ''}
            FROM mapping m
            JOIN "${this.schemaName}".operation_outputs oo
-             ON oo.workflow_uuid = m.orig_id AND oo.function_id < m.start_step`,
+             ON ${this.scoped('oo', ooParams)} AND oo.workflow_uuid = m.orig_id AND oo.function_id < m.start_step`,
           ooParams,
         );
 
         // Copy streams
+        const streamParams = copyParams();
+        const streamKeys = keyed(streamParams);
         await client.query(
           `${mappingCTE}
            INSERT INTO "${this.schemaName}".streams
-             (workflow_uuid, key, value, serialization, "offset", function_id)
-           SELECT m.fork_id, s.key, s.value, s.serialization, s."offset", s.function_id
+             (${streamKeys.names}workflow_uuid, key, value, serialization, "offset", function_id)
+           SELECT ${streamKeys.exprs}m.fork_id, s.key, s.value, s.serialization, s."offset", s.function_id
            FROM mapping m
            JOIN "${this.schemaName}".streams s
-             ON s.workflow_uuid = m.orig_id AND s.function_id < m.start_step`,
-          mappingParams,
+             ON ${this.scoped('s', streamParams)} AND s.workflow_uuid = m.orig_id AND s.function_id < m.start_step`,
+          streamParams,
         );
 
         // Copy events history
+        const historyParams = copyParams();
+        const historyKeys = keyed(historyParams);
         await client.query(
           `${mappingCTE}
            INSERT INTO "${this.schemaName}".workflow_events_history
-             (workflow_uuid, function_id, key, value, serialization)
-           SELECT m.fork_id, weh.function_id, weh.key, weh.value, weh.serialization
+             (${historyKeys.names}workflow_uuid, function_id, key, value, serialization)
+           SELECT ${historyKeys.exprs}m.fork_id, weh.function_id, weh.key, weh.value, weh.serialization
            FROM mapping m
            JOIN "${this.schemaName}".workflow_events_history weh
-             ON weh.workflow_uuid = m.orig_id AND weh.function_id < m.start_step`,
-          mappingParams,
+             ON ${this.scoped('weh', historyParams)} AND weh.workflow_uuid = m.orig_id AND weh.function_id < m.start_step`,
+          historyParams,
         );
 
         // Copy only the latest version of each event using a window function
+        const eventParams = copyParams();
+        const eventKeys = keyed(eventParams);
         await client.query(
           `${mappingCTE}
            INSERT INTO "${this.schemaName}".workflow_events
-             (workflow_uuid, key, value, serialization)
-           SELECT ranked.workflow_uuid, ranked.key, ranked.value, ranked.serialization
+             (${eventKeys.names}workflow_uuid, key, value, serialization)
+           SELECT ${eventKeys.exprs}ranked.workflow_uuid, ranked.key, ranked.value, ranked.serialization
            FROM (
              SELECT m.fork_id AS workflow_uuid, weh.key, weh.value, weh.serialization,
-                    ROW_NUMBER() OVER (PARTITION BY weh.workflow_uuid, weh.key ORDER BY weh.function_id DESC) AS rn
+                    ROW_NUMBER() OVER (PARTITION BY m.fork_id, weh.key ORDER BY weh.function_id DESC) AS rn
              FROM mapping m
              JOIN "${this.schemaName}".workflow_events_history weh
-               ON weh.workflow_uuid = m.orig_id AND weh.function_id < m.start_step
+               ON ${this.scoped('weh', eventParams)} AND weh.workflow_uuid = m.orig_id AND weh.function_id < m.start_step
            ) ranked
            WHERE ranked.rn = 1`,
-          mappingParams,
+          eventParams,
         );
       }
 
@@ -1433,414 +3286,372 @@ export class SystemDatabase {
     }
   }
 
-  async exportWorkflow(workflowID: string, exportChildren: boolean = false): Promise<ExportedWorkflow[]> {
-    const workflowIDs = [workflowID];
-    if (exportChildren) {
-      workflowIDs.push(...(await this.getWorkflowChildren(workflowID)));
-    }
-
-    const exportedWorkflows: ExportedWorkflow[] = [];
-
-    const client = await this.pool.connect();
-    try {
-      for (const wfID of workflowIDs) {
-        // Export workflow_status
-        const statusResult = await client.query<workflow_status>(
-          `SELECT
-            workflow_uuid, status, name, authenticated_user, assumed_role,
-            authenticated_roles, request, output, error, executor_id,
-            created_at, updated_at, application_version, application_id,
-            class_name, config_name, recovery_attempts, queue_name,
-            workflow_timeout_ms, workflow_deadline_epoch_ms, started_at_epoch_ms,
-            deduplication_id, inputs, priority, queue_partition_key, forked_from,
-            parent_workflow_id, serialization, delay_until_epoch_ms
-          FROM "${this.schemaName}".workflow_status
-          WHERE workflow_uuid = $1`,
-          [wfID],
-        );
-
-        if (statusResult.rows.length === 0) {
-          throw new DBOSNonExistentWorkflowError(`Workflow ${wfID} does not exist`);
-        }
-
-        const workflowStatus = statusResult.rows[0];
-
-        // Export operation_outputs
-        const outputsResult = await client.query<operation_outputs>(
-          `SELECT
-            workflow_uuid, function_id, function_name, output, error,
-            child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms,
-            serialization
-          FROM "${this.schemaName}".operation_outputs
-          WHERE workflow_uuid = $1`,
-          [wfID],
-        );
-
-        // Export workflow_events
-        const eventsResult = await client.query<workflow_events>(
-          `SELECT workflow_uuid, key, value, serialization
-          FROM "${this.schemaName}".workflow_events
-          WHERE workflow_uuid = $1`,
-          [wfID],
-        );
-
-        // Export workflow_events_history
-        const historyResult = await client.query<workflow_events_history>(
-          `SELECT workflow_uuid, function_id, key, value, serialization
-          FROM "${this.schemaName}".workflow_events_history
-          WHERE workflow_uuid = $1`,
-          [wfID],
-        );
-
-        // Export streams
-        const streamsResult = await client.query<streams>(
-          `SELECT workflow_uuid, key, value, "offset", function_id, serialization
-          FROM "${this.schemaName}".streams
-          WHERE workflow_uuid = $1`,
-          [wfID],
-        );
-
-        exportedWorkflows.push({
-          workflow_status: workflowStatus,
-          operation_outputs: outputsResult.rows,
-          workflow_events: eventsResult.rows,
-          workflow_events_history: historyResult.rows,
-          streams: streamsResult.rows,
-        });
-      }
-    } finally {
-      client.release();
-    }
-
-    return exportedWorkflows;
-  }
-
-  async importWorkflow(workflows: ExportedWorkflow[]): Promise<void> {
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN');
-
-      for (const workflow of workflows) {
-        const status = workflow.workflow_status;
-
-        // Import workflow_status
-        await client.query(
-          `INSERT INTO "${this.schemaName}".workflow_status (
-            workflow_uuid, status, name, authenticated_user, assumed_role,
-            authenticated_roles, request, output, error, executor_id,
-            created_at, updated_at, application_version, application_id,
-            class_name, config_name, recovery_attempts, queue_name,
-            workflow_timeout_ms, workflow_deadline_epoch_ms, started_at_epoch_ms,
-            deduplication_id, inputs, priority, queue_partition_key, forked_from,
-            parent_workflow_id, serialization, delay_until_epoch_ms
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)`,
-          [
-            status.workflow_uuid,
-            status.status,
-            status.name,
-            status.authenticated_user,
-            status.assumed_role,
-            status.authenticated_roles,
-            status.request,
-            status.output,
-            status.error,
-            status.executor_id,
-            status.created_at,
-            status.updated_at,
-            status.application_version,
-            status.application_id,
-            status.class_name,
-            status.config_name,
-            status.recovery_attempts,
-            status.queue_name,
-            status.workflow_timeout_ms,
-            status.workflow_deadline_epoch_ms,
-            status.started_at_epoch_ms,
-            status.deduplication_id,
-            status.inputs,
-            status.priority,
-            status.queue_partition_key,
-            status.forked_from,
-            status.parent_workflow_id,
-            status.serialization,
-            status.delay_until_epoch_ms ?? null,
-          ],
-        );
-
-        // Import operation_outputs
-        for (const output of workflow.operation_outputs) {
-          await client.query(
-            `INSERT INTO "${this.schemaName}".operation_outputs (
-              workflow_uuid, function_id, function_name, output, error,
-              child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms,
-              serialization
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-            [
-              output.workflow_uuid,
-              output.function_id,
-              output.function_name,
-              output.output,
-              output.error,
-              output.child_workflow_id,
-              output.started_at_epoch_ms,
-              output.completed_at_epoch_ms,
-              output.serialization,
-            ],
-          );
-        }
-
-        // Import workflow_events
-        for (const event of workflow.workflow_events) {
-          await client.query(
-            `INSERT INTO "${this.schemaName}".workflow_events (
-              workflow_uuid, key, value, serialization
-            ) VALUES ($1, $2, $3, $4)`,
-            [event.workflow_uuid, event.key, event.value, event.serialization],
-          );
-        }
-
-        // Import workflow_events_history
-        for (const history of workflow.workflow_events_history) {
-          await client.query(
-            `INSERT INTO "${this.schemaName}".workflow_events_history (
-              workflow_uuid, function_id, key, value, serialization
-            ) VALUES ($1, $2, $3, $4, $5)`,
-            [history.workflow_uuid, history.function_id, history.key, history.value, history.serialization],
-          );
-        }
-
-        // Import streams
-        for (const stream of workflow.streams) {
-          await client.query(
-            `INSERT INTO "${this.schemaName}".streams (
-              workflow_uuid, key, value, "offset", function_id, serialization
-            ) VALUES ($1, $2, $3, $4, $5, $6)`,
-            [stream.workflow_uuid, stream.key, stream.value, stream.offset, stream.function_id, stream.serialization],
-          );
-        }
-      }
-
-      await client.query('COMMIT');
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
-  }
-
   // ==================== Awaiting Workflows ====================
-  registerRunningWorkflow(
-    workflowID: string,
-    workflowPromise: Promise<unknown>,
-    queueName?: string,
-    queuePartitionKey?: string,
-  ) {
-    // Need to await for the workflow and capture errors.
-    const awaitWorkflowPromise = workflowPromise
-      .catch((error) => {
-        this.logger.debug('Captured error in awaitWorkflowPromise: ' + error);
-      })
-      .finally(() => {
-        // Remove itself from pending workflow map.
-        this.runningWorkflowMap.delete(workflowID);
-        this.workflowCancellationMap.delete(workflowID);
-      });
-    this.runningWorkflowMap.set(workflowID, {
-      promise: awaitWorkflowPromise,
+  /** Register one execution; the returned release is idempotent, so it can run both before a park and once the run settles. */
+  registerRunningWorkflow(workflowID: string, queueName?: string, queuePartitionKey?: string): RunningWorkflowEntry {
+    const entry: RunningWorkflowEntry = {
+      promise: Promise.resolve(),
       queueName,
       queuePartitionKey,
-    });
+      release: () => {
+        const entries = this.runningWorkflowMap.get(workflowID);
+        const index = entries?.indexOf(entry) ?? -1;
+        if (index < 0) return;
+        entries!.splice(index, 1);
+        if (entries!.length === 0) this.runningWorkflowMap.delete(workflowID);
+      },
+    };
+    const entries = this.runningWorkflowMap.get(workflowID);
+    if (entries) entries.push(entry);
+    else this.runningWorkflowMap.set(workflowID, [entry]);
+    return entry;
+  }
+
+  /** Track an execution's promise for shutdown, releasing its entry when it settles. */
+  trackRunningWorkflow(workflowID: string, entry: RunningWorkflowEntry, workflowPromise: Promise<unknown>) {
+    // Need to await for the workflow and capture errors.
+    entry.promise = workflowPromise
+      .catch((error) => {
+        const outcome = this.#destroyed ? 'was abandoned by shutdown' : 'failed';
+        this.logger.debug(`Workflow ${workflowID} ${outcome}: ${error}`);
+      })
+      .finally(() => {
+        entry.release();
+      });
   }
 
   checkForRunningWorkflow(workflowID: string): boolean {
     return this.runningWorkflowMap.has(workflowID);
   }
 
-  countRunningWorkflowsForQueue(queueName: string, queuePartitionKey?: string): number {
+  /** Workflows this worker is running for a queue, across every partition of it. */
+  countRunningWorkflowsForQueue(queueName: string): number {
     let count = 0;
-    for (const entry of this.runningWorkflowMap.values()) {
-      if (entry.queueName === queueName && entry.queuePartitionKey === queuePartitionKey) count++;
+    for (const entries of this.runningWorkflowMap.values()) {
+      for (const entry of entries) {
+        if (entry.queueName === queueName) count++;
+      }
     }
     return count;
   }
 
-  async awaitRunningWorkflows(): Promise<void> {
+  /** Workflows this worker is running for one partition of a queue. */
+  countRunningWorkflowsForPartition(queueName: string, queuePartitionKey?: string): number {
+    let count = 0;
+    for (const entries of this.runningWorkflowMap.values()) {
+      for (const entry of entries) {
+        if (entry.queueName === queueName && entry.queuePartitionKey === queuePartitionKey) count++;
+      }
+    }
+    return count;
+  }
+
+  /** Wait up to `timeoutMS` for locally-running workflows to finish. Without a timeout, do not wait at all. */
+  async awaitRunningWorkflows(timeoutMS?: number): Promise<void> {
+    if (timeoutMS !== undefined && timeoutMS > 0) {
+      const deadline = Date.now() + timeoutMS;
+      if (this.runningWorkflowMap.size > 0) {
+        this.logger.info('Waiting for pending workflows to finish.');
+      }
+      // Each pass picks up workflows a draining workflow started, and awaits any given run only once.
+      const awaited = new Set<Promise<unknown>>();
+      for (;;) {
+        const pending = Array.from(this.runningWorkflowMap.values())
+          .flat()
+          .map((entry) => entry.promise)
+          .filter((promise) => !awaited.has(promise));
+        if (pending.length === 0) break;
+        for (const promise of pending) awaited.add(promise);
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timedOut = await Promise.race([
+          Promise.allSettled(pending).then(() => false),
+          new Promise<boolean>((resolve) => {
+            timer = setTimeout(() => resolve(true), Math.max(0, deadline - Date.now()));
+          }),
+        ]);
+        clearTimeout(timer);
+        if (timedOut) break;
+      }
+    }
     if (this.runningWorkflowMap.size > 0) {
-      this.logger.info('Waiting for pending workflows to finish.');
-      await Promise.allSettled(Array.from(this.runningWorkflowMap.values(), (entry) => entry.promise));
+      this.logger.warn(
+        `Shutting down while ${this.runningWorkflowMap.size} workflows are still running: ${Array.from(this.runningWorkflowMap.keys()).join(', ')}`,
+      );
     }
-    if (this.workflowEventsMap.map.size > 0) {
-      this.logger.warn('Workflow events map is not empty - shutdown is not clean.');
-      //throw new Error('Workflow events map is not empty - shutdown is not clean.');
+  }
+
+  /**
+   * Run a DB-backed polling read under the polling concurrency limiter, so that
+   * high-fan-out wait loops cannot check out every pool client and starve
+   * control-plane operations. Only polling reads should go through here;
+   * control-plane work hits the pool directly and bypasses the limiter.
+   */
+  #pollWithLimiter<T>(query: () => Promise<T>): Promise<T> {
+    // Closing our own pool used to end these waits; a caller's pool stays open, so end them here.
+    if (this.#destroyed) {
+      return Promise.reject(new DBOSError('The system database has been shut down'));
     }
-    if (this.notificationsMap.map.size > 0) {
-      this.logger.warn('Message notification map is not empty - shutdown is not clean.');
-      //throw new Error('Message notification map is not empty - shutdown is not clean.');
+    return this.pollLimiter.runExclusive(query);
+  }
+
+  /** Cancellation check for polling waits: goes through the limiter so readers cannot starve the pool. */
+  async checkIfCanceledLimited(workflowID: string): Promise<void> {
+    // The caller's own workflow, even where a same-ID workflow is bound as a target.
+    const params: unknown[] = [];
+    const target = this.ownKey(workflowID, undefined, () => this.wf(undefined, workflowID, params));
+    const { rows } = await this.#pollWithLimiter(() =>
+      this.pool.query<{ status: string }>(
+        `SELECT status FROM "${this.schemaName}".workflow_status WHERE ${target}`,
+        params,
+      ),
+    );
+    if (rows[0]?.status === StatusString.CANCELLED) {
+      throw new DBOSWorkflowCancelledError(workflowID);
+    }
+  }
+
+  watchForCancellation(workflowID: string): CancellationWatch {
+    const controller = new AbortController();
+    let state: 'idle' | 'watching' | 'released' = 'idle';
+    // The running workflow's own key, resolved now for the poller that reads it later outside this context.
+    const shardKey = this.ownKey(workflowID, undefined, () => this.keyHint(workflowID));
+    const waiterKey = this.ownKey(workflowID, undefined, () => this.waiter(workflowID, ''));
+    const start = () => {
+      state = 'watching';
+      if (this.#destroyed) return;
+      let watchers = this.#cancelWatchers.get(waiterKey);
+      if (watchers === undefined) {
+        watchers = { workflowID, shardKey, controllers: new Set() };
+        this.#cancelWatchers.set(waiterKey, watchers);
+      }
+      watchers.controllers.add(controller);
+      this.#cancelPollerLoop ??= this.#cancelPollerScope.runInAsyncScope(() =>
+        withClearedShardKeyState(() => this.#runCancelPoller()),
+      );
+    };
+    const stop = () => {
+      const watchers = this.#cancelWatchers.get(waiterKey);
+      if (watchers?.controllers.delete(controller) && watchers.controllers.size === 0) {
+        this.#cancelWatchers.delete(waiterKey);
+        if (this.#cancelWatchers.size === 0) this.#cancelPollerWake?.();
+      }
+    };
+    return {
+      get signal() {
+        if (state === 'idle') start();
+        return controller.signal;
+      },
+      get cancelled() {
+        return controller.signal.aborted;
+      },
+      release: () => {
+        if (state === 'watching') stop();
+        state = 'released';
+      },
+    };
+  }
+
+  async #runCancelPoller(): Promise<void> {
+    while (this.#cancelWatchers.size > 0 && !this.#destroyed) {
+      const { promise, cancel } = cancellableSleep(this.dbPollingIntervalCancelMs);
+      this.#cancelPollerWake = cancel;
+      await promise;
+      this.#cancelPollerWake = null;
+      if (this.#cancelWatchers.size === 0 || this.#destroyed) break;
+      try {
+        await this.#abortCancelledWatchers();
+      } catch (e) {
+        this.logger.debug(`Workflow cancellation poll failed: ${String(e)}`);
+      }
+    }
+    this.#cancelPollerLoop = undefined;
+  }
+
+  async #abortCancelledWatchers(): Promise<void> {
+    // One read per shard key, each bound to its own workflows.
+    const byKey = new Map<string | undefined, string[]>();
+    for (const { workflowID, shardKey } of this.#cancelWatchers.values()) {
+      const ids = byKey.get(shardKey) ?? [];
+      ids.push(workflowID);
+      byKey.set(shardKey, ids);
+    }
+    for (const [shardKey, workflowIDs] of byKey) {
+      // Each key's read on its own, so one key's failure doesn't hide another key's cancellations.
+      let rows: { workflow_uuid: string }[];
+      try {
+        ({ rows } = await bindShardKeys(
+          workflowIDs.map((id) => [id, shardKey] as const),
+          () => {
+            const params: unknown[] = [StatusString.CANCELLED];
+            const ids = this.wfIn(undefined, workflowIDs, params);
+            return this.#pollWithLimiter(() =>
+              this.pool.query<{ workflow_uuid: string }>(
+                `SELECT workflow_uuid FROM "${this.schemaName}".workflow_status WHERE ${ids} AND status = $1`,
+                params,
+              ),
+            );
+          },
+        ));
+      } catch (e) {
+        this.logger.warn(`Error polling status for cancellable steps: ${String(e)}`);
+        continue;
+      }
+      const cancelled = new Set(rows.map((row) => row.workflow_uuid));
+      for (const [waiterKey, watchers] of this.#cancelWatchers) {
+        if (watchers.shardKey !== shardKey || !cancelled.has(watchers.workflowID)) continue;
+        this.#cancelWatchers.delete(waiterKey);
+        const reason = new DBOSWorkflowCancelledError(watchers.workflowID);
+        for (const controller of watchers.controllers) controller.abort(reason);
+      }
     }
   }
 
   @dbRetry()
+  // A missing row normally means the workflow has not been inserted yet, so
+  // polling for it is correct. Callers that know the row must already exist
+  // (e.g. a run parking on an outcome it just failed to write) pass
+  // `failIfMissing` to fail fast with DBOSNonExistentWorkflowError instead of
+  // polling forever.
   async awaitWorkflowResult(
     workflowID: string,
     timeoutSeconds?: number,
     callerID?: string,
     timerFuncID?: number,
+    pollingIntervalMs?: number,
+    failIfMissing?: boolean,
   ): Promise<SystemDatabaseStoredResult | undefined> {
     const timeoutms = timeoutSeconds !== undefined ? timeoutSeconds * 1000 : undefined;
     let finishTime = timeoutms !== undefined ? Date.now() + timeoutms : undefined;
+    const pollIntervalMs = pollingIntervalMs ?? this.dbPollingIntervalResultMs;
+
+    // Record the durable timeout deadline once before polling. durableSleepInternal persists it on the
+    // first call and reads back the same value on recovery, so it never changes across iterations.
+    if (timerFuncID !== undefined && callerID !== undefined && timeoutms !== undefined) {
+      finishTime = await this.durableSleepInternal(callerID, timerFuncID, timeoutms);
+    }
 
     while (true) {
-      let resolveNotification: () => void;
-      const statusPromise = new Promise<void>((resolve) => {
-        resolveNotification = resolve;
-      });
-      const irh = this.cancelWakeupMap.registerCallback(workflowID, (_res) => {
-        resolveNotification();
-      });
-      const crh = callerID
-        ? this.cancelWakeupMap.registerCallback(callerID, (_res) => {
-            resolveNotification();
-          })
-        : undefined;
+      if (callerID) await this.checkIfCanceledLimited(callerID);
+      let rows: workflow_status[];
       try {
-        if (callerID) await this.checkIfCanceled(callerID);
-        try {
-          const { rows } = await this.pool.query<workflow_status>(
-            `SELECT status, output, error, serialization FROM "${this.schemaName}".workflow_status 
-             WHERE workflow_uuid=$1`,
-            [workflowID],
-          );
-          if (rows.length > 0) {
-            const status = rows[0].status;
-            if (status === StatusString.SUCCESS) {
-              return { output: rows[0].output, serialization: rows[0].serialization };
-            } else if (status === StatusString.ERROR) {
-              return { error: rows[0].error, serialization: rows[0].serialization };
-            } else if (status === StatusString.CANCELLED) {
-              return { cancelled: true };
-            } else if (status === StatusString.MAX_RECOVERY_ATTEMPTS_EXCEEDED) {
-              return { maxRecoveryAttemptsExceeded: true };
-            } else {
-              // Status is not actionable
-            }
-          }
-        } catch (e) {
-          const err = e as Error;
-          this.logger.error(`Exception from system database: ${err}`, err);
-          throw err;
-        }
-
-        const ct = Date.now();
-        if (finishTime && ct > finishTime) return undefined; // Time's up
-
-        let timeoutPromise: Promise<void> = Promise.resolve();
-        let timeoutCancel: () => void = () => {};
-        if (timerFuncID !== undefined && callerID !== undefined && timeoutms !== undefined) {
-          const { promise, cancel, endTime } = await this.#durableSleep(
-            callerID,
-            timerFuncID,
-            timeoutms,
-            this.dbPollingIntervalResultMs,
-          );
-          finishTime = endTime;
-          timeoutPromise = promise;
-          timeoutCancel = cancel;
-        } else {
-          let poll = finishTime ? finishTime - ct : this.dbPollingIntervalResultMs;
-          poll = Math.min(this.dbPollingIntervalResultMs, poll);
-          const { promise, cancel } = cancellableSleep(poll);
-          timeoutPromise = promise;
-          timeoutCancel = cancel;
-        }
-
-        try {
-          await Promise.race([statusPromise, timeoutPromise]);
-        } finally {
-          timeoutCancel();
-        }
-      } finally {
-        this.cancelWakeupMap.deregisterCallback(irh);
-        if (crh) this.cancelWakeupMap.deregisterCallback(crh);
+        const params: unknown[] = [];
+        const target = this.wf('ws', workflowID, params);
+        ({ rows } = await this.#pollWithLimiter(() =>
+          this.pool.query<workflow_status>(
+            `SELECT ws.status, COALESCE(wo.output, ws.output) AS output,
+                    COALESCE(wo.error, ws.error) AS error, ws.serialization
+             FROM "${this.schemaName}".workflow_status ws
+             LEFT JOIN "${this.schemaName}".workflow_output wo ON ${this.wfJoin('ws', 'wo')}
+             WHERE ${target}`,
+            params,
+          ),
+        ));
+      } catch (e) {
+        const err = e as Error;
+        this.logger.error(`Exception from system database: ${err}`, err);
+        throw err;
       }
+      if (rows.length > 0) {
+        const status = rows[0].status;
+        if (status === StatusString.SUCCESS) {
+          return { output: rows[0].output, serialization: rows[0].serialization };
+        } else if (status === StatusString.ERROR) {
+          return { error: rows[0].error, serialization: rows[0].serialization };
+        } else if (status === StatusString.CANCELLED) {
+          return { cancelled: true };
+        } else if (status === StatusString.MAX_RECOVERY_ATTEMPTS_EXCEEDED) {
+          return { maxRecoveryAttemptsExceeded: true };
+        } else {
+          // Status is not actionable
+        }
+      } else if (failIfMissing) {
+        throw new DBOSNonExistentWorkflowError(`Workflow ${workflowID} does not exist`);
+      }
+
+      const ct = Date.now();
+      if (finishTime && ct > finishTime) return undefined; // Time's up
+
+      let poll = finishTime ? finishTime - Date.now() : pollIntervalMs;
+      poll = Math.min(pollIntervalMs, poll);
+      await sleepms(poll);
     }
   }
 
   @dbRetry()
-  async awaitFirstWorkflowId(workflowIds: string[], callerID?: string): Promise<string> {
-    const placeholders = workflowIds.map((_, i) => `$${i + 1}`).join(', ');
+  async awaitFirstWorkflowId(workflowIds: string[], callerID?: string, pollingIntervalMs?: number): Promise<string> {
+    const pollIntervalMs = pollingIntervalMs ?? this.dbPollingIntervalResultMs;
 
     while (true) {
-      let resolveNotification: () => void;
-      const wakeupPromise = new Promise<void>((resolve) => {
-        resolveNotification = resolve;
-      });
+      if (callerID) await this.checkIfCanceledLimited(callerID);
 
-      // Register cancel callbacks for all target workflows and the caller.
-      const cbHandles = workflowIds.map((wfid) =>
-        this.cancelWakeupMap.registerCallback(wfid, () => resolveNotification!()),
-      );
-      const callerCbHandle = callerID
-        ? this.cancelWakeupMap.registerCallback(callerID, () => resolveNotification!())
-        : undefined;
-
-      try {
-        if (callerID) await this.checkIfCanceled(callerID);
-
-        const { rows } = await this.pool.query<workflow_status>(
-          `SELECT workflow_uuid FROM "${this.schemaName}".workflow_status
-           WHERE workflow_uuid IN (${placeholders})
-             AND status NOT IN ('${StatusString.PENDING}', '${StatusString.ENQUEUED}', '${StatusString.DELAYED}')
-           LIMIT 1`,
-          workflowIds,
-        );
-
-        if (rows.length > 0) {
-          return rows[0].workflow_uuid;
-        }
-
-        const { promise: sleepPromise, cancel: sleepCancel } = cancellableSleep(this.dbPollingIntervalResultMs);
-        try {
-          await Promise.race([wakeupPromise, sleepPromise]);
-        } finally {
-          sleepCancel();
-        }
-      } finally {
-        for (const h of cbHandles) {
-          this.cancelWakeupMap.deregisterCallback(h);
-        }
-        if (callerCbHandle) this.cancelWakeupMap.deregisterCallback(callerCbHandle);
+      const first = await this.checkFirstWorkflowId(workflowIds);
+      if (first !== undefined) {
+        return first;
       }
+
+      await sleepms(pollIntervalMs);
     }
+  }
+
+  /** The first of these workflows found complete, if any. */
+  async checkFirstWorkflowId(workflowIds: string[]): Promise<string | undefined> {
+    const params: unknown[] = [];
+    const ids = this.wfIn(undefined, workflowIds, params);
+    const { rows } = await this.#pollWithLimiter(() =>
+      this.pool.query<workflow_status>(
+        `SELECT workflow_uuid FROM "${this.schemaName}".workflow_status
+         WHERE ${ids}
+           AND status NOT IN ('${StatusString.PENDING}', '${StatusString.ENQUEUED}', '${StatusString.DELAYED}', '${StatusString.SUSPENDED}')
+         LIMIT 1`,
+        params,
+      ),
+    );
+    return rows[0]?.workflow_uuid;
+  }
+
+  @dbRetry()
+  async awaitWorkflowIds(workflowIds: string[], callerID?: string, pollingIntervalMs?: number): Promise<void> {
+    const remainingWorkflowIds = new Set(workflowIds);
+    const pollIntervalMs = pollingIntervalMs ?? this.dbPollingIntervalResultMs;
+
+    while (remainingWorkflowIds.size > 0) {
+      const currentWorkflowIds = [...remainingWorkflowIds];
+
+      if (callerID) await this.checkIfCanceledLimited(callerID);
+
+      for (const workflowID of await this.checkCompletedWorkflowIds(currentWorkflowIds)) {
+        remainingWorkflowIds.delete(workflowID);
+      }
+      if (remainingWorkflowIds.size === 0) {
+        return;
+      }
+
+      await sleepms(pollIntervalMs);
+    }
+  }
+
+  /** Those of these workflows found complete. */
+  async checkCompletedWorkflowIds(workflowIds: string[]): Promise<string[]> {
+    const params: unknown[] = [];
+    const ids = this.wfIn(undefined, workflowIds, params);
+    const { rows } = await this.#pollWithLimiter(() =>
+      this.pool.query<{ workflow_uuid: string }>(
+        `SELECT workflow_uuid FROM "${this.schemaName}".workflow_status
+         WHERE ${ids}
+           AND status NOT IN ('${StatusString.PENDING}', '${StatusString.ENQUEUED}', '${StatusString.DELAYED}', '${StatusString.SUSPENDED}')`,
+        params,
+      ),
+    );
+    return rows.map((row) => row.workflow_uuid);
   }
 
   // ==================== Sleep ====================
   @dbRetry()
   async durableSleepms(workflowID: string, functionID: number, durationMS: number): Promise<void> {
-    let cancelled = false;
-    let resolveNotification: () => void;
-    const cancelPromise = new Promise<void>((resolve) => {
-      resolveNotification = () => {
-        cancelled = true;
-        resolve();
-      };
-    });
+    const endTime = await this.durableSleepInternal(workflowID, functionID, durationMS, true);
 
-    const cbr = this.cancelWakeupMap.registerCallback(workflowID, resolveNotification!);
-    try {
-      const { cancel: cancelInitial, endTime } = await this.#durableSleep(workflowID, functionID, durationMS);
-      cancelInitial();
-
-      while (!cancelled && Date.now() < endTime) {
-        const { promise, cancel } = cancellableSleep(Math.min(endTime - Date.now(), sleepConfig.maxTimeoutMS));
-        try {
-          await Promise.race([cancelPromise, promise]);
-        } finally {
-          cancel();
-        }
-      }
-    } finally {
-      this.cancelWakeupMap.deregisterCallback(cbr);
+    while (Date.now() < endTime) {
+      await sleepms(Math.min(endTime - Date.now(), sleepConfig.maxTimeoutMS));
     }
 
     await this.checkIfCanceled(workflowID);
@@ -1857,54 +3668,147 @@ export class SystemDatabase {
     message: string | null,
     topic: string | undefined,
     serialization: string | null,
-    messageUUID?: string,
+    idempotencyKey?: string,
+    // The destination's shard key; required on a sharded system database.
+    shardKey?: string,
   ): Promise<void> {
-    topic = topic ?? this.nullTopic;
-    messageUUID = messageUUID ?? randomUUID();
-    const client: PoolClient = await this.pool.connect();
+    const startTime = Date.now();
+    let missing: DBOSNonExistentWorkflowError | undefined;
+    const client: PoolClient = await this.connect();
 
     try {
       await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
       await this.#runAndRecordResult(client, DBOS_FUNCNAME_SEND, workflowID, functionID, async () => {
-        await client.query(
-          `INSERT INTO "${this.schemaName}".notifications (destination_uuid, topic, message, serialization, message_uuid)
-           VALUES ($1, $2, $3, $4, $5)
-           ON CONFLICT (message_uuid) DO NOTHING;`,
-          [destinationID, topic, message, serialization, messageUUID],
-        );
+        await this.sendDirectInternal(client, destinationID, message, topic, serialization, idempotencyKey, shardKey);
         return undefined;
       });
       await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK');
-      const err: DatabaseError = error as DatabaseError;
-      if (err.code === '23503') {
+      if (error instanceof DBOSNonExistentWorkflowError) {
         // Foreign key constraint violation (only expected for the INSERT query)
-        throw new DBOSNonExistentWorkflowError(`Sent to non-existent destination workflow UUID: ${destinationID}`);
+        missing = error;
       } else {
-        throw err;
+        throw error;
       }
+    } finally {
+      client.release();
+    }
+    if (missing) {
+      // A missing destination is the send's answer; the transaction has rolled back, so record it separately.
+      await this.recordOperationError(workflowID, functionID, DBOS_FUNCNAME_SEND, startTime, missing);
+      throw missing;
+    }
+  }
+
+  /** Runs on `client` if given, joining its transaction; otherwise on the pool with retries. */
+  async sendDirect(
+    destinationID: string,
+    message: string | null,
+    topic: string | undefined,
+    serialization: string | null,
+    idempotencyKey?: string,
+    client?: ClientBase,
+    shardKey?: string,
+  ): Promise<void> {
+    if (client !== undefined) {
+      return await this.sendDirectInternal(
+        client,
+        destinationID,
+        message,
+        topic,
+        serialization,
+        idempotencyKey,
+        shardKey,
+      );
+    }
+    return await this.sendDirectStandalone(destinationID, message, topic, serialization, idempotencyKey, shardKey);
+  }
+
+  /** A send from inside a step of `workflowID`: not recorded, but it lands only while the caller still owns the workflow. */
+  @dbRetry()
+  async sendFromStep(
+    workflowID: string,
+    destinationID: string,
+    message: string | null,
+    topic: string | undefined,
+    serialization: string | null,
+    idempotencyKey?: string,
+    shardKey?: string,
+  ): Promise<void> {
+    const ownerXid = currentOwnerXid(workflowID);
+    const client: PoolClient = await this.connect();
+    try {
+      await this.inTransaction(client, async () => {
+        await this.sendDirectInternal(client, destinationID, message, topic, serialization, idempotencyKey, shardKey);
+        // After the insert, in the order the recorded send locks, so they cannot deadlock.
+        if (ownerXid !== undefined) {
+          await this.checkOwner(client, workflowID, ownerXid);
+        }
+      });
     } finally {
       client.release();
     }
   }
 
   @dbRetry()
-  async sendDirect(
+  private async sendDirectStandalone(
     destinationID: string,
     message: string | null,
     topic: string | undefined,
     serialization: string | null,
-    messageUUID?: string,
+    idempotencyKey?: string,
+    shardKey?: string,
   ): Promise<void> {
+    return await this.sendDirectInternal(
+      this.pool,
+      destinationID,
+      message,
+      topic,
+      serialization,
+      idempotencyKey,
+      shardKey,
+    );
+  }
+
+  protected async sendDirectInternal(
+    db: ClientBase | Pool,
+    destinationID: string,
+    message: string | null,
+    topic: string | undefined,
+    serialization: string | null,
+    idempotencyKey?: string,
+    shardKey?: string,
+  ): Promise<void> {
+    if (db === this.pool) {
+      // All sends need a transaction now because they wake up suspended workflows unconditionally.
+      const client = await this.connect();
+      try {
+        return await this.inTransaction(client, () =>
+          this.sendDirectInternal(client, destinationID, message, topic, serialization, idempotencyKey, shardKey),
+        );
+      } finally {
+        client.release();
+      }
+    }
     topic = topic ?? this.nullTopic;
-    messageUUID = messageUUID ?? randomUUID();
+    // An idempotency key is scoped per destination: suffix it with the recipient's workflow ID.
+    const messageUUID = idempotencyKey ? `${idempotencyKey}::${destinationID}` : randomUUID();
+    const values: Record<string, unknown> = {
+      ...this.wfValues(destinationID, shardKey),
+      destination_uuid: destinationID,
+      topic,
+      message,
+      serialization,
+      message_uuid: messageUUID,
+    };
     try {
-      await this.pool.query(
-        `INSERT INTO "${this.schemaName}".notifications (destination_uuid, topic, message, serialization, message_uuid)
-         VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (message_uuid) DO NOTHING;`,
-        [destinationID, topic, message, serialization, messageUUID],
+      await this.insertRows(
+        db,
+        'notifications',
+        Object.keys(values),
+        [Object.values(values)],
+        `ON CONFLICT (${this.keyConflict('message_uuid')}) DO NOTHING`,
       );
     } catch (error) {
       const err: DatabaseError = error as DatabaseError;
@@ -1913,6 +3817,26 @@ export class SystemDatabase {
       }
       throw err;
     }
+    await this.wakeReceivers(db, [destinationID], [topic]);
+  }
+
+  /**
+   * Make SUSPENDED receivers waiting on one of `topics` due, for the background pass to re-enqueue.
+   * Runs on every send, whether or not this process uses suspend mode, so any sender wakes a workflow
+   * another process parked. A primary-key probe per destination; it matches nothing in the common case.
+   *
+   * The match is destinations x topics, so a batch sending A on topic X and B on topic Y also wakes A
+   * if it waits on Y. The spurious wake-up is harmless: the replayed recv finds no message and parks again.
+   */
+  protected async wakeReceivers(db: ClientBase | Pool, destinations: string[], topics: string[]): Promise<void> {
+    const params: unknown[] = [topics];
+    await db.query(
+      // Status is tested in SET, not WHERE, so the planner cannot scan idx_workflow_status_suspended.
+      `UPDATE "${this.schemaName}".workflow_status
+       SET delay_until_epoch_ms = CASE WHEN status = '${StatusString.SUSPENDED}' THEN 0 ELSE delay_until_epoch_ms END
+       WHERE ${this.wfIn(undefined, destinations, params)} AND suspend_key = ANY($1::text[])`,
+      params,
+    );
   }
 
   @dbRetry()
@@ -1922,6 +3846,7 @@ export class SystemDatabase {
     timeoutFunctionID: number,
     topic?: string,
     timeoutSeconds: number = DBOSExecutor.defaultNotificationTimeoutSec,
+    pollingIntervalMs?: number,
   ): Promise<{ serializedValue: string | null; serialization: string | null }> {
     topic = topic ?? this.nullTopic;
     const startTime = Date.now();
@@ -1936,6 +3861,13 @@ export class SystemDatabase {
 
     const timeoutms = timeoutSeconds !== undefined ? timeoutSeconds * 1000 : undefined;
     let finishTime = timeoutms !== undefined ? Date.now() + timeoutms : undefined;
+    const pollIntervalMs = pollingIntervalMs ?? this.dbPollingIntervalEventMs;
+
+    // Record the durable timeout deadline once before polling. durableSleepInternal persists it on the
+    // first call and reads back the same value on recovery, so it never changes across iterations.
+    if (timeoutms) {
+      finishTime = await this.durableSleepInternal(workflowID, timeoutFunctionID, timeoutms);
+    }
 
     while (true) {
       // register the key with the global notifications listener.
@@ -1943,20 +3875,21 @@ export class SystemDatabase {
       const messagePromise = new Promise<void>((resolve) => {
         resolveNotification = resolve;
       });
-      const payload = `${workflowID}::${topic}`;
+      const payload = this.waiter(workflowID, topic);
       const cbr = this.notificationsMap.registerCallback(payload, resolveNotification!);
-      const crh = this.cancelWakeupMap.registerCallback(workflowID, (_res) => {
-        resolveNotification();
-      });
 
       try {
-        await this.checkIfCanceled(workflowID);
+        await this.checkIfCanceledLimited(workflowID);
 
         // Check if the key is already in the DB, then wait for the notification if it isn't.
+        const params: unknown[] = [topic];
+        const target = this.wf(undefined, workflowID, params, 'destination_uuid');
         const initRecvRows = (
-          await this.pool.query<notifications>(
-            `SELECT topic FROM "${this.schemaName}".notifications WHERE destination_uuid=$1 AND topic=$2 AND consumed = false;`,
-            [workflowID, topic],
+          await this.#pollWithLimiter(() =>
+            this.pool.query<notifications>(
+              `SELECT topic FROM "${this.schemaName}".notifications WHERE ${target} AND topic=$1 AND consumed = false;`,
+              params,
+            ),
           )
         ).rows;
 
@@ -1965,62 +3898,70 @@ export class SystemDatabase {
         const ct = Date.now();
         if (finishTime && ct > finishTime) break; // Time's up
 
-        let timeoutPromise: Promise<void> = Promise.resolve();
-        let timeoutCancel: () => void = () => {};
-        if (timeoutms) {
-          const { promise, cancel, endTime } = await this.#durableSleep(
-            workflowID,
-            timeoutFunctionID,
-            timeoutms,
-            this.dbPollingIntervalEventMs,
-          );
-          timeoutPromise = promise;
-          timeoutCancel = cancel;
-          finishTime = endTime;
-        } else {
-          let poll = finishTime ? finishTime - ct : this.dbPollingIntervalEventMs;
-          poll = Math.min(this.dbPollingIntervalEventMs, poll);
-          const { promise, cancel } = cancellableSleep(poll);
-          timeoutPromise = promise;
-          timeoutCancel = cancel;
-        }
+        let poll = finishTime ? finishTime - Date.now() : pollIntervalMs;
+        poll = Math.min(pollIntervalMs, poll);
+        const { promise, cancel } = cancellableSleep(poll);
         try {
-          await Promise.race([messagePromise, timeoutPromise]);
+          await Promise.race([messagePromise, promise]);
         } finally {
-          timeoutCancel();
+          cancel();
         }
       } finally {
         this.notificationsMap.deregisterCallback(cbr);
-        this.cancelWakeupMap.deregisterCallback(crh);
       }
     }
 
-    await this.checkIfCanceled(workflowID);
+    return await this.recvConsume(workflowID, functionID, topic, startTime);
+  }
+
+  /**
+   * Consume and return the oldest message on `topic`, or null if there is none, recording it as the recv at `functionID`. Idempotent on `functionID`.
+   */
+  @dbRetry()
+  async recvConsume(
+    workflowID: string,
+    functionID: number,
+    topic: string | undefined,
+    startTime: number,
+  ): Promise<{ serializedValue: string | null; serialization: string | null }> {
+    topic = topic ?? this.nullTopic;
+    const res = await this.getOperationResultAndThrowIfCancelled(workflowID, functionID);
+    if (res) {
+      if (res.functionName !== DBOS_FUNCNAME_RECV) {
+        throw new DBOSUnexpectedStepError(workflowID, functionID, DBOS_FUNCNAME_RECV, res.functionName!);
+      }
+      const ownerXid = currentOwnerXid(workflowID);
+      if (ownerXid !== undefined && (await this.getWorkflowOwner(workflowID)) !== ownerXid) {
+        throw new DBOSWorkflowConflictError(workflowID);
+      }
+      return { serializedValue: res.output!, serialization: res.serialization ?? null };
+    }
 
     // Transactionally consume and return the message if it's in the DB, otherwise return null.
     let message: string | null = null;
     let serialization: string | null = null;
-    const client = await this.pool.connect();
+    const client = await this.connect();
     try {
       await client.query(`BEGIN ISOLATION LEVEL READ COMMITTED`);
+      const consumeParams: unknown[] = [topic, functionID];
       const finalRecvRows = (
         await client.query<notifications>(
           `UPDATE "${this.schemaName}".notifications
-        SET consumed = true
-        WHERE destination_uuid = $1
-          AND topic = $2
+        SET consumed = true, consumed_by_function_id = $2
+        WHERE ${this.wf(undefined, workflowID, consumeParams, 'destination_uuid')}
+          AND topic = $1
           AND consumed = false
           AND message_uuid = (
             SELECT message_uuid
             FROM "${this.schemaName}".notifications
-            WHERE destination_uuid = $1
-              AND topic = $2
+            WHERE ${this.wf(undefined, workflowID, consumeParams, 'destination_uuid')}
+              AND topic = $1
               AND consumed = false
             ORDER BY created_at_epoch_ms ASC
             LIMIT 1
           )
         RETURNING notifications.message, notifications.serialization;`,
-          [workflowID, topic],
+          consumeParams,
         )
       ).rows;
       if (finalRecvRows.length > 0) {
@@ -2061,30 +4002,40 @@ export class SystemDatabase {
     message: string | null,
     serialization: string | null,
   ): Promise<void> {
-    const client: PoolClient = await this.pool.connect();
+    const client: PoolClient = await this.connect();
 
     try {
       await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+      // Only a real write (not a replay) should wake readers.
+      let didWrite = false;
       await this.#runAndRecordResult(client, DBOS_FUNCNAME_SETEVENT, workflowID, functionID, async () => {
+        const keys = this.wfValues(workflowID);
+        const keyColumns = Object.keys(keys).map((c) => `${c}, `);
+        const keyPlaceholders = (from: number) => Object.keys(keys).map((_, i) => `$${from + i}, `);
         await client.query(
-          `INSERT INTO "${this.schemaName}".workflow_events (workflow_uuid, key, value, serialization)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (workflow_uuid, key)
-             DO UPDATE SET value = $3
+          `INSERT INTO "${this.schemaName}".workflow_events (${keyColumns.join('')}workflow_uuid, key, value, serialization)
+             VALUES (${keyPlaceholders(5).join('')}$1, $2, $3, $4)
+             ON CONFLICT (${this.keyConflict('workflow_uuid', 'key')})
+             DO UPDATE SET value = $3, serialization = $4
              RETURNING workflow_uuid;`,
-          [workflowID, key, message, serialization],
+          [workflowID, key, message, serialization, ...Object.values(keys)],
         );
         // Also write to the immutable history table for fork support
         await client.query(
-          `INSERT INTO "${this.schemaName}".workflow_events_history (workflow_uuid, function_id, key, value, serialization)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (workflow_uuid, function_id, key)
-             DO UPDATE SET value = $4;`,
-          [workflowID, functionID, key, message, serialization],
+          `INSERT INTO "${this.schemaName}".workflow_events_history (${keyColumns.join('')}workflow_uuid, function_id, key, value, serialization)
+             VALUES (${keyPlaceholders(6).join('')}$1, $2, $3, $4, $5)
+             ON CONFLICT (${this.keyConflict('workflow_uuid', 'function_id', 'key')})
+             DO UPDATE SET value = $4, serialization = $5;`,
+          [workflowID, functionID, key, message, serialization, ...Object.values(keys)],
         );
+        didWrite = true;
         return undefined;
       });
       await client.query('COMMIT');
+      // Notify only after commit, so a woken getEvent sees the value.
+      if (didWrite) {
+        this.#signalNotification(DBOS_WORKFLOW_EVENTS_CHANNEL, `${workflowID}::${key}`);
+      }
     } catch (e) {
       this.logger.error(e);
       await client.query(`ROLLBACK`);
@@ -2104,6 +4055,7 @@ export class SystemDatabase {
       functionID: number;
       timeoutFunctionID: number;
     },
+    pollingIntervalMs?: number,
   ): Promise<{ serializedValue: string | null; serialization: string | null }> {
     const startTime = Date.now();
     // Check if the operation has been done before for OAOO (only do this inside a workflow).
@@ -2121,16 +4073,28 @@ export class SystemDatabase {
             res.functionName!,
           );
         }
-        return { serializedValue: res.output!, serialization: null };
+        return { serializedValue: res.output!, serialization: res.serialization ?? null };
       }
     }
 
     // Get the return the value. if it's in the DB, otherwise return null.
     let value: string | null = null;
     let valueSer: string | null = null;
-    const payloadKey = `${workflowID}::${key}`;
+    const payloadKey = this.waiter(workflowID, key);
     const timeoutms = timeoutSeconds !== undefined ? timeoutSeconds * 1000 : undefined;
     let finishTime = timeoutms !== undefined ? Date.now() + timeoutms : undefined;
+    const pollIntervalMs = pollingIntervalMs ?? this.dbPollingIntervalEventMs;
+
+    // If we have a callerWorkflow, we want a durable sleep, otherwise, not. Record the durable
+    // timeout deadline once before polling. durableSleepInternal persists it on the first call and reads
+    // back the same value on recovery, so it never changes across iterations.
+    if (callerWorkflow && timeoutms) {
+      finishTime = await this.durableSleepInternal(
+        callerWorkflow.workflowID,
+        callerWorkflow.timeoutFunctionID ?? -1,
+        timeoutms,
+      );
+    }
 
     // Register the key with the global notifications listener first... we do not want to look in the DB first
     //  or that would cause a timing hole.
@@ -2140,21 +4104,20 @@ export class SystemDatabase {
         resolveNotification = resolve;
       });
       const cbr = this.workflowEventsMap.registerCallback(payloadKey, resolveNotification!);
-      const crh = callerWorkflow?.workflowID
-        ? this.cancelWakeupMap.registerCallback(callerWorkflow.workflowID, (_res) => {
-            resolveNotification();
-          })
-        : undefined;
 
       try {
-        if (callerWorkflow?.workflowID) await this.checkIfCanceled(callerWorkflow?.workflowID);
+        if (callerWorkflow?.workflowID) await this.checkIfCanceledLimited(callerWorkflow?.workflowID);
         // Check if the key is already in the DB, then wait for the notification if it isn't.
+        const params: unknown[] = [key];
+        const target = this.wf(undefined, workflowID, params);
         const initRecvRows = (
-          await this.pool.query<workflow_events>(
-            `SELECT key, value, serialization
+          await this.#pollWithLimiter(() =>
+            this.pool.query<workflow_events>(
+              `SELECT key, value, serialization
              FROM "${this.schemaName}".workflow_events
-             WHERE workflow_uuid=$1 AND key=$2;`,
-            [workflowID, key],
+             WHERE ${target} AND key=$1;`,
+              params,
+            ),
           )
         ).rows;
 
@@ -2167,35 +4130,17 @@ export class SystemDatabase {
         const ct = Date.now();
         if (finishTime && ct > finishTime) break; // Time's up
 
-        // If we have a callerWorkflow, we want a durable sleep, otherwise, not
-        let timeoutPromise: Promise<void> = Promise.resolve();
-        let timeoutCancel: () => void = () => {};
-        if (callerWorkflow && timeoutms) {
-          const { promise, cancel, endTime } = await this.#durableSleep(
-            callerWorkflow.workflowID,
-            callerWorkflow.timeoutFunctionID ?? -1,
-            timeoutms,
-            this.dbPollingIntervalEventMs,
-          );
-          timeoutPromise = promise;
-          timeoutCancel = cancel;
-          finishTime = endTime;
-        } else {
-          let poll = finishTime ? finishTime - ct : this.dbPollingIntervalEventMs;
-          poll = Math.min(this.dbPollingIntervalEventMs, poll);
-          const { promise, cancel } = cancellableSleep(poll);
-          timeoutPromise = promise;
-          timeoutCancel = cancel;
-        }
+        let poll = finishTime ? finishTime - Date.now() : pollIntervalMs;
+        poll = Math.min(pollIntervalMs, poll);
+        const { promise, cancel } = cancellableSleep(poll);
 
         try {
-          await Promise.race([valuePromise, timeoutPromise]);
+          await Promise.race([valuePromise, promise]);
         } finally {
-          timeoutCancel();
+          cancel();
         }
       } finally {
         this.workflowEventsMap.deregisterCallback(cbr);
-        if (crh) this.cancelWakeupMap.deregisterCallback(crh);
       }
     }
 
@@ -2217,65 +4162,6 @@ export class SystemDatabase {
     return { serializedValue: value, serialization: valueSer };
   }
 
-  // Event dispatcher queries / updates
-  @dbRetry()
-  async getEventDispatchState(
-    service: string,
-    workflowName: string,
-    key: string,
-  ): Promise<DBOSExternalState | undefined> {
-    const res = await this.pool.query<event_dispatch_kv>(
-      `SELECT * FROM "${this.schemaName}".event_dispatch_kv
-       WHERE workflow_fn_name = $1 AND service_name = $2 AND key = $3;`,
-      [workflowName, service, key],
-    );
-
-    if (res.rows.length === 0) return undefined;
-
-    return {
-      service: res.rows[0].service_name,
-      workflowFnName: res.rows[0].workflow_fn_name,
-      key: res.rows[0].key,
-      value: res.rows[0].value,
-      updateTime: res.rows[0].update_time,
-      updateSeq:
-        res.rows[0].update_seq !== null && res.rows[0].update_seq !== undefined
-          ? BigInt(res.rows[0].update_seq)
-          : undefined,
-    };
-  }
-
-  @dbRetry()
-  async upsertEventDispatchState(state: DBOSExternalState): Promise<DBOSExternalState> {
-    const res = await this.pool.query<event_dispatch_kv>(
-      `INSERT INTO "${this.schemaName}".event_dispatch_kv (
-        service_name, workflow_fn_name, key, value, update_time, update_seq)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (service_name, workflow_fn_name, key)
-       DO UPDATE SET
-         update_time = GREATEST(EXCLUDED.update_time, event_dispatch_kv.update_time),
-         update_seq =  GREATEST(EXCLUDED.update_seq,  event_dispatch_kv.update_seq),
-         value = CASE WHEN (EXCLUDED.update_time > event_dispatch_kv.update_time 
-            OR EXCLUDED.update_seq > event_dispatch_kv.update_seq 
-            OR (event_dispatch_kv.update_time IS NULL and event_dispatch_kv.update_seq IS NULL)
-         ) THEN EXCLUDED.value ELSE event_dispatch_kv.value END
-       RETURNING value, update_time, update_seq;`,
-      [state.service, state.workflowFnName, state.key, state.value, state.updateTime, state.updateSeq],
-    );
-
-    return {
-      service: state.service,
-      workflowFnName: state.workflowFnName,
-      key: state.key,
-      value: res.rows[0].value,
-      updateTime: res.rows[0].update_time,
-      updateSeq:
-        res.rows[0].update_seq !== undefined && res.rows[0].update_seq !== null
-          ? BigInt(res.rows[0].update_seq)
-          : undefined,
-    };
-  }
-
   // ==================== Streams ====================
   @dbRetry()
   async writeStreamFromStep(
@@ -2285,33 +4171,33 @@ export class SystemDatabase {
     serializedValue: string,
     serialization: string | null,
   ): Promise<void> {
-    const client: PoolClient = await this.pool.connect();
+    const ownerXid = currentOwnerXid(workflowID);
+    const client: PoolClient = await this.connect();
     try {
-      await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
-
-      // Find the maximum offset for this workflow_uuid and key combination
-      const maxOffsetResult = await client.query(
-        `SELECT MAX("offset") FROM "${this.schemaName}".streams
-         WHERE workflow_uuid = $1 AND key = $2`,
-        [workflowID, key],
-      );
-
-      // Next offset is max + 1, or 0 if no records exist
-      const maxOffset = (maxOffsetResult.rows[0] as { max: number | null }).max;
-      const nextOffset = maxOffset !== null ? maxOffset + 1 : 0;
-
-      // Insert the new stream entry
-      await client.query(
-        `INSERT INTO "${this.schemaName}".streams (workflow_uuid, key, value, "offset", function_id, serialization)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [workflowID, key, serializedValue, nextOffset, functionID, serialization],
-      );
-
-      await client.query('COMMIT');
-    } catch (e) {
-      this.logger.error(e);
-      await client.query('ROLLBACK');
-      throw e;
+      while (true) {
+        try {
+          await this.inTransaction(client, async () => {
+            // Derives the first unused offset inside the insert; two writers can still pick the same one.
+            await this.#insertStreamValue(client, workflowID, functionID, key, serializedValue, serialization);
+            // After the insert, in the order the workflow-level writes lock, so they cannot deadlock.
+            if (ownerXid !== undefined) {
+              await this.checkOwner(client, workflowID, ownerXid);
+            }
+          });
+        } catch (e) {
+          // Only an offset conflict resolves on retry; anything else would spin forever.
+          if (isPgDatabaseError(e) && e.code === '23505') {
+            this.logger.warn(`Stream offset conflict for workflow ${workflowID}, key ${key}; retrying`);
+            await sleepms(100);
+            continue;
+          }
+          if (!(e instanceof DBOSWorkflowConflictError)) this.logger.error(e);
+          throw e;
+        }
+        // Notify only after commit, so a woken reader sees the value.
+        this.#signalNotification(DBOS_STREAMS_CHANNEL, `${workflowID}::${key}`);
+        return;
+      }
     } finally {
       client.release();
     }
@@ -2326,177 +4212,245 @@ export class SystemDatabase {
     serialization: string | null,
     functionName: string,
   ): Promise<void> {
-    const client: PoolClient = await this.pool.connect();
+    const client: PoolClient = await this.connect();
     try {
-      await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
-
-      await this.#runAndRecordResult(client, functionName, workflowID, functionID, async () => {
-        // Find the maximum offset for this workflow_uuid and key combination
-        const maxOffsetResult = await client.query(
-          `SELECT MAX("offset") FROM "${this.schemaName}".streams 
-           WHERE workflow_uuid = $1 AND key = $2`,
-          [workflowID, key],
-        );
-
-        // Next offset is max + 1, or 0 if no records exist
-        const maxOffset = (maxOffsetResult.rows[0] as { max: number | null }).max;
-        const nextOffset = maxOffset !== null ? maxOffset + 1 : 0;
-
-        // Insert the new stream entry
-        await client.query(
-          `INSERT INTO "${this.schemaName}".streams (workflow_uuid, key, value, "offset", function_id, serialization)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [workflowID, key, serializedValue, nextOffset, functionID, serialization],
-        );
-
-        return undefined;
-      });
-
-      await client.query('COMMIT');
-    } catch (e) {
-      this.logger.error(e);
-      await client.query('ROLLBACK');
-      throw e;
+      while (true) {
+        // Only a real insert (not a replay) should wake readers.
+        let didWrite = false;
+        try {
+          await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+          await this.#runAndRecordResult(client, functionName, workflowID, functionID, async () => {
+            // Derives the first unused offset inside the insert; two writers can still pick the same one.
+            await this.#insertStreamValue(client, workflowID, functionID, key, serializedValue, serialization);
+            didWrite = true;
+            return undefined;
+          });
+          await client.query('COMMIT');
+        } catch (e) {
+          // Only an offset conflict resolves on retry; anything else would spin forever.
+          const offsetConflict = isPgDatabaseError(e) && e.code === '23505';
+          // Log before touching the connection again: a failing ROLLBACK is what would propagate.
+          if (!offsetConflict) this.logger.error(e);
+          // Roll back before waiting, so a retry does not hold an aborted transaction open.
+          await client.query('ROLLBACK');
+          if (offsetConflict) {
+            this.logger.warn(`Stream offset conflict for workflow ${workflowID}, key ${key}; retrying`);
+            await sleepms(100);
+            continue;
+          }
+          throw e;
+        }
+        // Notify only after commit, so a woken reader sees the value.
+        if (didWrite) {
+          this.#signalNotification(DBOS_STREAMS_CHANNEL, `${workflowID}::${key}`);
+        }
+        return;
+      }
     } finally {
       client.release();
     }
   }
 
-  async closeStream(workflowID: string, functionID: number, key: string): Promise<void> {
+  /** Append a value to a stream, at the first unused offset, derived inside the insert. */
+  async #insertStreamValue(
+    client: PoolClient,
+    workflowID: string,
+    functionID: number,
+    key: string,
+    serializedValue: string,
+    serialization: string | null,
+  ): Promise<void> {
+    const params: unknown[] = [key, serializedValue, functionID, serialization, workflowID];
+    const keyColumns = this.wfColumns(workflowID, params);
+    await client.query(
+      `INSERT INTO "${this.schemaName}".streams (${keyColumns.map(([c]) => `${c}, `).join('')}workflow_uuid, key, value, "offset", function_id, serialization)
+       SELECT ${keyColumns.map(([, e]) => `${e}, `).join('')}$5::text, $1::text, $2::text, COALESCE(MAX(s."offset"), -1) + 1, $3::int, $4::text
+       FROM "${this.schemaName}".streams s
+       WHERE ${this.wf('s', workflowID, params)} AND s.key = $1`,
+      params,
+    );
+  }
+
+  async closeStreamFromWorkflow(workflowID: string, functionID: number, key: string): Promise<void> {
     await this.writeStreamFromWorkflow(
       workflowID,
       functionID,
       key,
-      DBOS_STREAM_CLOSED_SENTINEL,
-      'portable_json',
+      DBOS_STREAM_CLOSED_SENTINEL_SERIALIZED,
+      DBOSPortableJSON.name(),
       DBOS_FUNCNAME_CLOSESTREAM,
     );
   }
 
+  async closeStreamFromStep(workflowID: string, stepID: number, key: string): Promise<void> {
+    await this.writeStreamFromStep(
+      workflowID,
+      stepID,
+      key,
+      DBOS_STREAM_CLOSED_SENTINEL_SERIALIZED,
+      DBOSPortableJSON.name(),
+    );
+  }
+
+  // Read the value at `offset` and the workflow's status in one query: status null = no such workflow, value undefined = nothing at that offset.
   @dbRetry()
-  async readStream(
+  async readStreamValue(
     workflowID: string,
     key: string,
     offset: number,
-  ): Promise<{ serializedValue: string; serialization: string | null }> {
-    const client: PoolClient = await this.pool.connect();
-    try {
-      const result = await client.query(
-        `SELECT value, serialization FROM "${this.schemaName}".streams 
-         WHERE workflow_uuid = $1 AND key = $2 AND "offset" = $3`,
-        [workflowID, key, offset],
-      );
+  ): Promise<{ status: string | null; value: { serializedValue: string; serialization: string | null } | undefined }> {
+    // LEFT JOIN so a workflow with nothing at offset still reports its status (single PK lookup); under the poll limiter, inside @dbRetry so the permit frees across backoff.
+    const params: unknown[] = [key, offset];
+    const target = this.wf('ws', workflowID, params);
+    const result = await this.#pollWithLimiter(() =>
+      this.pool.query<{
+        status: string;
+        value: string | null;
+        serialization: string | null;
+        stream_offset: number | null;
+      }>(
+        // "offset" is a reserved word, so alias it (stream_offset) to read it back plainly.
+        `SELECT ws.status AS status, s.value AS value, s.serialization AS serialization, s."offset" AS stream_offset
+         FROM "${this.schemaName}".workflow_status ws
+         LEFT OUTER JOIN "${this.schemaName}".streams s
+           ON ${this.wfJoin('s', 'ws')} AND s.key = $1 AND s."offset" = $2
+         WHERE ${target}`,
+        params,
+      ),
+    );
 
-      if (result.rows.length === 0) {
-        throw new Error(`No value found for workflow_uuid=${workflowID}, key=${key}, offset=${offset}`);
+    if (result.rows.length === 0) {
+      return { status: null, value: undefined };
+    }
+    const row = result.rows[0];
+    // streams.offset is non-nullable, so a NULL here means the join matched nothing at offset.
+    if (row.stream_offset === null) {
+      return { status: row.status, value: undefined };
+    }
+    return { status: row.status, value: { serializedValue: row.value as string, serialization: row.serialization } };
+  }
+
+  #signalNotification(channel: string, payload: string): void {
+    // Coalesce a wakeup on `channel` for `payload`; no-op without LISTEN/NOTIFY (clients, CockroachDB), which poll.
+    if (!this.shouldUseDBNotifications) {
+      return;
+    }
+    let batch = this.pendingNotifications.get(channel);
+    if (batch === undefined) {
+      batch = new Set();
+      this.pendingNotifications.set(channel, batch);
+    }
+    batch.add(payload);
+  }
+
+  // Periodically flush coalesced notifications across all channels, keeping the notifying commit off the write path.
+  async #runNotifier(): Promise<void> {
+    while (this.#notifierActive) {
+      const { promise, cancel } = cancellableSleep(this.notificationCoalesceMs);
+      this.#notifierWake = cancel;
+      await promise;
+      this.#notifierWake = null;
+      if (!this.#notifierActive) {
+        break;
       }
+      try {
+        await this.flushNotifications();
+      } catch (e) {
+        // Last resort: the flush drops its own failed batch, so this catches only unexpected errors that must not kill the push path.
+        if (this.#notifierActive) {
+          this.logger.warn(`Notifier error: ${String(e)}`);
+          const { promise: backoff } = cancellableSleep(1000);
+          await backoff;
+        }
+      }
+    }
+    // Final flush so values written just before shutdown still wake readers promptly.
+    try {
+      await this.flushNotifications();
+    } catch (e) {
+      this.logger.warn(`Notifier final flush error: ${String(e)}`);
+    }
+  }
 
-      // Deserialize the value before returning
-      const row = result.rows[0] as { value: string; serialization: string | null };
-      return { serializedValue: row.value, serialization: row.serialization };
-    } finally {
-      client.release();
+  // Emit one notifying transaction per channel for all pending payloads; drop a channel's batch on failure. Soft-private so tests can drive it.
+  async flushNotifications(): Promise<void> {
+    let hasPending = false;
+    for (const batch of this.pendingNotifications.values()) {
+      if (batch.size > 0) {
+        hasPending = true;
+        break;
+      }
+    }
+    if (!hasPending) {
+      return;
+    }
+    // Grab and clear atomically (no await between), so writes during the flush start the next batch.
+    const batches = this.pendingNotifications;
+    this.pendingNotifications = new Map();
+    // One transaction per channel so an unsendable payload on one channel drops only its own batch.
+    for (const [channel, batch] of batches) {
+      if (batch.size === 0) {
+        continue;
+      }
+      try {
+        // One statement: one round trip, one async-notify queue-lock acquisition; unnest emits one notification per payload.
+        const client = await this.connect();
+        try {
+          await client.query(`SELECT pg_notify($1, p) FROM unnest($2::text[]) AS p`, [channel, Array.from(batch)]);
+        } finally {
+          client.release();
+        }
+      } catch (e) {
+        // Drop the batch (don't requeue) on failure, e.g. a payload over pg_notify's 8000-byte limit; polling still delivers those values.
+        this.logger.warn(`Notifier flush error on ${channel}: ${String(e)}`);
+      }
     }
   }
 
   // ==================== Observability: Workflow Communications ====================
 
-  async getAllEvents(workflowID: string): Promise<Record<string, unknown>> {
-    const client = await this.pool.connect();
-    try {
-      const result = await client.query<{ key: string; value: string; serialization: string | null }>(
-        `SELECT key, value, serialization FROM "${this.schemaName}".workflow_events
-         WHERE workflow_uuid = $1`,
-        [workflowID],
-      );
-      const events: Record<string, unknown> = {};
-      for (const row of result.rows) {
-        events[row.key] = await safeParse(this.serializer, row.value, row.serialization);
-      }
-      return events;
-    } finally {
-      client.release();
-    }
-  }
-
-  async getAllNotifications(
-    workflowID: string,
-  ): Promise<{ topic: string | null; message: unknown; createdAtEpochMs: number; consumed: boolean }[]> {
-    const client = await this.pool.connect();
-    try {
-      const result = await client.query<{
-        topic: string;
-        message: string;
-        serialization: string | null;
-        created_at_epoch_ms: string;
-        consumed: boolean;
-      }>(
-        `SELECT topic, message, serialization, created_at_epoch_ms, consumed
-         FROM "${this.schemaName}".notifications
-         WHERE destination_uuid = $1
-         ORDER BY created_at_epoch_ms`,
-        [workflowID],
-      );
-      return await Promise.all(
-        result.rows.map(async (row) => ({
-          topic: row.topic === this.nullTopic ? null : row.topic,
-          message: await safeParse(this.serializer, row.message, row.serialization),
-          createdAtEpochMs: Number(row.created_at_epoch_ms),
-          consumed: row.consumed,
-        })),
-      );
-    } finally {
-      client.release();
-    }
-  }
-
-  async getAllStreamEntries(workflowID: string): Promise<Record<string, unknown[]>> {
-    const client = await this.pool.connect();
-    try {
-      const result = await client.query<{ key: string; value: string; serialization: string | null }>(
-        `SELECT key, value, serialization FROM "${this.schemaName}".streams
-         WHERE workflow_uuid = $1
-         ORDER BY key, "offset"`,
-        [workflowID],
-      );
-      const streams: Record<string, unknown[]> = {};
-      for (const row of result.rows) {
-        const value = await safeParse(this.serializer, row.value, row.serialization);
-        if (value === DBOS_STREAM_CLOSED_SENTINEL) {
-          continue;
-        }
-        if (!streams[row.key]) {
-          streams[row.key] = [];
-        }
-        streams[row.key].push(value);
-      }
-      return streams;
-    } finally {
-      client.release();
-    }
-  }
-
   // ==================== Queues ====================
   async transitionDelayedWorkflows(): Promise<void> {
-    // Transition workflows from DELAYED to ENQUEUED when their delay has expired
+    // Transition workflows from DELAYED to ENQUEUED when their delay has expired.
+    // For debounced workflows, clear the deduplication ID in the same atomic update: it is a
+    // debounce key held only while DELAYED, so a later same-key debounce starts a fresh workflow.
+    const params: unknown[] = [StatusString.ENQUEUED, Date.now(), StatusString.DELAYED];
+    // Only what this application would dequeue: a peer's debounce key is not ours to clear.
+    const scope = this.appNameFilter('application_name', this.appName, params);
     await this.pool.query(
       `UPDATE "${this.schemaName}".workflow_status
-       SET status = $1, updated_at = $2
-       WHERE status = $3 AND delay_until_epoch_ms <= $2`,
-      [StatusString.ENQUEUED, Date.now(), StatusString.DELAYED],
+       SET status = $1, updated_at = (EXTRACT(EPOCH FROM now()) * 1000)::bigint,
+           deduplication_id = CASE WHEN is_debounced THEN NULL ELSE deduplication_id END
+       WHERE status = $3 AND delay_until_epoch_ms <= $2 AND ${scope}`,
+      params,
     );
   }
 
-  async clearQueueAssignment(workflowID: string): Promise<boolean> {
-    // Reset the status of the task from "PENDING" to "ENQUEUED"
-    const wqRes = await this.pool.query<workflow_status>(
+  /** Cancel up to `limit` of this application's active workflows whose deadline has passed, returning their IDs. */
+  async cancelTimedOutWorkflows(limit: number): Promise<string[]> {
+    const params: unknown[] = [StatusString.CANCELLED, Date.now(), limit];
+    const scope = this.appNameFilter('application_name', this.appName, params);
+    // Literal statuses let the planner match idx_workflow_status_deadline_v2 under any plan mode.
+    // SKIP LOCKED leaves a row a dequeue or a peer's sweep holds for the next sweep.
+    const { rows } = await this.pool.query<{ workflow_uuid: string }>(
       `UPDATE "${this.schemaName}".workflow_status
-        SET started_at_epoch_ms = NULL, status = $2
-        WHERE workflow_uuid = $1 AND queue_name is NOT NULL AND status = $3`,
-      [workflowID, StatusString.ENQUEUED, StatusString.PENDING],
+       SET status = $1, owner_xid = NULL, deduplication_id = NULL, started_at_epoch_ms = NULL,
+           suspend_key = NULL,
+           updated_at = (EXTRACT(EPOCH FROM now()) * 1000)::bigint,
+           completed_at = (EXTRACT(EPOCH FROM now()) * 1000)::bigint
+       WHERE workflow_uuid IN (
+         SELECT workflow_uuid FROM "${this.schemaName}".workflow_status
+         WHERE status IN ('${StatusString.ENQUEUED}', '${StatusString.PENDING}', '${StatusString.DELAYED}', '${StatusString.SUSPENDED}')
+           AND workflow_deadline_epoch_ms IS NOT NULL
+           AND workflow_deadline_epoch_ms <= $2
+           AND ${scope}
+         ORDER BY workflow_deadline_epoch_ms
+         LIMIT $3
+         FOR UPDATE SKIP LOCKED)
+       RETURNING workflow_uuid`,
+      params,
     );
-    // If no rows were affected, the workflow is not anymore in the queue or was already completed
-    return (wqRes.rowCount ?? 0) > 0;
+    return rows.map((r) => r.workflow_uuid);
   }
 
   @dbRetry()
@@ -2516,15 +4470,27 @@ export class SystemDatabase {
 
   @dbRetry()
   async getQueuePartitions(queueName: string): Promise<string[]> {
-    const { rows } = await this.pool.query<{ queue_partition_key: string }>(
-      `SELECT DISTINCT queue_partition_key FROM "${this.schemaName}".workflow_status
-       WHERE queue_name = $1
-         AND status = $2
-         AND queue_partition_key IS NOT NULL`,
-      [queueName, StatusString.ENQUEUED],
+    // Recursive-CTE loose index scan: SELECT DISTINCT would scan every ENQUEUED row, whereas each iteration here is one seek on idx_workflow_status_partition_dequeue_v3, so cost scales with the number of partitions rather than the backlog depth.
+    const params: unknown[] = [queueName, StatusString.ENQUEUED];
+    // Only partitions this application can actually dequeue from.
+    const scope = `${this.scoped(undefined, params)} AND ${this.appNameFilter('application_name', this.appName, params)}`;
+    const { rows } = await this.pool.query<{ pk: string }>(
+      `WITH RECURSIVE partitions AS (
+         (SELECT MIN(queue_partition_key) AS pk
+          FROM "${this.schemaName}".workflow_status
+          WHERE queue_name = $1 AND status = $2 AND queue_partition_key IS NOT NULL AND ${scope})
+         UNION ALL
+         (SELECT (SELECT MIN(queue_partition_key)
+                  FROM "${this.schemaName}".workflow_status
+                  WHERE queue_name = $1 AND status = $2 AND queue_partition_key > partitions.pk AND ${scope})
+          FROM partitions
+          WHERE partitions.pk IS NOT NULL)
+       )
+       SELECT pk FROM partitions WHERE pk IS NOT NULL`,
+      params,
     );
 
-    return rows.map((row) => row.queue_partition_key);
+    return rows.map((row) => row.pk);
   }
 
   async findAndMarkStartableWorkflows(
@@ -2532,105 +4498,207 @@ export class SystemDatabase {
     executorID: string,
     appVersion: string,
     queuePartitionKey?: string,
+    localRunningCount: number = 0,
+    partitionLocalRunningCount: number = 0,
+    // Written to every claimed row: the dispatches of this claim own their executions.
+    ownerXid: string | null = null,
+    isLatestVersion?: boolean,
   ): Promise<string[]> {
-    const startTimeMs = Date.now();
-    const limiterPeriodMS = queue.rateLimit ? queue.rateLimit.periodSec * 1000 : 0;
-    const claimedIDs: string[] = [];
-    const localRunningForQueue = this.countRunningWorkflowsForQueue(queue.name, queuePartitionKey);
+    const { claimedIDs } = await this.claimStartableWorkflows(
+      queue,
+      executorID,
+      appVersion,
+      queuePartitionKey,
+      localRunningCount,
+      partitionLocalRunningCount,
+      ownerXid,
+      isLatestVersion,
+    );
+    return claimedIDs;
+  }
 
-    // Build partition key filter
-    let partitionFilter = '';
-    const partitionParams: string[] = [];
-    if (queuePartitionKey !== undefined) {
-      partitionFilter = `AND queue_partition_key = $PARTITION`;
-      partitionParams.push(queuePartitionKey);
+  /** Claim this queue's next workflows, plus the limit that left no room to claim any (undefined if every limit had room). */
+  async claimStartableWorkflows(
+    queue: WorkflowQueue,
+    executorID: string,
+    appVersion: string,
+    queuePartitionKey?: string,
+    localRunningCount: number = 0,
+    partitionLocalRunningCount: number = 0,
+    ownerXid: string | null = null,
+    isLatestVersion?: boolean,
+  ): Promise<{ claimedIDs: string[]; stopReason?: DequeueStopReason }> {
+    // Bound rather than now() in the deadline CASE, which Citus refuses for a non-immutable function.
+    const startTimeMs = Date.now();
+    const claimedIDs: string[] = [];
+    const partitionParams: string[] = queuePartitionKey !== undefined ? [queuePartitionKey] : [];
+    // Shares a concurrency or rate limit budget with other executors.
+    const hasSharedBudget =
+      queue.concurrency !== undefined ||
+      queue.partitionConcurrency !== undefined ||
+      queue.rateLimit !== undefined ||
+      queue.partitionRateLimit !== undefined;
+    // Shares that budget across partitions too, so sweeps of different partitions read disjoint rows and could each spend it: lock the whole queue.
+    const hasWriteSkew =
+      queuePartitionKey !== undefined && (queue.concurrency !== undefined || queue.rateLimit !== undefined);
+
+    // Compute maxTasks, the number of workflows startable under every flow control limit on this queue.
+    let maxTasks = Infinity;
+
+    // The first limit found with no room, which the caller reads as why nothing was claimed.
+    let stopReason: DequeueStopReason | undefined = undefined;
+    const limit = (room: number, reason: DequeueStopReason) => {
+      maxTasks = Math.min(maxTasks, room);
+      if (maxTasks <= 0) stopReason ??= reason;
+    };
+
+    // This worker's own limits need no database, so a full worker returns before taking the claim lock a peer could use.
+    if (queue.workerConcurrency !== undefined) {
+      // Use the in-memory registry for this worker's running count — avoids a DB round trip.
+      limit(Math.max(0, queue.workerConcurrency - localRunningCount), 'worker_concurrency');
+    }
+    if (queue.partitionWorkerConcurrency !== undefined) {
+      limit(Math.max(0, queue.partitionWorkerConcurrency - partitionLocalRunningCount), 'partition_worker_concurrency');
+    }
+    if (maxTasks <= 0) {
+      return { claimedIDs, stopReason };
     }
 
-    const client = await this.pool.connect();
+    // A sharded database keeps the version row under another key, which the claim's transaction cannot span.
+    if (isLatestVersion === undefined && this.sharded) {
+      isLatestVersion = await this.isLatestVersion(appVersion);
+    }
+    // Row locks only collide when claimers see the same queue head, so serialize claims on the budget's scope; CockroachDB has no advisory locks before 26.3.
+    const useClaimLock = hasSharedBudget && (this.sharded || !(await this.#isCockroach()));
+
+    const client = await this.connect();
     try {
-      // Default to READ COMMITTED except with global concurrency limits or rate limits
-      if (queue.concurrency !== undefined || queue.rateLimit !== undefined) {
-        await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+      if (useClaimLock) {
+        await client.query('BEGIN');
+        const lockParams: unknown[] = [];
+        const { rows } = await client.query<{ acquired: boolean }>(
+          this.claimLockQuery(queue.name, hasWriteSkew ? undefined : queuePartitionKey, lockParams),
+          lockParams,
+        );
+        if (rows[0]?.acquired !== true) {
+          await client.query('COMMIT');
+          // Another worker is claiming from this scope, so it still has work; the next poll retries.
+          return rows.length > 0 ? { claimedIDs, stopReason: 'claim_lock' } : { claimedIDs };
+        }
+      } else if (hasSharedBudget) {
+        // CockroachDB, without advisory locks before 26.3: SERIALIZABLE aborts claimers that spend the same budget.
+        await client.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
       } else {
         await client.query('BEGIN');
       }
 
-      // If there is a rate limit, compute how many functions have started in its period.
-      let numRecentQueries = 0;
-      if (queue.rateLimit) {
-        const params = [
-          queue.name,
-          StatusString.ENQUEUED,
-          StatusString.DELAYED,
-          startTimeMs - limiterPeriodMS,
-          ...partitionParams,
-        ];
-        const countResult = await client.query<{ count: string }>(
+      /** Slots left in a rate limit's rolling window, at the scope that limit applies to. */
+      const rateLimitRemaining = async (rateLimit: QueueRateLimit, partitionScoped: boolean): Promise<number> => {
+        const params: unknown[] = [queue.name, StatusString.ENQUEUED, StatusString.DELAYED, rateLimit.periodSec * 1000];
+        // Count only what this application would dequeue, matching the select below.
+        const scope = `${this.scoped(undefined, params)} AND ${this.appNameFilter('application_name', this.appName, params)}`;
+        const partitionFilter = partitionScoped ? `AND queue_partition_key = $${params.push(queuePartitionKey)}` : '';
+        const { rows } = await client.query<{ count: string }>(
           `SELECT COUNT(*) FROM "${this.schemaName}".workflow_status
            WHERE queue_name = $1
              AND rate_limited = TRUE
              AND status NOT IN ($2, $3)
-             AND started_at_epoch_ms > $4
-             ${partitionFilter.replace('$PARTITION', '$5')}`,
+             -- Database clock on both sides, as the claim stamps started_at_epoch_ms with it.
+             AND started_at_epoch_ms > (EXTRACT(epoch FROM now()) * 1000)::bigint - $4
+             AND ${scope}
+             ${partitionFilter}`,
           params,
         );
-        numRecentQueries = Number(countResult.rows[0].count);
-        if (numRecentQueries >= queue.rateLimit.limitPerPeriod) {
+        return rateLimit.limitPerPeriod - Number(rows[0].count);
+      };
+
+      /**
+       * Workflows already running, which peer workers count against too. Kept as its own query per
+       * scope: the partition-scoped predicate rides idx_workflow_status_partition_dequeue_v3, which
+       * a queue-wide scan loses.
+       */
+      const pendingCount = async (partitionScoped: boolean): Promise<number> => {
+        const params: unknown[] = [queue.name, StatusString.PENDING];
+        const scope = `${this.scoped(undefined, params)} AND ${this.appNameFilter('application_name', this.appName, params)}`;
+        const partitionFilter = partitionScoped ? `AND queue_partition_key = $${params.push(queuePartitionKey)}` : '';
+        const { rows } = await client.query<{ count: string }>(
+          `SELECT COUNT(*) FROM "${this.schemaName}".workflow_status
+           WHERE queue_name = $1 AND status = $2 AND ${scope} ${partitionFilter}`,
+          params,
+        );
+        return Number(rows[0]?.count ?? 0);
+      };
+
+      if (queue.rateLimit !== undefined) {
+        // Bound the claim by the limiter's remaining slots so a backlogged queue locks only what it can start.
+        limit(await rateLimitRemaining(queue.rateLimit, false), 'limiter');
+        if (maxTasks <= 0) {
           await client.query('COMMIT');
-          return claimedIDs;
+          return { claimedIDs, stopReason };
         }
       }
-
-      // Dequeue functions eligible for this worker and ordered by the time at which they were enqueued.
-      // If there is a global or local concurrency limit N, select only the N oldest enqueued
-      // functions, else select all of them.
-
-      let maxTasks = Infinity;
-
-      if (queue.workerConcurrency !== undefined) {
-        // Use the in-memory registry for this worker's running count — avoids a DB round trip.
-        maxTasks = Math.max(0, queue.workerConcurrency - localRunningForQueue);
+      if (queue.partitionRateLimit !== undefined) {
+        limit(await rateLimitRemaining(queue.partitionRateLimit, true), 'partition_limiter');
+      }
+      if (maxTasks <= 0) {
+        await client.query('COMMIT');
+        return { claimedIDs, stopReason };
       }
 
       if (queue.concurrency !== undefined) {
         // Global concurrency still requires a DB query since other workers may be running workflows too.
-        const params = [queue.name, StatusString.PENDING, ...partitionParams];
-        const runningTasksResult = await client.query<{ task_count: string }>(
-          `SELECT COUNT(*) as task_count
-           FROM "${this.schemaName}".workflow_status
-           WHERE queue_name = $1 AND status = $2
-             ${partitionFilter.replace('$PARTITION', '$3')}`,
-          params,
-        );
-        const totalRunningTasks = Number(runningTasksResult.rows[0]?.task_count ?? 0);
+        const totalRunningTasks = await pendingCount(false);
         if (totalRunningTasks > queue.concurrency) {
           this.logger.warn(
             `Total running tasks (${totalRunningTasks}) exceeds the global concurrency limit (${queue.concurrency})`,
           );
         }
-        const availableTasks = Math.max(0, queue.concurrency - totalRunningTasks);
-        maxTasks = Math.min(maxTasks, availableTasks);
+        limit(Math.max(0, queue.concurrency - totalRunningTasks), 'concurrency');
+        if (maxTasks <= 0) {
+          await client.query('COMMIT');
+          return { claimedIDs, stopReason };
+        }
       }
-
+      if (queue.partitionConcurrency !== undefined) {
+        const partitionRunningTasks = await pendingCount(true);
+        if (partitionRunningTasks > queue.partitionConcurrency) {
+          this.logger.warn(
+            `Total running tasks (${partitionRunningTasks}) on partition ${queuePartitionKey} of queue ${queue.name} exceeds the partition concurrency limit (${queue.partitionConcurrency})`,
+          );
+        }
+        limit(Math.max(0, queue.partitionConcurrency - partitionRunningTasks), 'partition_concurrency');
+      }
       // Return immediately if there are no available tasks due to flow control limits
       if (maxTasks <= 0) {
         await client.query('COMMIT');
-        return claimedIDs;
+        return { claimedIDs, stopReason };
       }
 
       // Retrieve the first max_tasks workflows in the queue.
-      // Only retrieve workflows of the local version (or without version set)
-      const lockMode = queue.concurrency ? 'FOR UPDATE NOWAIT' : 'FOR UPDATE SKIP LOCKED';
+      isLatestVersion ??= await this.isLatestVersion(appVersion, client);
+      const versionClause = isLatestVersion
+        ? '(application_version = $3 OR application_version IS NULL)'
+        : 'application_version = $3';
+
+      // A limit shared across processes needs a consistent view of the table: NOWAIT makes an
+      // overlapping dequeuer abort rather than claim the next rows and spend the same budget twice.
+      const lockMode = hasSharedBudget ? 'FOR UPDATE NOWAIT' : 'FOR UPDATE SKIP LOCKED';
       const limitClause = maxTasks !== Infinity ? `LIMIT ${maxTasks}` : '';
 
-      const selectParams = [StatusString.ENQUEUED, queue.name, appVersion, ...partitionParams];
+      const selectParams: unknown[] = [StatusString.ENQUEUED, queue.name, appVersion, ...partitionParams];
+      const selectScope = this.appNameFilter('application_name', this.appName, selectParams);
+      const keyScope = this.scoped(undefined, selectParams);
+      const claimGate = this.claimGate(queue.name, queuePartitionKey, selectParams);
       const selectQuery = `
         SELECT workflow_uuid
         FROM "${this.schemaName}".workflow_status
-        WHERE status = $1
+        WHERE ${keyScope}
+          AND status = $1
           AND queue_name = $2
-          AND (application_version IS NULL OR application_version = $3)
-          ${partitionFilter.replace('$PARTITION', '$4')}
+          AND ${versionClause}
+          AND ${selectScope}
+          AND ${claimGate}
+          ${queuePartitionKey !== undefined ? 'AND queue_partition_key = $4' : ''}
         ORDER BY priority ASC, created_at ASC
         ${limitClause}
         ${lockMode}
@@ -2643,41 +4711,50 @@ export class SystemDatabase {
 
       // Start the workflows
       const workflowIDs = rows.map((row) => row.workflow_uuid);
-      for (const id of workflowIDs) {
-        // If we have a rate limit, stop starting functions when the number
-        //   of functions started this period exceeds the limit.
-        if (queue.rateLimit && claimedIDs.length + numRecentQueries >= queue.rateLimit.limitPerPeriod) {
-          break;
-        }
-
+      if (workflowIDs.length > 0) {
         // Start the functions by marking them as pending and updating their executor IDs.
-        // Only claim the workflow if the UPDATE actually transitioned an ENQUEUED row —
-        // otherwise another worker won the race and we must not re-dispatch it.
-        const updateRes = await client.query(
+        const updateParams: unknown[] = [
+          StatusString.PENDING,
+          executorID,
+          appVersion,
+          queue.rateLimit !== undefined || queue.partitionRateLimit !== undefined,
+          StatusString.ENQUEUED,
+          // Claim an unclaimed row for this application; a nameless dequeuer leaves ownership untouched.
+          this.appName ?? null,
+          ownerXid,
+          startTimeMs,
+        ];
+        const claimedIDsFilter = this.wfIn(undefined, workflowIDs, updateParams);
+        // Re-check ownership alongside status, as the partitioned claim guard does.
+        const claimScope = this.appNameFilter('application_name', this.appName, updateParams);
+        // RETURNING reports exactly the rows this statement flipped, so a row another worker won is absent.
+        const flippedResult = await client.query<{ workflow_uuid: string }>(
           `UPDATE "${this.schemaName}".workflow_status
            SET status = $1,
+               owner_xid = $7,
                executor_id = $2,
                application_version = $3,
-               started_at_epoch_ms = $4,
-               rate_limited = $5,
+               started_at_epoch_ms = (EXTRACT(epoch FROM now()) * 1000)::bigint,
+               rate_limited = $4,
+               application_name = COALESCE(application_name, $6),
+               recovery_attempts = recovery_attempts + 1,
+               updated_at = (EXTRACT(epoch FROM now()) * 1000)::bigint,
                workflow_deadline_epoch_ms = CASE
-                 WHEN workflow_timeout_ms IS NOT NULL AND workflow_deadline_epoch_ms IS NULL
-                 THEN (EXTRACT(epoch FROM now()) * 1000)::bigint + workflow_timeout_ms
+                 WHEN workflow_timeout_ms IS NOT NULL AND workflow_deadline_epoch_ms IS NULL THEN
+                   CASE
+                     WHEN workflow_timeout_ms > 9223372036854775807 - $8::bigint
+                     THEN 9223372036854775807
+                     ELSE $8::bigint + workflow_timeout_ms
+                   END
                  ELSE workflow_deadline_epoch_ms
                END
-           WHERE workflow_uuid = $6 AND status = $7`,
-          [
-            StatusString.PENDING,
-            executorID,
-            appVersion,
-            startTimeMs,
-            queue.rateLimit !== undefined,
-            id,
-            StatusString.ENQUEUED,
-          ],
+           WHERE ${claimedIDsFilter} AND status = $5 AND ${claimScope}
+           RETURNING workflow_uuid`,
+          updateParams,
         );
-        if ((updateRes.rowCount ?? 0) > 0) {
-          claimedIDs.push(id);
+        const flippedIDs = new Set(flippedResult.rows.map((row) => row.workflow_uuid));
+        for (const id of workflowIDs) {
+          if (flippedIDs.has(id)) claimedIDs.push(id);
         }
       }
 
@@ -2690,11 +4767,265 @@ export class SystemDatabase {
     }
 
     // Return the IDs of all functions we marked started
-    return claimedIDs;
+    return { claimedIDs };
+  }
+
+  /** Max heads admitted per sweep: bounds dispatch, not the partition walk; an unconstrained sweep takes the lowest keys, so higher keys can wait under sustained load. */
+  partitionedDequeueSweepCap: number = 8192;
+
+  /** Max partitions a sweep claims per transaction, which bounds the locks it holds at once and for how long. */
+  partitionedDequeueBatchSize: number = 64;
+
+  /** Dequeue each partition's head-of-line workflow, at most {@link partitionedDequeueSweepCap} per sweep in transactions of {@link partitionedDequeueBatchSize}; only valid for partition-concurrency-1 queues with no queue-wide limit. */
+  async findAndMarkStartablePartitionedWorkflows(
+    queue: WorkflowQueue,
+    executorID: string,
+    appVersion: string,
+    maxTasks: number = Infinity,
+    // Written to every claimed row: the dispatches of this claim own their executions.
+    ownerXid: string | null = null,
+    isLatestVersion?: boolean,
+  ): Promise<string[]> {
+    // Bound rather than now() in the deadline CASE, which Citus refuses for a non-immutable function.
+    const startTimeMs = Date.now();
+    if (
+      queue.partitionConcurrency !== 1 ||
+      queue.concurrency !== undefined ||
+      queue.rateLimit !== undefined ||
+      queue.partitionRateLimit !== undefined
+    ) {
+      throw new DBOSError(
+        `Batched partitioned dequeue requires a queue with partition concurrency 1 and no queue-wide concurrency or rate limit: ${queue.name}`,
+      );
+    }
+    // partitionWorkerConcurrency needs no handling here: it cannot exceed partition concurrency 1, which the PENDING gate already enforces globally.
+
+    // A sharded database keeps the version row under another key, which the claim's transaction cannot span.
+    if (isLatestVersion === undefined && this.sharded) {
+      isLatestVersion = await this.isLatestVersion(appVersion);
+    }
+    // Sweeps whose heads differ lock disjoint rows, so a claim also takes its partition's lock; CockroachDB, without advisory locks before 26.3, relies on its SERIALIZABLE default.
+    const usePartitionLocks = this.sharded || !(await this.#isCockroach());
+    const client = await this.connect();
+    try {
+      isLatestVersion ??= await this.isLatestVersion(appVersion, client);
+      const versionClause = (n: number) =>
+        isLatestVersion
+          ? `(application_version = $${n} OR application_version IS NULL)`
+          : `application_version = $${n}`;
+      // The partition's head: $1 queue, $2 ENQUEUED, `version` the app version, `pk` the partition key expression.
+      const headOf = (pk: string, version: number, scope: string) =>
+        `SELECT workflow_uuid
+           FROM "${this.schemaName}".workflow_status
+           WHERE queue_name = $1 AND status = $2
+             AND queue_partition_key = ${pk}
+             AND ${versionClause(version)}
+             AND ${scope}
+           -- workflow_uuid totalizes the head order (same head for every worker under created_at ties) and the index's trailing workflow_uuid keeps this a pure top-1 probe.
+           ORDER BY priority ASC, created_at ASC, workflow_uuid ASC
+           LIMIT 1`;
+      // No application filter by design: a mutual-exclusion probe must block on any owner's row.
+      const noPending = (pk: string, pending: number, scope: string) =>
+        `NOT EXISTS (
+           SELECT 1
+           FROM "${this.schemaName}".workflow_status
+           WHERE ${scope} AND queue_name = $1 AND status = $${pending}
+             AND queue_partition_key IS NOT NULL AND queue_partition_key = ${pk}
+         )`;
+
+      // This worker's own budget bounds the sweep alongside the cap.
+      const sweepLimit = Math.min(this.partitionedDequeueSweepCap, maxTasks);
+      // When the worker's budget is the binding constraint, probe partitions in random order to prevent starvation.
+      const sweepOrder = sweepLimit < this.partitionedDequeueSweepCap ? 'random()' : 'partitions.pk ASC';
+      const candidateParams: unknown[] = [
+        queue.name,
+        StatusString.ENQUEUED,
+        appVersion,
+        StatusString.PENDING,
+        sweepLimit,
+      ];
+      const candidateScope = `${this.scoped(undefined, candidateParams)} AND ${this.appNameFilter('application_name', this.appName, candidateParams)}`;
+      const probeScope = this.scoped(undefined, candidateParams);
+
+      // Walk distinct partition keys with a recursive-CTE loose index scan (one seek per key, mirroring getQueuePartitions) so sweep cost scales with partition count, not backlog depth.
+      // The walk takes no lock: each batch below picks its heads again under its partitions' locks.
+      const candidateResult = await client.query<{ pk: string }>(
+        `WITH RECURSIVE partitions AS (
+           (SELECT MIN(queue_partition_key) AS pk
+            FROM "${this.schemaName}".workflow_status
+            WHERE queue_name = $1 AND status = $2 AND queue_partition_key IS NOT NULL AND ${candidateScope})
+           UNION ALL
+           (SELECT (SELECT MIN(queue_partition_key)
+                    FROM "${this.schemaName}".workflow_status
+                    WHERE queue_name = $1 AND status = $2 AND queue_partition_key > partitions.pk AND ${candidateScope})
+            FROM partitions
+            WHERE partitions.pk IS NOT NULL)
+         )
+         , chosen AS (
+           SELECT partitions.pk
+           FROM partitions
+           WHERE partitions.pk IS NOT NULL
+             AND ${noPending('partitions.pk', 4, probeScope)}
+           ORDER BY ${sweepOrder}
+           LIMIT $5
+         )
+         SELECT chosen.pk
+         FROM chosen
+         -- Only partitions with a head this worker may run; LATERAL plans as a tight nested loop.
+         JOIN LATERAL (${headOf('chosen.pk', 3, candidateScope)}) head ON TRUE
+         -- Which partitions were chosen is settled above; order them so the claim, and the dispatch it feeds, are deterministic.
+         ORDER BY chosen.pk ASC`,
+        candidateParams,
+      );
+      const partitionKeys = candidateResult.rows.map((row) => row.pk);
+
+      // Re-check queue/partition/version alongside status so a row resumeWorkflows moved to another queue mid-sweep is dropped, not hijacked.
+      const claimGuard = (ids: string, status: number, name: number, version: number, scope: string) =>
+        `${ids}
+           AND status = $${status}
+           AND queue_name = $${name}
+           AND queue_partition_key IS NOT NULL
+           AND ${versionClause(version)}
+           AND ${scope}`;
+
+      /** Claim the heads of these partitions inside the open transaction, returning the IDs it marked PENDING. */
+      const claimBatch = async (batch: string[]): Promise<string[]> => {
+        let heldPks = batch;
+        if (usePartitionLocks) {
+          await debugTriggerPoint(DEBUG_TRIGGER_PARTITIONED_DEQUEUE_BEFORE_LOCKS);
+          const lockParams: unknown[] = [];
+          const { rows } = await client.query<{ held: string[] }>(
+            this.partitionLockQuery(queue.name, batch, lockParams),
+            lockParams,
+          );
+          // Partitions another sweep holds are left to it, or to the next poll.
+          heldPks = rows[0]?.held ?? [];
+          if (heldPks.length === 0) return [];
+        }
+
+        // Pick the heads again under the locks, so a previous holder's claims and any newly visible head are seen.
+        const headParams: unknown[] = [queue.name, StatusString.ENQUEUED, appVersion, StatusString.PENDING];
+        const headScope = `${this.scoped(undefined, headParams)} AND ${this.appNameFilter('application_name', this.appName, headParams)}`;
+        const headProbeScope = this.scoped(undefined, headParams);
+        headParams.push(heldPks);
+        const headResult = await client.query<{ workflow_uuid: string }>(
+          `SELECT head.workflow_uuid
+           FROM unnest($${headParams.length}::text[]) AS chosen(pk)
+           JOIN LATERAL (${headOf('chosen.pk', 3, headScope)}) head ON TRUE
+           WHERE ${noPending('chosen.pk', 4, headProbeScope)}
+           ORDER BY chosen.pk ASC`,
+          headParams,
+        );
+        const candidateIDs = headResult.rows.map((row) => row.workflow_uuid);
+        if (candidateIDs.length === 0) return [];
+        await debugTriggerPoint(DEBUG_TRIGGER_PARTITIONED_DEQUEUE_AFTER_CANDIDATES);
+
+        const lockedParams: unknown[] = [StatusString.ENQUEUED, queue.name, appVersion];
+        const lockedIDsFilter = this.wfIn(undefined, candidateIDs, lockedParams);
+        const lockedScope = this.appNameFilter('application_name', this.appName, lockedParams);
+        // Lock the fixed candidate set — never a LIMIT query, whose SKIP LOCKED could slide past a locked head and admit out of order.
+        const lockedResult = await client.query<{ workflow_uuid: string }>(
+          `SELECT workflow_uuid
+           FROM "${this.schemaName}".workflow_status
+           WHERE ${claimGuard(lockedIDsFilter, 1, 2, 3, lockedScope)}
+           FOR UPDATE SKIP LOCKED`,
+          lockedParams,
+        );
+        const lockedIDs = new Set(lockedResult.rows.map((row) => row.workflow_uuid));
+        // Preserve partition order for submission.
+        const claimIDs = candidateIDs.filter((id) => lockedIDs.has(id));
+        if (claimIDs.length === 0) return [];
+
+        const flipParams: unknown[] = [
+          StatusString.PENDING,
+          executorID,
+          StatusString.ENQUEUED,
+          queue.name,
+          appVersion,
+          // Claim the row, as the unpartitioned dequeue does.
+          this.appName ?? null,
+          ownerXid,
+          startTimeMs,
+        ];
+        const flipIDsFilter = this.wfIn(undefined, claimIDs, flipParams);
+        const flipScope = this.appNameFilter('application_name', this.appName, flipParams);
+        // Start the workflows by marking them PENDING; RETURNING reports exactly the rows this statement flipped.
+        const flippedResult = await client.query<{ workflow_uuid: string }>(
+          `UPDATE "${this.schemaName}".workflow_status
+           SET status = $1,
+               owner_xid = $7,
+               executor_id = $2,
+               application_version = $5,
+               started_at_epoch_ms = (EXTRACT(epoch FROM now()) * 1000)::bigint,
+               rate_limited = FALSE,
+               application_name = COALESCE(application_name, $6),
+               recovery_attempts = recovery_attempts + 1,
+               updated_at = (EXTRACT(epoch FROM now()) * 1000)::bigint,
+               workflow_deadline_epoch_ms = CASE
+                 WHEN workflow_timeout_ms IS NOT NULL AND workflow_deadline_epoch_ms IS NULL THEN
+                   CASE
+                     WHEN workflow_timeout_ms > 9223372036854775807 - $8::bigint
+                     THEN 9223372036854775807
+                     ELSE $8::bigint + workflow_timeout_ms
+                   END
+                 ELSE workflow_deadline_epoch_ms
+               END
+           WHERE ${claimGuard(flipIDsFilter, 3, 4, 5, flipScope)}
+           RETURNING workflow_uuid`,
+          flipParams,
+        );
+        const flippedIDs = new Set(flippedResult.rows.map((row) => row.workflow_uuid));
+        return claimIDs.filter((id) => flippedIDs.has(id));
+      };
+
+      // One short transaction per batch, so a sweep holds at most a batch's locks, and only while it claims that batch.
+      const claimedIDs: string[] = [];
+      for (let start = 0; start < partitionKeys.length; start += this.partitionedDequeueBatchSize) {
+        const batch = partitionKeys.slice(start, start + this.partitionedDequeueBatchSize);
+        try {
+          await client.query('BEGIN');
+          const batchIDs = await claimBatch(batch);
+          await client.query('COMMIT');
+          claimedIDs.push(...batchIDs);
+        } catch (error) {
+          // Swallowed: a rollback failure must not mask why we are rolling back.
+          await client.query('ROLLBACK').catch(() => undefined);
+          // Earlier batches committed their claims, which must still reach dispatch; the next poll retries the rest.
+          if (claimedIDs.length === 0) throw error;
+          this.logger.warn(
+            `[${queue.name}] stopping a partitioned sweep after ${claimedIDs.length} claim(s): ${String(error)}`,
+          );
+          break;
+        }
+      }
+      if (claimedIDs.length > 0) {
+        this.logger.debug(`[${queue.name}] dequeueing ${claimedIDs.length} task(s)`);
+      }
+      return claimedIDs;
+    } finally {
+      client.release();
+    }
   }
 
   // ==================== Queries & Maintenance ====================
-  async listWorkflows(input: GetWorkflowsInput): Promise<WorkflowStatusInternal[]> {
+  /** With `keyedIDs`, the listed workflow IDs are addressed by their shard keys, as a batch read of known workflows. */
+  @dbRetry()
+  async listWorkflows(
+    input: GetWorkflowsInput,
+    options: { keyedIDs?: boolean } = {},
+  ): Promise<WorkflowStatusInternal[]> {
+    return await this.#listWorkflows(input, options);
+  }
+
+  /**
+   * Unretried body of {@link listWorkflows}. An ID-keyed read runs on `client` when given, so a caller
+   * holding a transaction never waits on a second pool connection; the caller owns the retry.
+   */
+  async #listWorkflows(
+    input: GetWorkflowsInput,
+    options: { keyedIDs?: boolean } = {},
+    client?: PoolClient,
+  ): Promise<WorkflowStatusInternal[]> {
     const schemaName = this.schemaName;
     const selectColumns = [
       'workflow_uuid',
@@ -2723,21 +5054,37 @@ export class SystemDatabase {
       'parent_workflow_id',
       'delay_until_epoch_ms',
       'completed_at',
+      'attributes',
+      'schedule_name',
+      'debounce_deadline_epoch_ms',
+      'is_debounced',
+      'application_name',
     ];
 
     input.loadInput = input.loadInput ?? true;
     input.loadOutput = input.loadOutput ?? true;
+    // Only join the payload table the caller actually asked for.
+    const payloadColumns: string[] = [];
+    const payloadJoins: string[] = [];
     if (input.loadInput) {
-      selectColumns.push('inputs', 'request');
+      payloadColumns.push('COALESCE(wi.inputs, workflow_status.inputs) AS inputs');
+      payloadJoins.push(`LEFT JOIN "${schemaName}".workflow_input wi ON ${this.wfJoin('wi', 'workflow_status')}`);
     }
 
     if (input.loadOutput) {
-      selectColumns.push('output', 'error');
+      payloadColumns.push('COALESCE(wo.output, workflow_status.output) AS output');
+      payloadColumns.push('COALESCE(wo.error, workflow_status.error) AS error');
+      payloadJoins.push(`LEFT JOIN "${schemaName}".workflow_output wo ON ${this.wfJoin('wo', 'workflow_status')}`);
     }
 
     if (input.loadInput || input.loadOutput) {
       selectColumns.push('serialization');
     }
+    const keyColumns: string[] = [];
+    const keyColumn = this.keyColumn('workflow_status');
+    if (keyColumn !== undefined) keyColumns.push(`${keyColumn} AS shard_key`);
+    const parentKeyColumn = this.keyColumn('workflow_status', 'parent_shard_key');
+    if (parentKeyColumn !== undefined) keyColumns.push(`${parentKeyColumn} AS parent_shard_key`);
 
     input.sortDesc = input.sortDesc ?? false; // By default, sort in ascending order
 
@@ -2765,29 +5112,59 @@ export class SystemDatabase {
     // If queuesOnly, filter for queued workflows
     if (input.queuesOnly) {
       whereClauses.push(`queue_name IS NOT NULL`);
-      whereClauses.push(`status IN ($${paramCounter}, $${paramCounter + 1}, $${paramCounter + 2})`);
-      params.push(StatusString.ENQUEUED, StatusString.PENDING, StatusString.DELAYED);
-      paramCounter += 3;
+      whereClauses.push(
+        `status IN ($${paramCounter}, $${paramCounter + 1}, $${paramCounter + 2}, $${paramCounter + 3})`,
+      );
+      params.push(StatusString.ENQUEUED, StatusString.PENDING, StatusString.DELAYED, StatusString.SUSPENDED);
+      paramCounter += 4;
     }
 
     addFilter('name', input.workflowName);
     addFilter('queue_name', input.queueName);
+    addFilter('schedule_name', input.scheduleName);
+
+    // A workflow ID is a global address, so an ID-keyed read is an identity read: it takes an
+    // explicit filter but is never defaulted to this one. Otherwise unset scopes to this
+    // application, as on every other observability query.
+    // Falsy, not just undefined: a Conductor request carries an omitted list as JSON null.
+    const idKeyed = (input.workflowIDs?.length ?? 0) > 0;
+    if (client && !idKeyed) throw new TypeError('listWorkflows takes a client only for an ID-keyed read');
+    whereClauses.push(
+      idKeyed
+        ? this.appNameFilter('application_name', input.applicationName, params)
+        : this.observabilityFilter('application_name', input.applicationName, params),
+    );
+    // An empty key list matches nothing, rather than every key.
+    if (input.shardKey !== undefined && input.shardKey !== null) {
+      const keys = Array.isArray(input.shardKey) ? input.shardKey : [input.shardKey];
+      whereClauses.push(this.keyIn('workflow_status', keys, params));
+    }
+    if (input.parentShardKey !== undefined && input.parentShardKey !== null) {
+      const keys = Array.isArray(input.parentShardKey) ? input.parentShardKey : [input.parentShardKey];
+      whereClauses.push(this.keyIn('workflow_status', keys, params, 'parent_shard_key'));
+    }
+    if (options.keyedIDs && input.workflowIDs) {
+      whereClauses.push(this.wfIn('workflow_status', input.workflowIDs, params));
+    }
+    paramCounter = params.length + 1;
 
     if (input.workflow_id_prefix) {
       if (Array.isArray(input.workflow_id_prefix)) {
-        const likeClauses = input.workflow_id_prefix.map((_, i) => `workflow_uuid LIKE $${paramCounter + i}`);
+        const likeClauses = input.workflow_id_prefix.map(
+          (_, i) => `workflow_status.workflow_uuid LIKE $${paramCounter + i}`,
+        );
         whereClauses.push(`(${likeClauses.join(' OR ')})`);
         params.push(...input.workflow_id_prefix.map((p) => `${p}%`));
         paramCounter += input.workflow_id_prefix.length;
       } else {
-        whereClauses.push(`workflow_uuid LIKE $${paramCounter}`);
+        whereClauses.push(`workflow_status.workflow_uuid LIKE $${paramCounter}`);
         params.push(`${input.workflow_id_prefix}%`);
         paramCounter++;
       }
     }
-    if (input.workflowIDs) {
+    if (input.workflowIDs && !options.keyedIDs) {
       const placeholders = input.workflowIDs.map((_, i) => `$${paramCounter + i}`).join(', ');
-      whereClauses.push(`workflow_uuid IN (${placeholders})`);
+      whereClauses.push(`workflow_status.workflow_uuid IN (${placeholders})`);
       params.push(...input.workflowIDs);
       paramCounter += input.workflowIDs.length;
     }
@@ -2802,12 +5179,25 @@ export class SystemDatabase {
       paramCounter++;
     }
 
+    // Matches the forks themselves, as opposed to wasForkedFrom, which matches the workflows they were forked from.
+    if (input.isFork !== undefined) {
+      whereClauses.push(input.isFork ? `forked_from IS NOT NULL` : `forked_from IS NULL`);
+    }
+
     if (input.hasParent !== undefined) {
       if (input.hasParent) {
         whereClauses.push(`parent_workflow_id IS NOT NULL`);
       } else {
         whereClauses.push(`parent_workflow_id IS NULL`);
       }
+    }
+
+    // Match workflows whose attributes JSONB contains all the given key-value pairs.
+    // The `@>` containment operator is served by the GIN index on the attributes column.
+    if (input.attributes && Object.keys(input.attributes).length > 0) {
+      whereClauses.push(`attributes @> $${paramCounter}::jsonb`);
+      params.push(JSON.stringify(input.attributes));
+      paramCounter++;
     }
 
     if (input.startTime) {
@@ -2849,407 +5239,83 @@ export class SystemDatabase {
 
     const whereClause = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
     const orderClause = `ORDER BY created_at ${input.sortDesc ? 'DESC' : 'ASC'}`;
-    const limitClause = input.limit ? `LIMIT ${input.limit}` : '';
-    const offsetClause = input.offset ? `OFFSET ${input.offset}` : '';
+    let limitClause = '';
+    if (input.limit) {
+      limitClause = `LIMIT $${paramCounter}`;
+      params.push(input.limit);
+      paramCounter++;
+    }
+    let offsetClause = '';
+    if (input.offset) {
+      offsetClause = `OFFSET $${paramCounter}`;
+      params.push(input.offset);
+      paramCounter++;
+    }
 
+    const projection = [...selectColumns.map((c) => `workflow_status.${c}`), ...payloadColumns, ...keyColumns].join(
+      ', ',
+    );
     const query = `
-      SELECT ${selectColumns.join(', ')}
+      SELECT ${projection}
       FROM "${schemaName}".workflow_status
+      ${payloadJoins.join('\n      ')}
       ${whereClause}
       ${orderClause}
       ${limitClause}
       ${offsetClause}
     `;
 
-    const result = await this.pool.query<workflow_status>(query, params);
+    // An ID-keyed read is bounded by its ID list, so it takes no cap: a status lookup must not fail its own caller.
+    const result = idKeyed
+      ? await (client ?? this.pool).query<workflow_status>(query, params)
+      : await this.observabilityQuery((c) => c.query<workflow_status>(query, params));
     return result.rows.map(mapWorkflowStatus);
-  }
-
-  async getWorkflowAggregates(input: GetWorkflowAggregatesInput): Promise<WorkflowAggregateRow[]> {
-    if (input.timeBucketSizeMs !== undefined && input.timeBucketSizeMs <= 0) {
-      throw new Error('time_bucket_size_ms must be > 0');
-    }
-
-    const groupByFlags: [string, boolean, string][] = [
-      ['status', input.groupByStatus ?? false, 'status'],
-      ['name', input.groupByName ?? false, 'name'],
-      ['queue_name', input.groupByQueueName ?? false, 'queue_name'],
-      ['executor_id', input.groupByExecutorId ?? false, 'executor_id'],
-      ['application_version', input.groupByApplicationVersion ?? false, 'application_version'],
-    ];
-
-    const groupNames: string[] = [];
-    const groupColumns: string[] = [];
-    const groupSelectColumns: string[] = [];
-    for (const [colName, enabled, col] of groupByFlags) {
-      if (enabled) {
-        groupNames.push(colName);
-        groupColumns.push(col);
-        groupSelectColumns.push(col);
-      }
-    }
-
-    if (input.timeBucketSizeMs !== undefined) {
-      // Bucket on created_at — the indexed wall-clock timestamp on workflow_status.
-      const bucket = input.timeBucketSizeMs;
-      const bucketExpr = `(CAST(FLOOR(created_at / ${bucket}) AS BIGINT) * ${bucket})`;
-      groupNames.push('time_bucket');
-      groupColumns.push(bucketExpr);
-      groupSelectColumns.push(`${bucketExpr} AS time_bucket`);
-    }
-
-    if (groupColumns.length === 0) {
-      throw new Error('At least one group_by flag must be set to True');
-    }
-
-    // Build select columns from boolean flags. MAX ignores NULLs, so rows
-    // missing started_at_epoch_ms or completed_at naturally drop out of the
-    // latency maxes.
-    const selectFlags: [string, boolean, string][] = [
-      ['count', input.selectCount ?? false, 'COUNT(*)'],
-      ['min_created_at', input.selectMinCreatedAt ?? false, 'MIN(created_at)'],
-      ['max_queue_wait_ms', input.selectMaxQueueWaitMs ?? false, 'MAX(started_at_epoch_ms - created_at)'],
-      ['max_total_latency_ms', input.selectMaxTotalLatencyMs ?? false, 'MAX(completed_at - created_at)'],
-    ];
-    const selectNames: string[] = [];
-    const selectColumns: string[] = [];
-    for (const [name, enabled, expr] of selectFlags) {
-      if (enabled) {
-        selectNames.push(name);
-        selectColumns.push(`${expr} AS ${name}`);
-      }
-    }
-
-    if (selectColumns.length === 0) {
-      throw new Error('At least one select_ flag must be set to True');
-    }
-
-    const whereClauses: string[] = [];
-    const params: unknown[] = [];
-    let paramIdx = 1;
-
-    const addFilter = (column: string, values: string[] | undefined) => {
-      if (!values || values.length === 0) return;
-      const placeholders = values.map((_, i) => `$${paramIdx + i}`).join(', ');
-      whereClauses.push(`${column} IN (${placeholders})`);
-      params.push(...values);
-      paramIdx += values.length;
-    };
-
-    addFilter('status', input.status);
-    addFilter('name', input.name);
-    addFilter('application_version', input.appVersion);
-    addFilter('executor_id', input.executorId);
-    addFilter('queue_name', input.queueName);
-
-    if (input.workflowIdPrefix && input.workflowIdPrefix.length > 0) {
-      const likeClauses = input.workflowIdPrefix.map((p) => {
-        params.push(`${p}%`);
-        return `workflow_uuid LIKE $${paramIdx++}`;
-      });
-      whereClauses.push(`(${likeClauses.join(' OR ')})`);
-    }
-
-    if (input.startTime) {
-      whereClauses.push(`created_at >= $${paramIdx}`);
-      params.push(new Date(input.startTime).getTime());
-      paramIdx++;
-    }
-    if (input.endTime) {
-      whereClauses.push(`created_at <= $${paramIdx}`);
-      params.push(new Date(input.endTime).getTime());
-      paramIdx++;
-    }
-    if (input.completedAfter) {
-      whereClauses.push(`completed_at >= $${paramIdx}`);
-      params.push(new Date(input.completedAfter).getTime());
-      paramIdx++;
-    }
-    if (input.completedBefore) {
-      whereClauses.push(`completed_at <= $${paramIdx}`);
-      params.push(new Date(input.completedBefore).getTime());
-      paramIdx++;
-    }
-    // dequeuedAfter/Before filter on started_at_epoch_ms: that column is
-    // populated on dequeue and surfaced as WorkflowStatus.dequeuedAt.
-    if (input.dequeuedAfter) {
-      whereClauses.push(`started_at_epoch_ms >= $${paramIdx}`);
-      params.push(new Date(input.dequeuedAfter).getTime());
-      paramIdx++;
-    }
-    if (input.dequeuedBefore) {
-      whereClauses.push(`started_at_epoch_ms <= $${paramIdx}`);
-      params.push(new Date(input.dequeuedBefore).getTime());
-      paramIdx++;
-    }
-
-    const whereClause = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
-    const groupByClause = groupColumns.join(', ');
-    const selectClause = [...groupSelectColumns, ...selectColumns].join(', ');
-
-    const query = `
-      SELECT ${selectClause}
-      FROM "${this.schemaName}".workflow_status
-      ${whereClause}
-      GROUP BY ${groupByClause}
-    `;
-
-    const result = await this.pool.query<Record<string, unknown>>(query, params);
-
-    const toIntOrNull = (v: unknown): number | null => (v === null || v === undefined ? null : Number(v));
-
-    return result.rows.map((row) => {
-      const group: Record<string, string | null> = {};
-      for (const name of groupNames) {
-        const v = row[name];
-        group[name] = v === null || v === undefined ? null : String(v as string | number | bigint);
-      }
-      return {
-        group,
-        count: selectNames.includes('count') ? toIntOrNull(row.count) : null,
-        minCreatedAt: selectNames.includes('min_created_at') ? toIntOrNull(row.min_created_at) : null,
-        maxQueueWaitMs: selectNames.includes('max_queue_wait_ms') ? toIntOrNull(row.max_queue_wait_ms) : null,
-        maxTotalLatencyMs: selectNames.includes('max_total_latency_ms') ? toIntOrNull(row.max_total_latency_ms) : null,
-      };
-    });
-  }
-
-  async getStepAggregates(input: GetStepAggregatesInput): Promise<StepAggregateRow[]> {
-    if (input.timeBucketSizeMs !== undefined && input.timeBucketSizeMs <= 0) {
-      throw new Error('time_bucket_size_ms must be > 0');
-    }
-
-    // operation_outputs has no explicit status column; derive it from
-    // whether `error` is populated. Bookkeeping rows from recordChildWorkflow
-    // and DBOS.getResult have NULL error and NULL output, so they appear
-    // as SUCCESS here — callers can filter them by function_name.
-    const statusExpr = `CASE WHEN error IS NULL THEN 'SUCCESS' ELSE 'ERROR' END`;
-
-    const groupByFlags: [string, boolean, string][] = [
-      ['function_name', input.groupByFunctionName ?? false, 'function_name'],
-      ['status', input.groupByStatus ?? false, statusExpr],
-    ];
-
-    const groupNames: string[] = [];
-    const groupColumns: string[] = [];
-    const groupSelectColumns: string[] = [];
-    for (const [colName, enabled, expr] of groupByFlags) {
-      if (enabled) {
-        groupNames.push(colName);
-        groupColumns.push(expr);
-        groupSelectColumns.push(`${expr} AS ${colName}`);
-      }
-    }
-
-    if (input.timeBucketSizeMs !== undefined) {
-      // Bucket on completed_at_epoch_ms — it's the indexed timestamp on
-      // this table.
-      const bucket = input.timeBucketSizeMs;
-      const bucketExpr = `(CAST(FLOOR(completed_at_epoch_ms / ${bucket}) AS BIGINT) * ${bucket})`;
-      groupNames.push('time_bucket');
-      groupColumns.push(bucketExpr);
-      groupSelectColumns.push(`${bucketExpr} AS time_bucket`);
-    }
-
-    if (groupColumns.length === 0) {
-      throw new Error('At least one group_by flag must be set to True');
-    }
-
-    // Build select columns from boolean flags. MAX ignores NULLs, so rows
-    // without start/complete timestamps (child-workflow and getResult
-    // markers) drop out of the duration max.
-    const selectFlags: [string, boolean, string][] = [
-      ['count', input.selectCount ?? false, 'COUNT(*)'],
-      ['max_duration_ms', input.selectMaxDurationMs ?? false, 'MAX(completed_at_epoch_ms - started_at_epoch_ms)'],
-    ];
-    const selectNames: string[] = [];
-    const selectColumns: string[] = [];
-    for (const [name, enabled, expr] of selectFlags) {
-      if (enabled) {
-        selectNames.push(name);
-        selectColumns.push(`${expr} AS ${name}`);
-      }
-    }
-
-    if (selectColumns.length === 0) {
-      throw new Error('At least one select_ flag must be set to True');
-    }
-
-    const whereClauses: string[] = [];
-    const params: unknown[] = [];
-    let paramIdx = 1;
-
-    if (input.status && input.status.length > 0) {
-      const placeholders = input.status.map((_, i) => `$${paramIdx + i}`).join(', ');
-      whereClauses.push(`(${statusExpr}) IN (${placeholders})`);
-      params.push(...input.status);
-      paramIdx += input.status.length;
-    }
-    if (input.functionName && input.functionName.length > 0) {
-      const placeholders = input.functionName.map((_, i) => `$${paramIdx + i}`).join(', ');
-      whereClauses.push(`function_name IN (${placeholders})`);
-      params.push(...input.functionName);
-      paramIdx += input.functionName.length;
-    }
-    if (input.workflowIdPrefix && input.workflowIdPrefix.length > 0) {
-      const likeClauses = input.workflowIdPrefix.map((p) => {
-        params.push(`${p}%`);
-        return `workflow_uuid LIKE $${paramIdx++}`;
-      });
-      whereClauses.push(`(${likeClauses.join(' OR ')})`);
-    }
-    if (input.completedAfter) {
-      whereClauses.push(`completed_at_epoch_ms >= $${paramIdx}`);
-      params.push(new Date(input.completedAfter).getTime());
-      paramIdx++;
-    }
-    if (input.completedBefore) {
-      whereClauses.push(`completed_at_epoch_ms <= $${paramIdx}`);
-      params.push(new Date(input.completedBefore).getTime());
-      paramIdx++;
-    }
-
-    const whereClause = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
-    const groupByClause = groupColumns.join(', ');
-    const selectClause = [...groupSelectColumns, ...selectColumns].join(', ');
-
-    const query = `
-      SELECT ${selectClause}
-      FROM "${this.schemaName}".operation_outputs
-      ${whereClause}
-      GROUP BY ${groupByClause}
-    `;
-
-    const result = await this.pool.query<Record<string, unknown>>(query, params);
-
-    const toIntOrNull = (v: unknown): number | null => (v === null || v === undefined ? null : Number(v));
-
-    return result.rows.map((row) => {
-      const group: Record<string, string | null> = {};
-      for (const name of groupNames) {
-        const v = row[name];
-        group[name] = v === null || v === undefined ? null : String(v as string | number | bigint);
-      }
-      return {
-        group,
-        count: selectNames.includes('count') ? toIntOrNull(row.count) : null,
-        maxDurationMs: selectNames.includes('max_duration_ms') ? toIntOrNull(row.max_duration_ms) : null,
-      };
-    });
-  }
-
-  async garbageCollect(cutoffEpochTimestampMs?: number, rowsThreshold?: number): Promise<void> {
-    if (rowsThreshold !== undefined) {
-      // Get the created_at timestamp of the rows_threshold newest row
-      const result = await this.pool.query<{ created_at: number }>(
-        `SELECT created_at
-         FROM "${this.schemaName}".workflow_status
-         ORDER BY created_at DESC
-         LIMIT 1 OFFSET $1`,
-        [rowsThreshold - 1],
-      );
-
-      if (result.rows.length > 0) {
-        const rowsBasedCutoff = result.rows[0].created_at;
-        // Use the more restrictive cutoff (higher timestamp = more recent = more deletion)
-        if (cutoffEpochTimestampMs === undefined || rowsBasedCutoff > cutoffEpochTimestampMs) {
-          cutoffEpochTimestampMs = rowsBasedCutoff;
-        }
-      }
-    }
-
-    if (cutoffEpochTimestampMs === undefined) {
-      return;
-    }
-
-    // Delete all workflows older than cutoff that are NOT PENDING, ENQUEUED, or DELAYED
-    await this.pool.query(
-      `DELETE FROM "${this.schemaName}".workflow_status
-       WHERE created_at < $1
-         AND status NOT IN ($2, $3, $4)`,
-      [cutoffEpochTimestampMs, StatusString.PENDING, StatusString.ENQUEUED, StatusString.DELAYED],
-    );
-
-    return;
-  }
-
-  @dbRetry()
-  async getMetrics(startTime: string, endTime: string): Promise<MetricData[]> {
-    const startEpochMs = new Date(startTime).getTime();
-    const endEpochMs = new Date(endTime).getTime();
-
-    const metrics: MetricData[] = [];
-
-    // Query workflow metrics
-    const workflowResult = await this.pool.query<{ name: string; count: string }>(
-      `SELECT name, COUNT(workflow_uuid) as count
-       FROM "${this.schemaName}".workflow_status
-       WHERE created_at >= $1 AND created_at < $2
-       GROUP BY name`,
-      [startEpochMs, endEpochMs],
-    );
-
-    for (const row of workflowResult.rows) {
-      metrics.push({
-        metricType: 'workflow_count',
-        metricName: row.name,
-        value: Number(row.count),
-      });
-    }
-
-    // Query step metrics
-    const stepResult = await this.pool.query<{ function_name: string; count: string }>(
-      `SELECT function_name, COUNT(*) as count
-       FROM "${this.schemaName}".operation_outputs
-       WHERE completed_at_epoch_ms >= $1 AND completed_at_epoch_ms < $2
-       GROUP BY function_name`,
-      [startEpochMs, endEpochMs],
-    );
-
-    for (const row of stepResult.rows) {
-      metrics.push({
-        metricType: 'step_count',
-        metricName: row.function_name,
-        value: Number(row.count),
-      });
-    }
-
-    return metrics;
   }
 
   // ==================== Scheduling ====================
 
   async createSchedule(schedule: WorkflowScheduleInternal, client?: PoolClient): Promise<void> {
     const q = client ?? this.pool;
+    const owner = await this.#resolveRowOwner(
+      q,
+      'workflow_schedules',
+      'schedule_name',
+      schedule.scheduleName,
+      schedule.applicationName,
+      'Schedule',
+    );
+    const values: Record<string, unknown> = {
+      ...this.globalValues(),
+      ...this.scheduleValues(schedule),
+      ...scheduleRow(schedule, owner),
+    };
     try {
       await q.query(
-        `INSERT INTO "${this.schemaName}".workflow_schedules
-         (schedule_id, schedule_name, workflow_name, workflow_class_name, schedule, status, context, last_fired_at, automatic_backfill, cron_timezone, queue_name)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-        [
-          schedule.scheduleId,
-          schedule.scheduleName,
-          schedule.workflowName,
-          schedule.workflowClassName,
-          schedule.schedule,
-          schedule.status,
-          schedule.context,
-          schedule.lastFiredAt,
-          schedule.automaticBackfill,
-          schedule.cronTimezone,
-          schedule.queueName,
-        ],
+        `INSERT INTO "${this.schemaName}".workflow_schedules (${Object.keys(values).join(', ')})
+         VALUES (${Object.keys(values)
+           .map((_, i) => `$${i + 1}`)
+           .join(', ')})`,
+        Object.values(values),
       );
     } catch (e) {
-      if (e instanceof DatabaseError && e.code === '23505') {
+      if (isPgDatabaseError(e) && e.code === '23505') {
         throw new Error(`Schedule '${schedule.scheduleName}' already exists`);
       }
       throw e;
     }
   }
 
+  /**
+   * List only schedules owned by these applications, plus unclaimed ones.
+   * By default, only list this application's schedules.
+   */
   async listSchedules(
-    filters?: { status?: string | string[]; workflowName?: string | string[]; scheduleNamePrefix?: string | string[] },
+    filters?: {
+      status?: string | string[];
+      workflowName?: string | string[];
+      scheduleNamePrefix?: string | string[];
+      applicationName?: string | string[];
+    },
     client?: PoolClient,
   ): Promise<WorkflowScheduleInternal[]> {
     const q = client ?? this.pool;
@@ -3283,82 +5349,162 @@ export class SystemDatabase {
       });
       conditions.push(`(${likeClauses.join(' OR ')})`);
     }
+    // Unset scopes to this application, as on every other observability query.
+    conditions.push(this.observabilityFilter('application_name', filters?.applicationName, params));
+    paramIdx = params.length + 1;
 
+    conditions.push(this.global(undefined, params));
     const where = conditions.length > 0 ? ` WHERE ${conditions.join(' AND ')}` : '';
     const result = await q.query(
-      `SELECT schedule_id, schedule_name, workflow_name, workflow_class_name, schedule, status, context, last_fired_at, automatic_backfill, cron_timezone, queue_name
+      `SELECT ${this.#scheduleColumns()}
        FROM "${this.schemaName}".workflow_schedules${where}
        ORDER BY schedule_name`,
       params,
     );
 
-    return result.rows.map((row: workflow_schedules) => ({
-      scheduleId: row.schedule_id,
-      scheduleName: row.schedule_name,
-      workflowName: row.workflow_name,
-      workflowClassName: row.workflow_class_name,
-      schedule: row.schedule,
-      status: row.status,
-      context: row.context,
-      lastFiredAt: row.last_fired_at ?? null,
-      automaticBackfill: !!row.automatic_backfill,
-      cronTimezone: row.cron_timezone ?? null,
-      queueName: row.queue_name ?? null,
-    }));
+    return result.rows.map((row: workflow_schedules) => mapWorkflowSchedule(row));
   }
 
   async getSchedule(name: string, client?: PoolClient): Promise<WorkflowScheduleInternal | null> {
     const q = client ?? this.pool;
+    const params: unknown[] = [name];
     const result = await q.query(
-      `SELECT schedule_id, schedule_name, workflow_name, workflow_class_name, schedule, status, context, last_fired_at, automatic_backfill, cron_timezone, queue_name
+      `SELECT ${this.#scheduleColumns()}
        FROM "${this.schemaName}".workflow_schedules
-       WHERE schedule_name = $1`,
-      [name],
+       WHERE ${this.global(undefined, params)} AND schedule_name = $1`,
+      params,
     );
     if (result.rows.length === 0) return null;
-    const row = result.rows[0] as workflow_schedules;
-    return {
-      scheduleId: row.schedule_id,
-      scheduleName: row.schedule_name,
-      workflowName: row.workflow_name,
-      workflowClassName: row.workflow_class_name,
-      schedule: row.schedule,
-      status: row.status,
-      context: row.context,
-      lastFiredAt: row.last_fired_at ?? null,
-      automaticBackfill: !!row.automatic_backfill,
-      cronTimezone: row.cron_timezone ?? null,
-      queueName: row.queue_name ?? null,
-    };
+    return mapWorkflowSchedule(result.rows[0] as workflow_schedules);
+  }
+
+  /** The columns a schedule is read back with, its workflows' shard key among them on a sharded database. */
+  #scheduleColumns(): string {
+    const keyColumn = this.scheduleKeyColumn();
+    return keyColumn !== undefined ? `${SCHEDULE_COLUMNS}, ${keyColumn}` : SCHEDULE_COLUMNS;
   }
 
   async deleteSchedule(name: string, client?: PoolClient): Promise<void> {
     const q = client ?? this.pool;
-    await q.query(`DELETE FROM "${this.schemaName}".workflow_schedules WHERE schedule_name = $1`, [name]);
+    const params: unknown[] = [name];
+    await q.query(
+      `DELETE FROM "${this.schemaName}".workflow_schedules WHERE ${this.global(undefined, params)} AND schedule_name = $1`,
+      params,
+    );
   }
 
   async setScheduleStatus(name: string, status: string, client?: PoolClient): Promise<void> {
     const q = client ?? this.pool;
-    await q.query(`UPDATE "${this.schemaName}".workflow_schedules SET status = $1 WHERE schedule_name = $2`, [
-      status,
-      name,
-    ]);
+    const params: unknown[] = [status, name];
+    await q.query(
+      `UPDATE "${this.schemaName}".workflow_schedules SET status = $1 WHERE ${this.global(undefined, params)} AND schedule_name = $2`,
+      params,
+    );
   }
 
+  async updateSchedule(name: string, updates: WorkflowScheduleUpdate, client?: PoolClient): Promise<void> {
+    const q = client ?? this.pool;
+
+    // Only update the definition fields the caller provided, leaving runtime state (schedule_id, status, last_fired_at) untouched.
+    const columns: [keyof WorkflowScheduleUpdate, string][] = [
+      ['schedule', 'schedule'],
+      ['context', 'context'],
+      ['automaticBackfill', 'automatic_backfill'],
+      ['cronTimezone', 'cron_timezone'],
+      ['queueName', 'queue_name'],
+    ];
+    const setClauses: string[] = [];
+    const params: unknown[] = [];
+    let paramIdx = 1;
+    for (const [key, column] of columns) {
+      if (key in updates) {
+        setClauses.push(`${column} = $${paramIdx++}`);
+        params.push(updates[key] ?? null);
+      }
+    }
+
+    if (setClauses.length === 0) {
+      // Nothing to change, but still surface a missing schedule as an error.
+      const existingParams: unknown[] = [name];
+      const existing = await q.query(
+        `SELECT 1 FROM "${this.schemaName}".workflow_schedules WHERE ${this.global(undefined, existingParams)} AND schedule_name = $1`,
+        existingParams,
+      );
+      if (existing.rows.length === 0) {
+        throw new DBOSError(`Schedule '${name}' not found`);
+      }
+      return;
+    }
+
+    params.push(name);
+    const result = await q.query(
+      `UPDATE "${this.schemaName}".workflow_schedules SET ${setClauses.join(', ')} WHERE schedule_name = $${paramIdx} AND ${this.global(undefined, params)}`,
+      params,
+    );
+    if (result.rowCount === 0) {
+      throw new DBOSError(`Schedule '${name}' not found`);
+    }
+  }
+
+  @dbRetry()
   async updateLastFiredAt(name: string, lastFiredAt: string): Promise<void> {
+    const params: unknown[] = [lastFiredAt, name];
     await this.pool.query(
-      `UPDATE "${this.schemaName}".workflow_schedules SET last_fired_at = $1 WHERE schedule_name = $2`,
-      [lastFiredAt, name],
+      `UPDATE "${this.schemaName}".workflow_schedules SET last_fired_at = $1 WHERE ${this.global(undefined, params)} AND schedule_name = $2`,
+      params,
     );
   }
 
   async applySchedules(schedules: WorkflowScheduleInternal[]): Promise<void> {
-    const client = await this.pool.connect();
+    const client = await this.connect();
     try {
       await client.query('BEGIN');
-      for (const sched of schedules) {
-        await this.deleteSchedule(sched.scheduleName, client);
-        await this.createSchedule(sched, client);
+      // Sorted, so concurrent writers lock schedule rows in one order.
+      const sorted = [...schedules].sort((a, b) => compareCodeUnits(a.scheduleName, b.scheduleName));
+      for (const sched of sorted) {
+        const owner = await this.#resolveRowOwner(
+          client,
+          'workflow_schedules',
+          'schedule_name',
+          sched.scheduleName,
+          sched.applicationName,
+          'Schedule',
+        );
+        const scheduleKeys = this.scheduleValues(sched);
+        const values: Record<string, unknown> = {
+          ...this.globalValues(),
+          ...scheduleKeys,
+          ...scheduleRow(sched, owner),
+        };
+        // Upsert on schedule_name; on conflict, preserve schedule_id and runtime state (status, last_fired_at) and update only the declared definition fields, so an unchanged re-apply is a no-op.
+        await client.query(
+          `INSERT INTO "${this.schemaName}".workflow_schedules (${Object.keys(values).join(', ')})
+           VALUES (${Object.keys(values)
+             .map((_, i) => `$${i + 1}`)
+             .join(', ')})
+           ON CONFLICT (${this.keyConflict('schedule_name')}) DO UPDATE SET
+             ${Object.keys(scheduleKeys)
+               .map((c) => `${c} = EXCLUDED.${c}, `)
+               .join('')}workflow_name = EXCLUDED.workflow_name,
+             workflow_class_name = EXCLUDED.workflow_class_name,
+             schedule = EXCLUDED.schedule,
+             context = EXCLUDED.context,
+             automatic_backfill = EXCLUDED.automatic_backfill,
+             cron_timezone = EXCLUDED.cron_timezone,
+             queue_name = EXCLUDED.queue_name,
+             -- Claim only an unclaimed row, so a registration landing between the check above and this write keeps the name it took.
+             application_name = COALESCE("${this.schemaName}".workflow_schedules.application_name, EXCLUDED.application_name)`,
+          Object.values(values),
+        );
+        // Read back, since the guard above is silent about why it declined to claim.
+        await this.#resolveRowOwner(
+          client,
+          'workflow_schedules',
+          'schedule_name',
+          sched.scheduleName,
+          sched.applicationName,
+          'Schedule',
+        );
       }
       await client.query('COMMIT');
     } catch (e) {
@@ -3370,82 +5516,164 @@ export class SystemDatabase {
   }
 
   // ==================== Application Versions ====================
-  async createApplicationVersion(versionName: string): Promise<void> {
-    const versionId = randomUUID();
-    await this.pool.query(
-      `INSERT INTO "${this.schemaName}".application_versions (version_id, version_name)
-       VALUES ($1, $2)
-       ON CONFLICT (version_name) DO NOTHING`,
-      [versionId, versionName],
-    );
+  /**
+   * Register this version, claiming the row if nobody owns it yet so a pinned version
+   * does not stay unclaimed. A peer's name is a collision, which is why this throws.
+   */
+  async createApplicationVersion(versionName: string, applicationName?: string): Promise<void> {
+    const owner = applicationName ?? this.appName;
+    const client = await this.connect();
+    try {
+      await client.query('BEGIN');
+      // Claim a pre-upgrade row in place, so the version is not recreated or retimed.
+      const claimParams: unknown[] = [owner ?? null, versionName];
+      const claimed = await client.query(
+        `UPDATE "${this.schemaName}".application_versions
+         SET application_name = $1
+         WHERE ${this.global(undefined, claimParams)} AND version_name = $2 AND application_name IS NULL`,
+        claimParams,
+      );
+      if ((claimed.rowCount ?? 0) === 0) {
+        const values: Record<string, unknown> = {
+          ...this.globalValues(),
+          version_id: randomUUID(),
+          version_name: versionName,
+          application_name: owner ?? null,
+        };
+        // Targetless DO NOTHING: names no arbiter, so it survives version_name's uniqueness being dropped while still absorbing a concurrent registrar.
+        await client.query(
+          `INSERT INTO "${this.schemaName}".application_versions (${Object.keys(values).join(', ')})
+           VALUES (${Object.keys(values)
+             .map((_, i) => `$${i + 1}`)
+             .join(', ')})
+           ON CONFLICT DO NOTHING`,
+          Object.values(values),
+        );
+      }
+      // Read back, since the writes above are silent about why they declined to claim.
+      await this.#resolveRowOwner(
+        client,
+        'application_versions',
+        'version_name',
+        versionName,
+        owner,
+        'Application version',
+      );
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
   }
 
-  async updateApplicationVersionTimestamp(versionName: string, newTimestamp: number): Promise<void> {
-    await this.pool.query(
-      `UPDATE "${this.schemaName}".application_versions
-       SET version_timestamp = $1
-       WHERE version_name = $2`,
-      [newTimestamp, versionName],
-    );
+  /**
+   * Promote a version to latest. Promoting a peer's is a collision, not a retiming;
+   * promotion claims an unclaimed row, which would otherwise be every peer's latest.
+   */
+  async updateApplicationVersionTimestamp(
+    versionName: string,
+    newTimestamp: number,
+    applicationName?: string,
+    txnClient?: PoolClient,
+  ): Promise<void> {
+    const owner = applicationName ?? this.appName;
+    // A caller-supplied client is already in a transaction, which owns BEGIN and COMMIT.
+    const client = txnClient ?? (await this.connect());
+    try {
+      if (!txnClient) await client.query('BEGIN');
+      const resolved = await this.#resolveRowOwner(
+        client,
+        'application_versions',
+        'version_name',
+        versionName,
+        owner,
+        'Application version',
+      );
+      // Scoped to the row this writer resolved to: once version_name is no longer globally unique, a bare name match would retime every peer's version.
+      const scope =
+        resolved === undefined ? 'application_name IS NULL' : '(application_name = $3 OR application_name IS NULL)';
+      const params: unknown[] = [newTimestamp, versionName];
+      if (resolved !== undefined) params.push(resolved);
+      await client.query(
+        `UPDATE "${this.schemaName}".application_versions
+         SET version_timestamp = $1, application_name = ${resolved === undefined ? 'application_name' : '$3'}
+         WHERE ${this.global(undefined, params)} AND version_name = $2 AND ${scope}`,
+        params,
+      );
+      if (!txnClient) await client.query('COMMIT');
+    } catch (e) {
+      if (!txnClient) await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      if (!txnClient) client.release();
+    }
   }
 
   async listApplicationVersions(): Promise<VersionInfo[]> {
-    const { rows } = await this.pool.query<application_versions>(
-      `SELECT version_id, version_name, version_timestamp, created_at
-       FROM "${this.schemaName}".application_versions
-       ORDER BY version_timestamp DESC`,
+    const params: unknown[] = [];
+    const scope = `${this.global(undefined, params)} AND ${this.appNameFilter('application_name', this.appName, params)}`;
+    const { rows } = await this.observabilityQuery((client) =>
+      client.query<application_versions>(
+        `SELECT version_id, version_name, version_timestamp, created_at, application_name
+         FROM "${this.schemaName}".application_versions
+         WHERE ${scope}
+         ORDER BY version_timestamp DESC`,
+        params,
+      ),
     );
-    return rows.map((r) => ({
-      versionId: r.version_id,
-      versionName: r.version_name,
-      versionTimestamp: Number(r.version_timestamp),
-      createdAt: Number(r.created_at),
-    }));
+    return rows.map(mapVersionInfo);
   }
 
-  async getLatestApplicationVersion(): Promise<VersionInfo> {
-    const { rows } = await this.pool.query<application_versions>(
-      `SELECT version_id, version_name, version_timestamp, created_at
-       FROM "${this.schemaName}".application_versions
-       ORDER BY version_timestamp DESC
-       LIMIT 1`,
-    );
-    if (rows.length === 0) {
+  /**
+   * The latest version registered by an application. Defaults to this handle's, so a
+   * caller acting for another one — firing its schedule — must name it.
+   */
+  @dbRetry()
+  async getLatestApplicationVersion(applicationName?: string): Promise<VersionInfo> {
+    const latest = await this.#latestApplicationVersion(this.pool, applicationName ?? this.appName);
+    if (latest === undefined) {
       throw new DBOSInitializationError('No application versions found');
     }
-    const r = rows[0];
-    return {
-      versionId: r.version_id,
-      versionName: r.version_name,
-      versionTimestamp: Number(r.version_timestamp),
-      createdAt: Number(r.created_at),
-    };
+    return mapVersionInfo(latest);
   }
 
   // ==================== Queues ====================
 
   async getQueue(name: string): Promise<QueueRecord | null> {
+    const params: unknown[] = [name];
     const { rows } = await this.pool.query<queues>(
-      `SELECT name, concurrency, worker_concurrency, rate_limit_max, rate_limit_period_sec,
-              priority_enabled, partition_queue, polling_interval_sec
+      `SELECT ${QUEUE_COLUMNS}
          FROM "${this.schemaName}".queues
-        WHERE name = $1`,
-      [name],
+        WHERE ${this.global(undefined, params)} AND name = $1`,
+      params,
     );
     return rows.length === 0 ? null : queueRecordFromRow(rows[0]);
   }
 
-  async listQueues(): Promise<QueueRecord[]> {
+  /**
+   * List only queues owned by these applications, plus unclaimed ones.
+   * By default, only list this application's queues.
+   */
+  async listQueues(applicationName?: string | string[]): Promise<QueueRecord[]> {
+    const params: unknown[] = [];
+    const scope = `${this.global(undefined, params)} AND ${this.observabilityFilter('application_name', applicationName, params)}`;
     const { rows } = await this.pool.query<queues>(
-      `SELECT name, concurrency, worker_concurrency, rate_limit_max, rate_limit_period_sec,
-              priority_enabled, partition_queue, polling_interval_sec
-         FROM "${this.schemaName}".queues`,
+      `SELECT ${QUEUE_COLUMNS}
+         FROM "${this.schemaName}".queues
+        WHERE ${scope}`,
+      params,
     );
     return rows.map(queueRecordFromRow);
   }
 
   async deleteQueue(name: string): Promise<void> {
-    await this.pool.query(`DELETE FROM "${this.schemaName}".queues WHERE name = $1`, [name]);
+    const params: unknown[] = [name];
+    await this.pool.query(
+      `DELETE FROM "${this.schemaName}".queues WHERE ${this.global(undefined, params)} AND name = $1`,
+      params,
+    );
   }
 
   async updateQueue(name: string, fields: QueueRecordUpdate): Promise<void> {
@@ -3462,7 +5690,7 @@ export class SystemDatabase {
     params.push(Date.now());
     params.push(name);
     await this.pool.query(
-      `UPDATE "${this.schemaName}".queues SET ${setClauses.join(', ')} WHERE name = $${idx}`,
+      `UPDATE "${this.schemaName}".queues SET ${setClauses.join(', ')} WHERE name = $${idx} AND ${this.global(undefined, params)}`,
       params,
     );
   }
@@ -3473,28 +5701,46 @@ export class SystemDatabase {
   async upsertQueue(record: QueueRecord, updateExisting: boolean): Promise<boolean> {
     const now = Date.now();
     const onConflict = updateExisting
-      ? `ON CONFLICT (name) DO UPDATE SET
+      ? `ON CONFLICT (${this.keyConflict('name')}) DO UPDATE SET
           concurrency = EXCLUDED.concurrency,
           worker_concurrency = EXCLUDED.worker_concurrency,
           rate_limit_max = EXCLUDED.rate_limit_max,
           rate_limit_period_sec = EXCLUDED.rate_limit_period_sec,
           priority_enabled = EXCLUDED.priority_enabled,
           partition_queue = EXCLUDED.partition_queue,
+          partition_concurrency = EXCLUDED.partition_concurrency,
+          partition_worker_concurrency = EXCLUDED.partition_worker_concurrency,
+          partition_rate_limit_max = EXCLUDED.partition_rate_limit_max,
+          partition_rate_limit_period_sec = EXCLUDED.partition_rate_limit_period_sec,
           polling_interval_sec = EXCLUDED.polling_interval_sec,
-          updated_at = EXCLUDED.updated_at`
-      : `ON CONFLICT (name) DO NOTHING`;
-    const client = await this.pool.connect();
+          updated_at = EXCLUDED.updated_at,
+          -- Claim only an unclaimed row, so a registration landing between the check above and this write keeps the name it just took.
+          application_name = COALESCE("${this.schemaName}".queues.application_name, EXCLUDED.application_name)`
+      : `ON CONFLICT (${this.keyConflict('name')}) DO NOTHING`;
+    const owner = record.applicationName ?? this.appName;
+    const client = await this.connect();
     try {
       await client.query('BEGIN');
+      const existedParams: unknown[] = [record.name];
       const existed = await client.query<{ name: string }>(
-        `SELECT name FROM "${this.schemaName}".queues WHERE name = $1`,
-        [record.name],
+        `SELECT name FROM "${this.schemaName}".queues WHERE ${this.global(undefined, existedParams)} AND name = $1`,
+        existedParams,
       );
+      // A name collision is a conflict in every mode: the name is the queue's address.
+      const resolvedOwner = await this.#resolveRowOwner(client, 'queues', 'name', record.name, owner, 'Queue');
+      const keys = this.globalValues();
       await client.query(
         `INSERT INTO "${this.schemaName}".queues
-          (name, concurrency, worker_concurrency, rate_limit_max, rate_limit_period_sec,
-           priority_enabled, partition_queue, polling_interval_sec, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+          (${Object.keys(keys)
+            .map((c) => `${c}, `)
+            .join('')}name, concurrency, worker_concurrency, rate_limit_max, rate_limit_period_sec,
+           priority_enabled, partition_queue, partition_concurrency, partition_worker_concurrency,
+           partition_rate_limit_max, partition_rate_limit_period_sec,
+           polling_interval_sec, updated_at, application_name)
+         -- priority_enabled is vestigial: every queue dispatches in priority order.
+         VALUES (${Object.keys(keys)
+           .map((_, i) => `$${14 + i}, `)
+           .join('')}$1, $2, $3, $4, $5, TRUE, $6, $7, $8, $9, $10, $11, $12, $13)
          ${onConflict}`,
         [
           record.name,
@@ -3502,12 +5748,19 @@ export class SystemDatabase {
           record.workerConcurrency,
           record.rateLimitMax,
           record.rateLimitPeriodSec,
-          record.priorityEnabled,
           record.partitionQueue,
+          record.partitionConcurrency,
+          record.partitionWorkerConcurrency,
+          record.partitionRateLimitMax,
+          record.partitionRateLimitPeriodSec,
           record.pollingIntervalSec,
           now,
+          resolvedOwner ?? null,
+          ...Object.values(keys),
         ],
       );
+      // Read back, since the guard above is silent about why it declined to claim.
+      await this.#resolveRowOwner(client, 'queues', 'name', record.name, owner, 'Queue');
       await client.query('COMMIT');
       return existed.rowCount === 0;
     } catch (e) {
@@ -3518,93 +5771,247 @@ export class SystemDatabase {
     }
   }
 
+  // ==================== Application Rename ====================
+
+  /**
+   * Rows a rename moves: an application's own, unclaimed ones, or both. Unlike
+   * the claiming scope, unclaimed rows are not implied; they move only when asked.
+   */
+  #renameSource(oldName: string | undefined, adoptUnclaimedRows: boolean, params: unknown[]): string {
+    const clauses: string[] = [];
+    if (oldName !== undefined) {
+      params.push(oldName);
+      clauses.push(`application_name = $${params.length}`);
+    }
+    if (adoptUnclaimedRows) {
+      clauses.push('application_name IS NULL');
+    }
+    // Callers validate that at least one source is named.
+    return `(${clauses.join(' OR ')})`;
+  }
+
+  /**
+   * Re-own a table's rows in half-open key ranges, so a long history neither moves in
+   * one transaction nor rescans what it already moved; a re-run resumes.
+   */
+  async #renameRowsInBatches(
+    table: string,
+    keyColumn: string,
+    oldName: string | undefined,
+    newName: string,
+    batchSize: number | undefined,
+    adoptUnclaimedRows: boolean,
+  ): Promise<number> {
+    if (batchSize === undefined) {
+      const params: unknown[] = [newName];
+      const predicate = this.#renameSource(oldName, adoptUnclaimedRows, params);
+      const res = await this.pool.query(
+        `UPDATE "${this.schemaName}".${table} SET application_name = $1 WHERE ${predicate}`,
+        params,
+      );
+      return res.rowCount ?? 0;
+    }
+
+    let total = 0;
+    // Ranges, not LIMIT: a LIMIT repages every row already moved, and an IN list of keys plans as a whole-table hash join.
+    let watermark: string | undefined = undefined;
+    for (;;) {
+      const boundParams: unknown[] = [];
+      const predicate = this.#renameSource(oldName, adoptUnclaimedRows, boundParams);
+      let scope = predicate;
+      if (watermark !== undefined) {
+        boundParams.push(watermark);
+        scope = `${predicate} AND ${keyColumn} > $${boundParams.length}`;
+      }
+      // The batchSize-th matching key bounds this range; distinct, so a key's rows are never split across batches.
+      const upperResult = await this.pool.query<Record<string, string>>(
+        `SELECT DISTINCT ${keyColumn} FROM "${this.schemaName}".${table}
+         WHERE ${scope} ORDER BY ${keyColumn} LIMIT 1 OFFSET ${batchSize - 1}`,
+        boundParams,
+      );
+      const upper: string | undefined = upperResult.rows[0]?.[keyColumn];
+
+      const updateParams: unknown[] = [newName];
+      const updatePredicate = this.#renameSource(oldName, adoptUnclaimedRows, updateParams);
+      let batch = updatePredicate;
+      if (upper !== undefined) {
+        if (watermark !== undefined) {
+          updateParams.push(watermark);
+          batch = `${batch} AND ${keyColumn} > $${updateParams.length}`;
+        }
+        updateParams.push(upper);
+        batch = `${batch} AND ${keyColumn} <= $${updateParams.length}`;
+      }
+      // The final batch drops the watermark, so rows that appeared below it still move.
+      const res = await this.pool.query(
+        `UPDATE "${this.schemaName}".${table} SET application_name = $1 WHERE ${batch}`,
+        updateParams,
+      );
+      total += res.rowCount ?? 0;
+
+      // Fewer than a full batch remained, so that update took the rest.
+      if (upper === undefined) return total;
+      watermark = upper;
+    }
+  }
+
+  /**
+   * Give `newName` ownership of rows `oldName` holds, of unclaimed rows, or of both.
+   * The renamed application must be stopped, or its dequeues race this.
+   */
+  async renameApplication(
+    oldName: string | undefined,
+    newName: string,
+    options: { batchSize?: number | null; adoptUnclaimedRows?: boolean } = {},
+  ): Promise<ApplicationRowCounts> {
+    const adoptUnclaimedRows = options.adoptUnclaimedRows ?? false;
+    const batchSize = options.batchSize === null ? undefined : (options.batchSize ?? DEFAULT_RENAME_BATCH_SIZE);
+
+    if (oldName !== undefined && oldName === '') {
+      throw new DBOSError("The application's previous name cannot be empty.");
+    }
+    if (oldName === undefined && !adoptUnclaimedRows) {
+      throw new DBOSError('Nothing to re-own: name the application to rename, adopt unclaimed rows, or both.');
+    }
+    if (oldName === newName) {
+      throw new DBOSError(`Application '${newName}' already holds that name; nothing to rename.`);
+    }
+    // A NaN survives a bare `< 1` test and would only fail once it reached SQL, leaving the rename half-applied.
+    if (batchSize !== undefined && (!Number.isInteger(batchSize) || batchSize < 1)) {
+      throw new DBOSError(`batchSize must be a positive integer, got ${batchSize}`);
+    }
+
+    // Never a merge: queue, schedule, and version names are globally unique whatever their owner, so this cannot collide.
+    const client = await this.connect();
+    let queues: number, schedules: number, versions: number, inFlight: number;
+    try {
+      await client.query('BEGIN');
+      const move = async (table: string, statuses?: string[]): Promise<number> => {
+        const params: unknown[] = [newName];
+        let where = this.#renameSource(oldName, adoptUnclaimedRows, params);
+        if (statuses !== undefined) {
+          params.push(statuses);
+          where = `${where} AND status = ANY($${params.length})`;
+        } else {
+          where = `${where} AND ${this.global(undefined, params)}`;
+        }
+        const res = await client.query(
+          `UPDATE "${this.schemaName}".${table} SET application_name = $1 WHERE ${where}`,
+          params,
+        );
+        return res.rowCount ?? 0;
+      };
+
+      // A half-owned application dequeues work whose version row it can no longer see, so these move together.
+      queues = await move('queues');
+      schedules = await move('workflow_schedules');
+      versions = await move('application_versions');
+      inFlight = await move('workflow_status', [
+        StatusString.PENDING,
+        StatusString.ENQUEUED,
+        StatusString.DELAYED,
+        StatusString.SUSPENDED,
+      ]);
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+
+    // Only terminal rows are left to match, and they scope observability and GC alone, so they may lag behind the commit above.
+    const terminal = await this.#renameRowsInBatches(
+      'workflow_status',
+      'workflow_uuid',
+      oldName,
+      newName,
+      batchSize,
+      adoptUnclaimedRows,
+    );
+    const steps = await this.#renameRowsInBatches(
+      'operation_outputs',
+      'workflow_uuid',
+      oldName,
+      newName,
+      batchSize,
+      adoptUnclaimedRows,
+    );
+
+    return { queues, schedules, versions, workflows: inFlight + terminal, steps };
+  }
+
   // ==================== Internal ====================
-  private async insertWorkflowStatus(
-    client: PoolClient,
+  protected async insertWorkflowStatus(
+    client: ClientBase,
     initStatus: WorkflowStatusInternal,
-    ownerXid: string | null,
-    incrementAttempts: boolean = false,
+    creatorXid: string | null,
   ): Promise<InsertWorkflowResult> {
+    const values: Record<string, unknown> = {
+      ...this.wfValues(initStatus.workflowUUID, initStatus.shardKey),
+      workflow_uuid: initStatus.workflowUUID,
+      status: initStatus.status,
+      name: initStatus.workflowName,
+      // For cross-language compatibility, these variables MUST be NULL in the database when not set
+      class_name: initStatus.workflowClassName === '' ? null : initStatus.workflowClassName,
+      config_name: initStatus.workflowConfigName === '' ? null : initStatus.workflowConfigName,
+      queue_name: initStatus.queueName ?? null,
+      authenticated_user: initStatus.authenticatedUser,
+      assumed_role: initStatus.assumedRole,
+      authenticated_roles: JSON.stringify(initStatus.authenticatedRoles),
+      executor_id: initStatus.executorId,
+      application_version: initStatus.applicationVersion ?? null,
+      application_id: initStatus.applicationID,
+      recovery_attempts:
+        initStatus.status === StatusString.ENQUEUED || initStatus.status === StatusString.DELAYED ? 0 : 1,
+      workflow_timeout_ms: initStatus.timeoutMS ?? null,
+      workflow_deadline_epoch_ms: initStatus.deadlineEpochMS ?? null,
+      // Legacy column: the payload lives in workflow_input.
+      inputs: null,
+      deduplication_id: initStatus.deduplicationID ?? null,
+      priority: initStatus.priority,
+      queue_partition_key: initStatus.queuePartitionKey ?? null,
+      forked_from: initStatus.forkedFrom ?? null,
+      parent_workflow_id: initStatus.parentWorkflowID ?? null,
+      ...this.parentValues(initStatus.parentWorkflowID),
+      serialization: initStatus.serialization,
+      creator_xid: creatorXid,
+      delay_until_epoch_ms: initStatus.delayUntilEpochMS ?? null,
+      attributes: initStatus.attributes ? JSON.stringify(initStatus.attributes) : null,
+      schedule_name: initStatus.scheduleName ?? null,
+      debounce_deadline_epoch_ms: initStatus.debounceDeadlineEpochMS ?? null,
+      is_debounced: initStatus.isDebounced ?? false,
+      application_name: initStatus.applicationName ?? null,
+      // A direct start runs at once, so its creator token also owns the execution.
+      owner_xid: initStatus.status === StatusString.PENDING ? creatorXid : null,
+    };
+    const columns = Object.keys(values);
+    const inputValues: Record<string, unknown> = {
+      ...this.wfValues(initStatus.workflowUUID, initStatus.shardKey),
+      workflow_uuid: initStatus.workflowUUID,
+      inputs: initStatus.input ?? null,
+    };
+    const inputColumns = Object.keys(inputValues);
     try {
       const { rows } = await client.query<InsertWorkflowResult>(
-        `INSERT INTO "${this.schemaName}".workflow_status (
-          workflow_uuid,
-          status,
-          name,
-          class_name,
-          config_name,
-          queue_name,
-          authenticated_user,
-          assumed_role,
-          authenticated_roles,
-          request,
-          executor_id,
-          application_version,
-          application_id,
-          created_at,
-          recovery_attempts,
-          updated_at,
-          workflow_timeout_ms,
-          workflow_deadline_epoch_ms,
-          inputs,
-          deduplication_id,
-          priority,
-          queue_partition_key,
-          forked_from,
-          parent_workflow_id,
-          serialization,
-          owner_xid,
-          delay_until_epoch_ms
-        ) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $26, $27, $28)
-        ON CONFLICT (workflow_uuid)
-          DO UPDATE SET
-            recovery_attempts = CASE
-              WHEN workflow_status.status != '${StatusString.ENQUEUED}' AND workflow_status.status != '${StatusString.DELAYED}'
-              THEN workflow_status.recovery_attempts + $25
-              ELSE workflow_status.recovery_attempts
-            END,
-            updated_at = EXCLUDED.updated_at,
-            executor_id = CASE
-              WHEN EXCLUDED.status != '${StatusString.ENQUEUED}' AND EXCLUDED.status != '${StatusString.DELAYED}'
-              THEN EXCLUDED.executor_id
-              ELSE workflow_status.executor_id
-            END
-          RETURNING recovery_attempts, status, name, class_name, config_name, queue_name, workflow_deadline_epoch_ms, executor_id, owner_xid, serialization`,
-        [
-          initStatus.workflowUUID,
-          initStatus.status,
-          initStatus.workflowName,
-          // For cross-language compatibility, these variables MUST be NULL in the database when not set
-          initStatus.workflowClassName === '' ? null : initStatus.workflowClassName,
-          initStatus.workflowConfigName === '' ? null : initStatus.workflowConfigName,
-          initStatus.queueName ?? null,
-          initStatus.authenticatedUser,
-          initStatus.assumedRole,
-          JSON.stringify(initStatus.authenticatedRoles),
-          JSON.stringify(initStatus.request),
-          initStatus.executorId,
-          initStatus.applicationVersion ?? null,
-          initStatus.applicationID,
-          initStatus.createdAt,
-          initStatus.status === StatusString.ENQUEUED || initStatus.status === StatusString.DELAYED ? 0 : 1,
-          initStatus.updatedAt ?? Date.now(),
-          initStatus.timeoutMS ?? null,
-          initStatus.deadlineEpochMS ?? null,
-          initStatus.input ?? null,
-          initStatus.deduplicationID ?? null,
-          initStatus.priority,
-          initStatus.queuePartitionKey ?? null,
-          initStatus.forkedFrom ?? null,
-          initStatus.parentWorkflowID ?? null,
-          (incrementAttempts ?? false) ? 1 : 0,
-          initStatus.serialization,
-          ownerXid,
-          initStatus.delayUntilEpochMS ?? null,
-        ],
+        `INSERT INTO "${this.schemaName}".workflow_status (${columns.join(', ')})
+        VALUES (${columns.map((_, i) => `$${i + 1}`).join(', ')})
+        ON CONFLICT (${this.keyConflict('workflow_uuid')})
+          -- A no-op update, so an existing row comes back unchanged for the caller to inspect.
+          DO UPDATE SET creator_xid = workflow_status.creator_xid
+          RETURNING status, name, class_name, config_name, queue_name, executor_id, creator_xid, serialization`,
+        Object.values(values),
       );
       if (rows.length === 0) {
         throw new Error(`Attempt to insert workflow ${initStatus.workflowUUID} failed`);
       }
+      // Two statements, not a data-modifying CTE: at scale the CTE costs more than the round trip it saves.
+      await client.query(
+        `INSERT INTO "${this.schemaName}".workflow_input (${inputColumns.join(', ')})
+         VALUES (${inputColumns.map((_, i) => `$${i + 1}`).join(', ')})
+         ON CONFLICT (${this.keyConflict('workflow_uuid')}) DO NOTHING`,
+        Object.values(inputValues),
+      );
       const ret = rows[0];
       ret.class_name = ret.class_name ?? '';
       ret.config_name = ret.config_name ?? '';
@@ -3623,10 +6030,11 @@ export class SystemDatabase {
     }
   }
 
-  private async getWorkflowStatusValue(client: PoolClient, workflowID: string): Promise<string | undefined> {
+  private async getWorkflowStatusValue(client: PoolClient | Pool, workflowID: string): Promise<string | undefined> {
+    const params: unknown[] = [];
     const { rows } = await client.query<{ status: string }>(
-      `SELECT status FROM "${this.schemaName}".workflow_status WHERE workflow_uuid=$1`,
-      [workflowID],
+      `SELECT status FROM "${this.schemaName}".workflow_status WHERE ${this.wf(undefined, workflowID, params)}`,
+      params,
     );
     return rows.length === 0 ? undefined : rows[0].status;
   }
@@ -3637,8 +6045,6 @@ export class SystemDatabase {
     status: (typeof StatusString)[keyof typeof StatusString],
     options: {
       update?: {
-        output?: string | null;
-        error?: string | null;
         resetRecoveryAttempts?: boolean;
         queueName?: string | null;
         resetDeadline?: boolean;
@@ -3648,31 +6054,24 @@ export class SystemDatabase {
         resetNameTo?: string;
         setCompletedAt?: boolean;
         clearCompletedAt?: boolean;
+        ownerXid?: string | null;
       };
       where?: {
         status?: (typeof StatusString)[keyof typeof StatusString];
+        notStatus?: (typeof StatusString)[keyof typeof StatusString];
+        ownerXid?: string;
       };
       throwOnFailure?: boolean;
     } = {},
-  ): Promise<void> {
+  ): Promise<number> {
     // Use SQL now() so updated_at and completed_at (when set together) are
     // computed in the same statement against the same clock.
     const nowMsExpr = `(EXTRACT(EPOCH FROM now()) * 1000)::bigint`;
-    let setClause = `SET status=$2, updated_at=${nowMsExpr}`;
-    let whereClause = `WHERE workflow_uuid=$1`;
-    const args: (string | number | undefined)[] = [workflowID, status];
+    let setClause = `SET status=$1, updated_at=${nowMsExpr}`;
+    const args: unknown[] = [status];
+    let whereClause = `WHERE ${this.wf(undefined, workflowID, args)}`;
 
     const update = options.update ?? {};
-    if (update.output) {
-      const param = args.push(update.output);
-      setClause += `, output=$${param}`;
-    }
-
-    if (update.error) {
-      const param = args.push(update.error);
-      setClause += `, error=$${param}`;
-    }
-
     if (update.resetRecoveryAttempts) {
       setClause += `, recovery_attempts = 0`;
     }
@@ -3710,10 +6109,23 @@ export class SystemDatabase {
       setClause += `, completed_at = NULL`;
     }
 
+    if (update.ownerXid !== undefined) {
+      const param = args.push(update.ownerXid);
+      setClause += `, owner_xid=$${param}`;
+    }
+
     const where = options.where ?? {};
     if (where.status) {
       const param = args.push(where.status);
       whereClause += ` AND status=$${param}`;
+    }
+    if (where.notStatus) {
+      const param = args.push(where.notStatus);
+      whereClause += ` AND status!=$${param}`;
+    }
+    if (where.ownerXid !== undefined) {
+      const param = args.push(where.ownerXid);
+      whereClause += ` AND owner_xid=$${param}`;
     }
 
     const result = await client.query<workflow_status>(
@@ -3723,8 +6135,9 @@ export class SystemDatabase {
 
     const throwOnFailure = options.throwOnFailure ?? true;
     if (throwOnFailure && result.rowCount !== 1) {
-      throw new DBOSWorkflowConflictError(`Attempt to record transition of nonexistent workflow ${workflowID}`);
+      throw new DBOSNonExistentWorkflowError(`Attempt to record transition of nonexistent workflow ${workflowID}`);
     }
+    return result.rowCount ?? 0;
   }
 
   private async recordOperationResultInternal(
@@ -3740,47 +6153,94 @@ export class SystemDatabase {
       output?: string | null;
       error?: string | null;
       serialization?: string | null;
+      ownerChecked?: boolean;
+      // Columns recording the shard key of the child, resolved by the caller before binding its own key.
+      childValues?: Record<string, unknown>;
     } = {},
   ): Promise<void> {
+    const ownerXid = options.ownerChecked ? undefined : currentOwnerXid(workflowID);
+    if (ownerXid !== undefined) {
+      await this.checkOwner(client, workflowID, ownerXid);
+    }
+    const values: Record<string, unknown> = {
+      ...this.wfValues(workflowID),
+      workflow_uuid: workflowID,
+      function_id: functionID,
+      output: options.output ?? null,
+      error: options.error ?? null,
+      function_name: functionName,
+      child_workflow_id: options.childWorkflowID ?? null,
+      ...(options.childValues ?? this.childValues(options.childWorkflowID)),
+      started_at_epoch_ms: startTimeEpochMs,
+      completed_at_epoch_ms: endTimeEpochMs,
+      serialization: options.serialization ?? null,
+      // Mirrors the parent: only the running application records its steps.
+      application_name: this.appName ?? null,
+    };
+    const columns = Object.keys(values);
     try {
       const out = await client.query<operation_outputs>(
-        `INSERT INTO ${this.schemaName}.operation_outputs
-         (workflow_uuid, function_id, output, error, function_name, child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms, serialization)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-         ON CONFLICT (workflow_uuid, function_id) DO UPDATE
+        `INSERT INTO "${this.schemaName}".operation_outputs
+         (${columns.join(', ')}, retention_timestamp)
+         VALUES (${columns.map((_, i) => `$${i + 1}`).join(', ')}, (EXTRACT(EPOCH FROM now()) * 1000)::bigint)
+         ON CONFLICT (${this.keyConflict('workflow_uuid', 'function_id')}) DO UPDATE
          SET completed_at_epoch_ms = operation_outputs.completed_at_epoch_ms
          RETURNING completed_at_epoch_ms;`,
-        [
-          workflowID,
-          functionID,
-          options.output ?? null,
-          options.error ?? null,
-          functionName,
-          options.childWorkflowID ?? null,
-          startTimeEpochMs,
-          endTimeEpochMs,
-          options.serialization ?? null,
-        ],
+        Object.values(values),
       );
+      // A row already there with another completion time is this execution's own doing
+      // (a retry carries the same time), so it is nondeterminism, not a duplicate.
       if (
         checkConflict &&
         (out?.rowCount ?? 0) > 0 &&
         Number(out?.rows?.[0]?.completed_at_epoch_ms) !== endTimeEpochMs
       ) {
-        DBOSExecutor.globalInstance?.logger.warn(
-          `Step output for ${workflowID}(${functionID}):${functionName} already recorded`,
-        );
-        throw new DBOSWorkflowConflictError(workflowID);
+        throw new DBOSStepNondeterminismError(workflowID, functionID);
       }
     } catch (error) {
-      const err: DatabaseError = error as DatabaseError;
-      if (err.code === '40001' || err.code === '23505') {
-        // Serialization and primary key conflict (Postgres).
-        throw new DBOSWorkflowConflictError(workflowID);
-      } else {
-        throw err;
+      if ((error as DatabaseError).code === '23505') {
+        throw new DBOSStepNondeterminismError(workflowID, functionID);
       }
+      throw error;
     }
+  }
+
+  /** Run `fn` in a READ COMMITTED transaction on `client`, so an ownership check holds its row lock until the write commits. */
+  async inTransaction<T>(client: PoolClient, fn: () => Promise<T>): Promise<T> {
+    await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+    let result: T;
+    try {
+      result = await fn();
+    } catch (e) {
+      // Swallowed: a rollback failure must not mask why we are rolling back.
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw e;
+    }
+    await client.query('COMMIT');
+    return result;
+  }
+
+  /** Throw DBOSWorkflowConflictError unless ownerXid still owns the workflow; the row lock holds until commit, so no hand-off lands in between. */
+  async checkOwner(client: ClientBase, workflowID: string, ownerXid: string): Promise<void> {
+    const params: unknown[] = [];
+    const { rows } = await client.query<{ owner_xid: string | null }>(
+      `SELECT owner_xid FROM "${this.schemaName}".workflow_status WHERE ${this.wf(undefined, workflowID, params)} FOR NO KEY UPDATE`,
+      params,
+    );
+    if (rows[0]?.owner_xid !== ownerXid) {
+      throw new DBOSWorkflowConflictError(workflowID);
+    }
+  }
+
+  /** The workflow's current ownership token; null if unowned or missing. */
+  @dbRetry()
+  async getWorkflowOwner(workflowID: string): Promise<string | null> {
+    const params: unknown[] = [];
+    const { rows } = await this.pool.query<{ owner_xid: string | null }>(
+      `SELECT owner_xid FROM "${this.schemaName}".workflow_status WHERE ${this.wf(undefined, workflowID, params)}`,
+      params,
+    );
+    return rows[0]?.owner_xid ?? null;
   }
 
   async #getOperationResultAndThrowIfCancelled(
@@ -3790,11 +6250,13 @@ export class SystemDatabase {
   ): Promise<SystemDatabaseStoredResult | undefined> {
     await this.#checkIfCanceled(client, workflowID);
 
-    const { rows } = await client.query<operation_outputs>(
-      `SELECT output, error, child_workflow_id, function_name
+    const childKey = this.keyColumn(undefined, 'child_shard_key');
+    const params: unknown[] = [functionID];
+    const { rows } = await client.query<operation_outputs & ShardKeyColumns>(
+      `SELECT output, error, child_workflow_id, function_name, serialization${childKey !== undefined ? `, ${childKey}` : ''}
        FROM "${this.schemaName}".operation_outputs
-      WHERE workflow_uuid=$1 AND function_id=$2`,
-      [workflowID, functionID],
+      WHERE ${this.wf(undefined, workflowID, params)} AND function_id=$1`,
+      params,
     );
     if (rows.length === 0) {
       return undefined;
@@ -3803,7 +6265,10 @@ export class SystemDatabase {
         output: rows[0].output,
         error: rows[0].error,
         childWorkflowID: rows[0].child_workflow_id,
+        childShardKey: rows[0].child_shard_key ?? undefined,
         functionName: rows[0].function_name,
+        // Return serialization so recv/getEvent replay deserializes with the stored format, not the default.
+        serialization: rows[0].serialization,
       };
     }
   }
@@ -3821,6 +6286,9 @@ export class SystemDatabase {
       if (result.functionName !== functionName) {
         throw new DBOSUnexpectedStepError(workflowID, functionID, functionName, result.functionName!);
       }
+      if (result.error) {
+        throw await deserializeResError(result.error, result.serialization ?? null, this.serializer);
+      }
       return result.output;
     }
     const output = await func();
@@ -3834,72 +6302,73 @@ export class SystemDatabase {
       Date.now(),
       {
         output,
+        serialization: DBOSPortableJSON.name(),
       },
     );
     return output;
   }
 
-  #setWFCancelMap(workflowID: string) {
-    if (this.runningWorkflowMap.has(workflowID)) {
-      this.workflowCancellationMap.set(workflowID, true);
-    }
-    this.cancelWakeupMap.callCallbacks(workflowID);
-  }
-
-  #clearWFCancelMap(workflowID: string) {
-    if (this.workflowCancellationMap.has(workflowID)) {
-      this.workflowCancellationMap.delete(workflowID);
-    }
-  }
-
-  async #checkIfCanceled(client: PoolClient, workflowID: string): Promise<void> {
-    if (this.workflowCancellationMap.get(workflowID) === true) {
-      throw new DBOSWorkflowCancelledError(workflowID);
-    }
+  async #checkIfCanceled(client: PoolClient | Pool, workflowID: string): Promise<void> {
     const statusValue = await this.getWorkflowStatusValue(client, workflowID);
     if (statusValue === StatusString.CANCELLED) {
       throw new DBOSWorkflowCancelledError(workflowID);
     }
   }
 
+  // Durably records (or, on recovery, reads back) the wakeup deadline for a sleep or
+  // timeout so it survives recovery. Returns the absolute end time in epoch ms; the
+  // caller is responsible for actually waiting until then. Throws if the workflow has
+  // been cancelled.
+  // For an actual sleep, completed_at is the wake deadline so the step's duration reflects the
+  // sleep; a timeout marker records zero duration since its deadline may never be reached.
+  @dbRetry()
+  async durableSleepInternal(
+    workflowID: string,
+    functionID: number,
+    durationMS: number,
+    recordCompletionAtDeadline: boolean = false,
+  ): Promise<number> {
+    // The caller's own workflow, even where a same-ID workflow is bound as a target.
+    return await this.ownKey(workflowID, undefined, () =>
+      this.#durableSleep(workflowID, functionID, durationMS, recordCompletionAtDeadline),
+    );
+  }
+
   async #durableSleep(
     workflowID: string,
     functionID: number,
     durationMS: number,
-    maxSleepPerIteration?: number,
-  ): Promise<{ promise: Promise<void>; cancel: () => void; endTime: number }> {
-    if (maxSleepPerIteration === undefined) maxSleepPerIteration = durationMS;
+    recordCompletionAtDeadline: boolean,
+  ): Promise<number> {
+    const startTimeMs = Date.now();
+    // Round once so the deadline stays integral: completed_at_epoch_ms is BIGINT and rejects fractional values.
+    const endTimeMs = startTimeMs + Math.ceil(durationMS);
 
-    const curTime = Date.now();
-    let endTimeMs = curTime + durationMS;
-
-    const client = await this.pool.connect();
+    const client = await this.connect();
     try {
       const res = await this.#getOperationResultAndThrowIfCancelled(client, workflowID, functionID);
       if (res) {
         if (res.functionName !== DBOS_FUNCNAME_SLEEP) {
           throw new DBOSUnexpectedStepError(workflowID, functionID, DBOS_FUNCNAME_SLEEP, res.functionName!);
         }
-        endTimeMs = JSON.parse(res.output!) as number;
-      } else {
-        await this.recordOperationResultInternal(
+        return JSON.parse(res.output!) as number;
+      }
+      await this.inTransaction(client, () =>
+        this.recordOperationResultInternal(
           client,
           workflowID,
           functionID,
           DBOS_FUNCNAME_SLEEP,
           false,
-          Date.now(),
-          Date.now(),
+          startTimeMs,
+          recordCompletionAtDeadline ? endTimeMs : startTimeMs,
           {
             output: DBOSPortableJSON.stringify(endTimeMs),
             serialization: DBOSPortableJSON.name(),
           },
-        );
-      }
-      return {
-        ...cancellableSleep(Math.max(Math.min(maxSleepPerIteration, endTimeMs - curTime), 0)),
-        endTime: endTimeMs,
-      };
+        ),
+      );
+      return endTimeMs;
     } finally {
       client.release();
     }
@@ -3911,11 +6380,41 @@ export class SystemDatabase {
    * workflow listener by resolving its promise.
    */
   reconnectTimeout: NodeJS.Timeout | null = null;
+  #notificationsStopped: boolean = false;
+
+  // Disown the client and release it once; a late socket error must not re-enter this path and release again.
+  #retireNotificationsClient(client: PoolClient) {
+    if (this.notificationsClient === client) {
+      this.notificationsClient = null;
+    }
+    client.removeAllListeners();
+    // Cover the release() call itself, which tears the connection down and can surface a socket error.
+    client.on('error', () => {});
+    try {
+      client.release(true);
+    } catch (e) {
+      this.logger.warn(`Error releasing notifications client: ${String(e)}`);
+    }
+    // release() re-attached pg's idle listener, which would forward this dead client's error on to the
+    // pool. A caller's pool may have no 'error' listener at all, so this client's death has to stay ours.
+    client.removeAllListeners('error');
+    client.on('error', (e: Error) => this.logger.warn(`Error on retired notifications client: ${e}`));
+  }
+
+  // Shutdown can begin during any await in the setup below; releasing the client instead of carrying on
+  // keeps pool.end() from waiting on a connection that will never be published.
+  #abandonIfStopped(client: PoolClient): boolean {
+    if (!this.#notificationsStopped) {
+      return false;
+    }
+    this.#retireNotificationsClient(client);
+    return true;
+  }
 
   async #listenForNotifications() {
     const connect = async () => {
       const reconnect = () => {
-        if (this.reconnectTimeout) {
+        if (this.reconnectTimeout || this.#notificationsStopped) {
           return;
         }
         this.reconnectTimeout = setTimeout(async () => {
@@ -3924,11 +6423,25 @@ export class SystemDatabase {
         }, 1000);
       };
 
-      let client: PoolClient | null = null;
+      let acquired: PoolClient | null = null;
       try {
-        client = await this.pool.connect();
-        await client.query('LISTEN dbos_notifications_channel;');
-        await client.query('LISTEN dbos_workflow_events_channel;');
+        const client = await this.connect();
+        acquired = client;
+        if (this.#abandonIfStopped(client)) return;
+
+        // Catch errors during setup
+        const setup: { error: Error | null } = { error: null };
+        const onSetupError = (err: Error) => {
+          setup.error = err;
+        };
+        client.on('error', onSetupError);
+
+        await client.query(`LISTEN ${DBOS_NOTIFICATIONS_CHANNEL};`);
+        await client.query(`LISTEN ${DBOS_WORKFLOW_EVENTS_CHANNEL};`);
+        await client.query(`LISTEN ${DBOS_STREAMS_CHANNEL};`);
+
+        // The self-test's NOTIFY needs a second client, which can queue forever on an ending pool.
+        if (this.#abandonIfStopped(client)) return;
 
         // Self-test: verify LISTEN actually works by sending a NOTIFY and checking it arrives.
         // If a transaction-mode pooler (e.g. PgBouncer pool_mode=transaction) is in the path,
@@ -3941,10 +6454,16 @@ export class SystemDatabase {
         };
         client.on('notification', onSelfTest);
         await this.pool.query("NOTIFY dbos_notifications_channel, 'dbos_listen_selftest'");
-        for (let i = 0; i < 30 && !selfTestReceived; i++) {
+        for (let i = 0; i < 30 && !selfTestReceived && !setup.error && !this.#notificationsStopped; i++) {
           await new Promise((r) => setTimeout(r, 100));
         }
         client.removeListener('notification', onSelfTest);
+
+        // Both checked before the warning below, so an abandoned self-test is not reported as a pooler problem.
+        if (this.#abandonIfStopped(client)) return;
+        if (setup.error) {
+          throw setup.error;
+        }
 
         if (!selfTestReceived) {
           this.logger.warn(
@@ -3957,28 +6476,27 @@ export class SystemDatabase {
 
         const handler = (msg: Notification) => {
           if (!this.shouldUseDBNotifications) return;
-          if (msg.channel === 'dbos_notifications_channel' && msg.payload) {
+          if (msg.channel === DBOS_NOTIFICATIONS_CHANNEL && msg.payload) {
             this.notificationsMap.callCallbacks(msg.payload);
-          } else if (msg.channel === 'dbos_workflow_events_channel' && msg.payload) {
+          } else if (msg.channel === DBOS_WORKFLOW_EVENTS_CHANNEL && msg.payload) {
             this.workflowEventsMap.callCallbacks(msg.payload);
+          } else if (msg.channel === DBOS_STREAMS_CHANNEL && msg.payload) {
+            this.streamsMap.callCallbacks(msg.payload);
           }
         };
 
+        client.removeListener('error', onSetupError);
         client.on('notification', handler);
         client.on('error', (err: Error) => {
           this.logger.warn(`Error in notifications client: ${err}`);
-          if (client) {
-            client.removeAllListeners();
-            client.release(true);
-          }
+          this.#retireNotificationsClient(client);
           reconnect();
         });
         this.notificationsClient = client;
       } catch (error) {
         this.logger.warn(`Error in notifications listener: ${String(error)}`);
-        if (client) {
-          client.removeAllListeners();
-          client.release(true);
+        if (acquired) {
+          this.#retireNotificationsClient(acquired);
         }
         reconnect();
       }

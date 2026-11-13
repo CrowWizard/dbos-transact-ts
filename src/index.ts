@@ -1,27 +1,36 @@
-export { DBOS, RecvOptions, GetEventOptions, SetWorkflowDelayOptions } from './dbos';
+export {
+  DBOS,
+  RecvOptions,
+  SleepOptions,
+  GetEventOptions,
+  GetResultOptions,
+  PollingOptions,
+  WaitFirstOptions,
+  WaitAllOptions,
+  SetWorkflowDelayOptions,
+  ReadStreamOptions,
+  ReadStreamOffsetOptions,
+  ShardKeyOptions,
+  StoreExternalObjectOptions,
+} from './dbos';
 
-export { DBOSClient } from './client';
+export type { StepReservation } from './dbos';
 
-export { SchedulerMode, SchedulerConfig } from './scheduler/scheduler_decorator';
+export { DBOSClient, ClientStoreExternalObjectOptions } from './client';
+
+export type { ExternalObjectRef, ExternalStore } from './external_storage';
 
 export { WorkflowSchedule, ScheduledWorkflowFn, ScheduleOptions } from './scheduler/scheduler';
 
-export {
-  AlertHandler,
-  ArgDataType,
-  DBOSDataType,
-  DBOSLifecycleCallback,
-  DBOSMethodMiddlewareInstaller,
-  ExternalRegistration,
-  MethodRegistrationBase,
-  ArgName,
-} from './decorators';
+export { AlertHandler, DBOSLifecycleCallback, ExternalRegistration, MethodRegistrationBase } from './decorators';
 
-export { WorkflowQueue } from './wfqueue';
+export type { WorkflowQueue } from './wfqueue';
 
 export * as Error from './error';
 
-export { DBOSWorkflowConflictError } from './error';
+export { DBOSWorkflowConflictError, DBOSStepNondeterminismError, DBOSWorkflowSuspendedError } from './error';
+
+export { PortableWorkflowError } from '../schemas/system_db_schema';
 
 export {
   InputSchema,
@@ -30,9 +39,9 @@ export {
   StatusString,
   WorkflowStatusString,
   GetWorkflowsInput,
-  GetWorkflowsInput as GetQueuedWorkflowsInput,
   ListWorkflowStepsOptions,
   WorkflowStatus,
+  WorkflowIDReusePolicy,
 } from './workflow';
 
 export { Debouncer, DebouncerClient } from './debouncer';
@@ -41,8 +50,14 @@ export { SerializationRecipe, DBOSSerializer } from './serialization';
 
 export { StepConfig } from './step';
 
-export { FunctionName, ConfiguredInstance, MethodParameter } from './decorators';
+export { FunctionName, ConfiguredInstance } from './decorators';
 
-export { DBOSConfig, DBOSExternalState, OtelAttributeFormat } from './dbos-executor';
+export { DBOSConfig, OtelAttributeFormat } from './dbos-executor';
 
-export { VersionInfo } from './system_database';
+export { DLogger, ContextualMetadata, StackTrace } from './telemetry/logs';
+
+export { DBOSSpan } from './telemetry/traces';
+
+export { VersionInfo, ApplicationRowCounts } from './system_database';
+
+export { EnqueueWorkflowOptions } from './enqueue_options';

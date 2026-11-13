@@ -1,35 +1,37 @@
-import { randomUUID } from 'node:crypto';
 import { DBOS, DBOSClient } from '.';
-import { StartWorkflowParams } from './dbos';
+import { runTransactionalInternalStep, StartWorkflowParams } from './dbos';
 import { DBOSExecutor } from './dbos-executor';
+import { getNextWFID } from './context';
 import {
+  ensureDBOSIsLaunched,
   getFunctionRegistration,
   getFunctionRegistrationByName,
   getRegisteredFunctionClassName,
   UntypedAsyncFunction,
 } from './decorators';
-import { getDBOSErrorCode, QueueDedupIDDuplicated } from './error';
-import { DEBOUNCER_WORKLOW_NAME, INTERNAL_QUEUE_NAME } from './utils';
+import { DBOSError, DBOSQueueDuplicatedError, getDBOSErrorCode, QueueDedupIDDuplicated } from './error';
+import { serializeArgs, serializeFunctionInputOutput } from './serialization';
+import { DebounceResult, InternalEnqueueOptions } from './system_database';
+import { INTERNAL_QUEUE_NAME } from './utils';
+import { WorkflowHandle, WorkflowSerializationFormat } from './workflow';
+import { PortableWorkflowError } from '../schemas/system_db_schema';
 
-// Parameters for the debouncer workflow
-interface DebouncerWorkflowParams {
+// Parameters for the debouncer
+interface DebouncerParams {
   workflowName: string;
   workflowClassName: string;
   startWorkflowParams?: StartWorkflowParams;
   debounceTimeoutMs?: number;
-}
-
-// The message sent from a debounce to the debouncer workflow
-interface DebouncerMessage {
-  args: unknown[];
-  messageID: string;
-  debouncePeriodMs: number;
+  // The application the debounce acts for; undefined means the caller's own.
+  applicationName?: string;
 }
 
 interface DebouncerConfig<Args extends unknown[], Return> {
   workflow: (...args: Args) => Promise<Return>;
   startWorkflowParams?: StartWorkflowParams;
   debounceTimeoutMs?: number;
+  /** The application this debounce acts for. Defaults to the caller's own. */
+  applicationName?: string;
 }
 
 interface DebouncerClientConfig {
@@ -37,40 +39,110 @@ interface DebouncerClientConfig {
   workflowClassName?: string;
   startWorkflowParams?: StartWorkflowParams;
   debounceTimeoutMs?: number;
+  // Serialization format for the workflow's inputs, e.g. 'portable' for a workflow registered with portable serialization.
+  serializationType?: WorkflowSerializationFormat;
+  /** The application this debounce acts for. Defaults to the client's own. */
+  applicationName?: string;
 }
 
-const _DEBOUNCER_TOPIC = 'DEBOUNCER_TOPIC';
+/**
+ * True if `e` is a queue-deduplication error, including the portable-serialization
+ * replay form, which carries only the original type name.
+ */
+function isQueueDeduplicatedError(e: unknown): boolean {
+  if (e instanceof Error && getDBOSErrorCode(e) === QueueDedupIDDuplicated) {
+    return true;
+  }
+  return e instanceof PortableWorkflowError && e.name === DBOSQueueDuplicatedError.name;
+}
 
-export const debouncerWorkflowFunction = async (
-  initialDebouncePeriodMs: number,
-  cfg: DebouncerWorkflowParams,
-  ...args: unknown[]
-) => {
-  let workflowInputs = args;
-  const debounceDeadlineEpochMs = cfg.debounceTimeoutMs ? Date.now() + cfg.debounceTimeoutMs : Number.MAX_VALUE;
-  let debouncePeriodMs = initialDebouncePeriodMs;
-  while (Date.now() < debounceDeadlineEpochMs) {
-    const timeUntilDeadline = Math.max(debounceDeadlineEpochMs - Date.now(), 0);
-    const timeoutMs = Math.min(debouncePeriodMs, timeUntilDeadline);
-    const message = await DBOS.recv<DebouncerMessage>(_DEBOUNCER_TOPIC, timeoutMs / 1000);
-    if (message === null) {
-      break;
-    } else {
-      workflowInputs = message['args'];
-      debouncePeriodMs = message['debouncePeriodMs'];
-      await DBOS.setEvent(message.messageID, message.messageID);
-    }
+/**
+ * A debounce owns the workflow's deduplication ID (the debounce key) and its delay
+ * (the debounce period), so a caller must not also set them. Priority and partition
+ * keys are rejected because they cannot apply to a debounced enqueue. A server-side
+ * debounce also rejects a caller-set applicationName; the client accepts it as a fallback.
+ */
+function rejectConflictingOptions(params: StartWorkflowParams | undefined, rejectApplicationName = false): void {
+  const enqueueOptions = params?.enqueueOptions;
+  if (rejectApplicationName && enqueueOptions?.applicationName !== undefined) {
+    throw new DBOSError(
+      "Cannot debounce a workflow with an applicationName set: the debouncer's own applicationName option names the target application.",
+    );
   }
-  const methReg = getFunctionRegistrationByName(cfg.workflowClassName, cfg.workflowName);
-  if (!methReg || !methReg.registeredFunction) {
-    throw Error(`Invalid workflow name provided to debouncer: ${cfg.workflowName}`);
+  if (enqueueOptions?.deduplicationID !== undefined) {
+    throw new DBOSError(
+      'Cannot debounce a workflow with a deduplicationID set: the debounce key is used as the workflow deduplication ID.',
+    );
   }
-  const func = methReg?.registeredFunction as UntypedAsyncFunction;
-  await DBOS.startWorkflow(func, cfg.startWorkflowParams)(...workflowInputs);
-};
+  if (enqueueOptions?.delaySeconds !== undefined) {
+    throw new DBOSError('Cannot debounce a workflow with a delay set: the debounce period controls the delay.');
+  }
+  if (enqueueOptions?.priority !== undefined) {
+    throw new DBOSError(
+      'Cannot debounce a workflow with a priority set: priority is not supported for debounced workflows.',
+    );
+  }
+  if (enqueueOptions?.queuePartitionKey !== undefined) {
+    throw new DBOSError(
+      'Cannot debounce a workflow with a queue partition key set: partition keys are not supported for debounced workflows.',
+    );
+  }
+  if (params?.duplicationPolicy === 'return-existing') {
+    throw new DBOSError(
+      "Cannot debounce a workflow with duplicationPolicy 'return-existing': a debounce owns the deduplication behavior.",
+    );
+  }
+  if (params?.workflowIDReusePolicy === 'reject') {
+    throw new DBOSError(
+      "Cannot debounce a workflow with workflowIDReusePolicy 'reject': a debounce owns how its workflow is started.",
+    );
+  }
+}
+
+// The action a debounce caller should take after a bounce attempt.
+type BounceAction = 'return' | 'enqueue' | 'raise' | 'retry';
+
+/**
+ * Decide what a debounce caller should do after a bounce attempt.
+ * - 'return': an existing debounced workflow was extended; return a handle to it.
+ * - 'enqueue': the key is unheld; enqueue a fresh debounced workflow.
+ * - 'raise': the key is held by a non-debounced workflow, by a different workflow
+ *   whose debounce key collides, or by an application other than the target; surface the conflict.
+ * - 'retry': a same-name debounced holder flipped out of DELAYED mid-bounce (a rare race); retry.
+ */
+function classifyBounce(
+  result: DebounceResult,
+  workflowName: string,
+  workflowClassName: string,
+  targetApplicationName?: string,
+): BounceAction {
+  if (result.bouncedWorkflowID !== null) {
+    return 'return';
+  }
+  if (result.holderWorkflowID === null) {
+    return 'enqueue';
+  }
+  if (!result.holderIsDebounced) {
+    return 'raise';
+  }
+  if (result.holderWorkflowName !== workflowName || (result.holderWorkflowClassName ?? '') !== workflowClassName) {
+    return 'raise';
+  }
+  // A foreign holder never leaves DELAYED on the target's account, so retrying would spin.
+  // Missing on a checkpoint recorded before holders carried an owner, which reads as unclaimed.
+  const holderApplicationName = result.holderApplicationName ?? null;
+  if (
+    targetApplicationName !== undefined &&
+    holderApplicationName !== null &&
+    holderApplicationName !== targetApplicationName
+  ) {
+    return 'raise';
+  }
+  return 'retry';
+}
 
 export class Debouncer<Args extends unknown[], Return> {
-  private readonly cfg: DebouncerWorkflowParams;
+  private readonly cfg: DebouncerParams;
   constructor(params: DebouncerConfig<Args, Return>) {
     const wInfo = getFunctionRegistration(params.workflow);
     this.cfg = {
@@ -78,68 +150,108 @@ export class Debouncer<Args extends unknown[], Return> {
       workflowClassName: getRegisteredFunctionClassName(params.workflow),
       startWorkflowParams: params.startWorkflowParams,
       debounceTimeoutMs: params.debounceTimeoutMs,
+      applicationName: params.applicationName,
     };
   }
 
-  async debounce(debounceKey: string, debouncePeriodMs: number, ...args: Args) {
+  async debounce(debounceKey: string, debouncePeriodMs: number, ...args: Args): Promise<WorkflowHandle<Return>> {
     if (debouncePeriodMs <= 0) {
       throw Error(`debouncePeriodMs must be positive, not ${debouncePeriodMs}`);
     }
-    const cfg = { ...this.cfg };
-    cfg.startWorkflowParams = this.cfg.startWorkflowParams ? { ...this.cfg.startWorkflowParams } : {};
-    cfg.startWorkflowParams.workflowID = cfg.startWorkflowParams.workflowID ?? (await DBOS.randomUUID());
+    ensureDBOSIsLaunched('debounce');
+    rejectConflictingOptions(this.cfg.startWorkflowParams, true);
+
+    const exec = DBOSExecutor.globalInstance!;
+    const queueName = this.cfg.startWorkflowParams?.queueName ?? INTERNAL_QUEUE_NAME;
+    const deduplicationID = `${this.cfg.workflowClassName}.${this.cfg.workflowName}-${debounceKey}`;
+
+    // Capture a pinned workflow ID once: it is re-applied on every enqueue attempt (a lost
+    // dedup race consumes it before throwing) and goes unused when a bounce coalesces.
+    const pinnedWorkflowID = getNextWFID(this.cfg.startWorkflowParams?.workflowID);
+
+    // Resolve the workflow function so bounced inputs serialize identically to enqueued ones.
+    const methReg = getFunctionRegistrationByName(this.cfg.workflowClassName, this.cfg.workflowName);
+    if (!methReg || !methReg.registeredFunction) {
+      throw new DBOSError(`Invalid workflow name provided to debouncer: ${this.cfg.workflowName}`);
+    }
+    const func = methReg.registeredFunction as UntypedAsyncFunction;
+    const serializationType = methReg.workflowConfig?.serialization;
+    // One owner for the whole operation: the bounce scope, the conflict check, and the fresh enqueue must agree.
+    const targetApp = this.cfg.applicationName ?? exec.systemDatabase.appName;
+
     while (true) {
-      const deduplicationID = `${cfg.workflowClassName}.${cfg.workflowName}-${debounceKey}`;
+      // Try to extend an existing debounced workflow for this key first (the sole coalescing mechanism).
+      // In a workflow, the bounce commits atomically with its step checkpoint so a crash can never
+      // commit one without the other, which on recovery would re-bounce work that already ran.
+      const funcArgs = await serializeFunctionInputOutput(
+        serializationType === 'portable' ? { positionalArgs: args } : args,
+        [this.cfg.workflowName, '<arguments>'],
+        exec.serializer,
+        serializationType,
+      );
+      const bounceParams = {
+        workflowName: this.cfg.workflowName,
+        workflowClassName: this.cfg.workflowClassName,
+        queueName,
+        deduplicationID,
+        delayUntilEpochMS: Date.now() + debouncePeriodMs,
+        input: funcArgs.stringified,
+        serialization: funcArgs.sername,
+        applicationName: targetApp,
+      };
+      const result = await runTransactionalInternalStep<DebounceResult>(
+        (client) => exec.systemDatabase.debounceDelayedWorkflow(bounceParams, client),
+        'DBOS.debounceDelayedWorkflow',
+      );
+
+      const action = classifyBounce(result, this.cfg.workflowName, this.cfg.workflowClassName, targetApp);
+      if (action === 'return') {
+        return DBOS.retrieveWorkflow<Return>(result.bouncedWorkflowID!);
+      }
+      if (action === 'raise') {
+        throw new DBOSQueueDuplicatedError(pinnedWorkflowID ?? '', queueName, deduplicationID);
+      }
+      if (action === 'retry') {
+        continue;
+      }
+
+      // action === 'enqueue': the key is free, create a fresh debounced workflow.
+      const debounceDeadlineEpochMS = this.cfg.debounceTimeoutMs ? Date.now() + this.cfg.debounceTimeoutMs : undefined;
       try {
-        // Attempt to enqueue a debouncer for this workflow
-        await DBOS.startWorkflow(DBOSExecutor.debouncerWorkflow!, {
-          queueName: INTERNAL_QUEUE_NAME,
-          enqueueOptions: { deduplicationID },
-        })(debouncePeriodMs, cfg, ...args);
-        return DBOS.retrieveWorkflow<Return>(cfg.startWorkflowParams.workflowID);
+        const enqueueOptions: InternalEnqueueOptions = {
+          applicationVersion: this.cfg.startWorkflowParams?.enqueueOptions?.applicationVersion,
+          deduplicationID,
+          delaySeconds: debouncePeriodMs / 1000,
+          debounceDeadlineEpochMS,
+          isDebounced: true,
+          applicationName: this.cfg.applicationName,
+        };
+        // A null timeout detaches any propagated workflow deadline: a debounce delay can be long,
+        // so an inherited absolute deadline could expire before the debounced workflow ever runs.
+        const handle = await DBOS.startWorkflow(func, {
+          workflowID: pinnedWorkflowID,
+          queueName,
+          timeoutMS: this.cfg.startWorkflowParams?.timeoutMS ?? null,
+          workflowAttributes: this.cfg.startWorkflowParams?.workflowAttributes,
+          authenticatedUser: this.cfg.startWorkflowParams?.authenticatedUser,
+          authenticatedRoles: this.cfg.startWorkflowParams?.authenticatedRoles,
+          enqueueOptions,
+        })(...args);
+        return handle as WorkflowHandle<Return>;
       } catch (e) {
-        // If there is already a debouncer, send a message to it.
-        if (e instanceof Error && getDBOSErrorCode(e) === QueueDedupIDDuplicated) {
-          const dedupWorkflowID = await DBOS.runStep(async () => {
-            return await DBOSExecutor.globalInstance?.systemDatabase.getDeduplicatedWorkflow(
-              INTERNAL_QUEUE_NAME,
-              deduplicationID,
-            );
-          });
-          if (!dedupWorkflowID) {
-            continue;
-          } else {
-            const messageID = await DBOS.randomUUID();
-            const message: DebouncerMessage = {
-              messageID,
-              args,
-              debouncePeriodMs,
-            };
-            await DBOS.send(dedupWorkflowID, message, _DEBOUNCER_TOPIC);
-            // Wait for the debouncer to acknowledge receipt of the message.
-            // If the message is not acknowledged, this likely means the debouncer started its workflow
-            // and exited without processing this message, so try again.
-            const event = await DBOS.getEvent(dedupWorkflowID, messageID, 1000);
-            if (!event) {
-              continue;
-            }
-            // Retrieve the user workflow ID from the input to the debouncer
-            // and return a handle to it.
-            const dedupWorkflowInput = await DBOS.retrieveWorkflow(dedupWorkflowID).getWorkflowInputs();
-            const typedInput = dedupWorkflowInput as Parameters<typeof debouncerWorkflowFunction>;
-            const userWorkflowID = typedInput[1].startWorkflowParams!.workflowID!;
-            return DBOS.retrieveWorkflow<Return>(userWorkflowID);
-          }
-        } else {
+        // A concurrent debounce grabbed the key between bounce and enqueue; loop to bounce that workflow instead.
+        if (!isQueueDeduplicatedError(e)) {
           throw e;
         }
+        continue;
       }
     }
   }
 }
 
 export class DebouncerClient {
-  private readonly cfg: DebouncerWorkflowParams;
+  private readonly cfg: DebouncerParams;
+  private readonly serializationType: WorkflowSerializationFormat;
   constructor(
     readonly client: DBOSClient,
     params: DebouncerClientConfig,
@@ -149,63 +261,79 @@ export class DebouncerClient {
       workflowClassName: params.workflowClassName || '',
       startWorkflowParams: params.startWorkflowParams,
       debounceTimeoutMs: params.debounceTimeoutMs,
+      applicationName: params.applicationName,
     };
+    this.serializationType = params.serializationType;
   }
 
-  async debounce(debounceKey: string, debouncePeriodMs: number, ...args: unknown[]) {
+  async debounce(debounceKey: string, debouncePeriodMs: number, ...args: unknown[]): Promise<WorkflowHandle<unknown>> {
     if (debouncePeriodMs <= 0) {
       throw Error(`debouncePeriodMs must be positive, not ${debouncePeriodMs}`);
     }
-    const cfg = { ...this.cfg };
-    cfg.startWorkflowParams = this.cfg.startWorkflowParams ? { ...this.cfg.startWorkflowParams } : {};
-    cfg.startWorkflowParams.workflowID = cfg.startWorkflowParams.workflowID ?? String(randomUUID());
+    rejectConflictingOptions(this.cfg.startWorkflowParams);
+
+    const queueName = this.cfg.startWorkflowParams?.queueName ?? INTERNAL_QUEUE_NAME;
+    const deduplicationID = `${this.cfg.workflowClassName}.${this.cfg.workflowName}-${debounceKey}`;
+    // One owner for the whole operation: the debouncer's target wins, then the workflow options', then the client's.
+    const targetApp =
+      this.cfg.applicationName ??
+      this.cfg.startWorkflowParams?.enqueueOptions?.applicationName ??
+      this.client.applicationName;
+
     while (true) {
-      const deduplicationID = `${cfg.workflowClassName}.${cfg.workflowName}-${debounceKey}`;
+      // Try to extend an existing debounced workflow for this key first (the sole coalescing mechanism).
+      const serparam = await serializeArgs(args, undefined, this.client.serializer, this.serializationType);
+      const result = await this.client.debounceDelayedWorkflow({
+        workflowName: this.cfg.workflowName,
+        workflowClassName: this.cfg.workflowClassName,
+        queueName,
+        deduplicationID,
+        delayUntilEpochMS: Date.now() + debouncePeriodMs,
+        input: serparam.serializedValue,
+        serialization: serparam.serialization,
+        applicationName: targetApp,
+      });
+
+      const action = classifyBounce(result, this.cfg.workflowName, this.cfg.workflowClassName, targetApp);
+      if (action === 'return') {
+        return this.client.retrieveWorkflow(result.bouncedWorkflowID!);
+      }
+      if (action === 'raise') {
+        throw new DBOSQueueDuplicatedError(this.cfg.startWorkflowParams?.workflowID ?? '', queueName, deduplicationID);
+      }
+      if (action === 'retry') {
+        continue;
+      }
+
+      // action === 'enqueue': the key is free, create a fresh debounced workflow.
+      const debounceDeadlineEpochMS = this.cfg.debounceTimeoutMs ? Date.now() + this.cfg.debounceTimeoutMs : undefined;
       try {
-        // Attempt to enqueue a debouncer for this workflow
-        await this.client.enqueue(
-          { workflowName: DEBOUNCER_WORKLOW_NAME, queueName: INTERNAL_QUEUE_NAME, deduplicationID },
-          debouncePeriodMs,
-          cfg,
-          ...args,
-        );
-        return this.client.retrieveWorkflow(cfg.startWorkflowParams.workflowID);
-      } catch (e) {
-        // If there is already a debouncer, send a message to it.
-        if (e instanceof Error && getDBOSErrorCode(e) === QueueDedupIDDuplicated) {
-          // Access the private client system database
-          // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-explicit-any
-          const dedupWorkflowID = (await (this.client as any).systemDatabase.getDeduplicatedWorkflow(
-            INTERNAL_QUEUE_NAME,
+        const workflowID = await this.client.enqueueDebounced(
+          {
+            workflowName: this.cfg.workflowName,
+            workflowClassName: this.cfg.workflowClassName || undefined,
+            queueName,
+            workflowID: this.cfg.startWorkflowParams?.workflowID,
+            workflowTimeoutMS: this.cfg.startWorkflowParams?.timeoutMS ?? undefined,
+            appVersion: this.cfg.startWorkflowParams?.enqueueOptions?.applicationVersion,
+            attributes: this.cfg.startWorkflowParams?.workflowAttributes,
+            authenticatedUser: this.cfg.startWorkflowParams?.authenticatedUser,
+            authenticatedRoles: this.cfg.startWorkflowParams?.authenticatedRoles,
             deduplicationID,
-          )) as string;
-          if (!dedupWorkflowID) {
-            continue;
-          } else {
-            const messageID = String(randomUUID());
-            const message: DebouncerMessage = {
-              messageID,
-              args,
-              debouncePeriodMs,
-            };
-            await this.client.send(dedupWorkflowID, message, _DEBOUNCER_TOPIC);
-            // Wait for the debouncer to acknowledge receipt of the message.
-            // If the message is not acknowledged, this likely means the debouncer started its workflow
-            // and exited without processing this message, so try again.
-            const event = await this.client.getEvent(dedupWorkflowID, messageID, 1000);
-            if (!event) {
-              continue;
-            }
-            // Retrieve the user workflow ID from the input to the debouncer
-            // and return a handle to it.
-            const dedupWorkflowInput = await this.client.retrieveWorkflow(dedupWorkflowID).getWorkflowInputs();
-            const typedInput = dedupWorkflowInput as Parameters<typeof debouncerWorkflowFunction>;
-            const userWorkflowID = typedInput[1].startWorkflowParams!.workflowID!;
-            return this.client.retrieveWorkflow(userWorkflowID);
-          }
-        } else {
+            delaySeconds: debouncePeriodMs / 1000,
+            serializationType: this.serializationType,
+            applicationName: targetApp,
+          },
+          debounceDeadlineEpochMS,
+          args,
+        );
+        return this.client.retrieveWorkflow(workflowID);
+      } catch (e) {
+        // A concurrent debounce grabbed the key between bounce and enqueue; loop to bounce that workflow instead.
+        if (!isQueueDeduplicatedError(e)) {
           throw e;
         }
+        continue;
       }
     }
   }

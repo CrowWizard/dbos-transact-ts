@@ -1,13 +1,7 @@
 import { spawnSync } from 'node:child_process';
-import {
-  ConfiguredInstance,
-  DBOS,
-  DBOSClient,
-  DBOSConfig,
-  DBOSMethodMiddlewareInstaller,
-  MethodRegistrationBase,
-} from '../src';
-import { generateDBOSTestConfig, reexecuteWorkflowById, setUpDBOSTestSysDb } from './helpers';
+import { ConfiguredInstance, DBOS, DBOSClient, DBOSConfig } from '../src';
+import { getAllRegisteredClassNames, getAllRegisteredFunctions } from '../src/decorators';
+import { generateDBOSTestConfig, reexecuteWorkflowById, setUpDBOSTestSysDb, usingSharding } from './helpers';
 
 @DBOS.className('ClassA')
 class TestClass {
@@ -51,23 +45,8 @@ class TestClassInst extends ConfiguredInstance {
 const instA = new TestClassInst('A');
 const instB = new TestClassInst('B');
 
-class TestMWC implements DBOSMethodMiddlewareInstaller {
-  seenClasses: Set<string> = new Set();
-  seenMethods: Set<string> = new Set();
-
-  installMiddleware(methodReg: MethodRegistrationBase): void {
-    const rcn = methodReg.className;
-    const rfn = methodReg.name;
-
-    this.seenClasses.add(rcn);
-    this.seenMethods.add(`${rcn}/${rfn}`);
-  }
-}
-
 describe('rename_tests', () => {
   let config: DBOSConfig;
-  let collector: TestMWC = new TestMWC();
-
   beforeAll(async () => {
     config = generateDBOSTestConfig();
     expect(config.systemDatabaseUrl).toBeDefined();
@@ -76,8 +55,6 @@ describe('rename_tests', () => {
   });
 
   beforeEach(async () => {
-    collector = new TestMWC();
-    DBOS.registerMiddlewareInstaller(collector);
     (DBOS.associateClassWithInfo('test1', TestClass) as { key?: string }).key = 'a';
     (
       DBOS.associateFunctionWithInfo('test2', TestClassInst.stepTestStatic, { name: 'tibs' }).regInfo as {
@@ -104,13 +81,10 @@ describe('rename_tests', () => {
     expect(rvib).toBe(1000);
 
     // Get registered classes
-    const sc: string[] = [];
-    collector.seenClasses.forEach((v) => sc.push(v));
-    expect(sc.toSorted()).toStrictEqual(['ClassA', 'ClassB']);
+    expect(getAllRegisteredClassNames().toSorted()).toStrictEqual(['ClassA', 'ClassB']);
 
     // Get registered workflows
-    const sw: string[] = [];
-    collector.seenMethods.forEach((v) => sw.push(v));
+    const sw = getAllRegisteredFunctions().map((r) => `${r.className}/${r.name}`);
     expect(sw.filter((n) => n.includes('wf')).toSorted()).toStrictEqual([
       'ClassA/wfAStatic',
       'ClassB/wfBInstance',
@@ -181,6 +155,9 @@ describe('rename_tests', () => {
     expect(DBOS.getAssociatedInfo('test2', TestClassInst, 'tibs').length).toBe(1);
     expect(DBOS.getAssociatedInfo('test2', 'ClassB', 'tibs').length).toBe(1);
     expect(DBOS.getAssociatedInfo('test2', TestClassInst, 'tibs')[0].methodConfig).toStrictEqual({ key: 'b' });
+
+    // The scripts below run in processes outside the sharded run's harness.
+    if (usingSharding()) return;
 
     // Negative test - conflicting class names (decorator)
     const result1 = spawnSync('npx', ['ts-node', './tests/dupclassreg.ts'], {

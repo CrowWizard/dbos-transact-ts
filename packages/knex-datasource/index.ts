@@ -1,18 +1,24 @@
 // using https://github.com/knex/knex
 
-import { DBOS, DBOSWorkflowConflictError, FunctionName } from '@dbos-inc/dbos-sdk';
+import { DBOS, FunctionName } from '@dbos-inc/dbos-sdk';
 import {
   type DataSourceTransactionHandler,
   isPGRetriableTransactionError,
-  isPGKeyConflictError,
+  DBOSError,
+  DBOSStepAlreadyRecordedError,
+  DBOSWorkflowConflictError,
+  assertStillOwnsWorkflow,
+  checkpointWorkflowID,
+  replayRecordedStep,
   registerTransaction,
   runTransaction,
   DBOSDataSource,
   registerDataSource,
-  createTransactionCompletionSchemaPG,
-  createTransactionCompletionTablePG,
-  CheckSchemaInstallationReturn,
-  checkSchemaInstallationPG,
+  DataSourceMigrationOptions,
+  DataSourceSQLExecutor,
+  initializeDataSourceSchemaPG,
+  migrateDataSourcePG,
+  verifyDataSourcePG,
 } from '@dbos-inc/dbos-sdk/datasource';
 import { AsyncLocalStorage } from 'async_hooks';
 import knex, { type Knex } from 'knex';
@@ -36,8 +42,11 @@ export type TransactionConfig = Pick<Knex.TransactionConfig, 'isolationLevel' | 
 
 const asyncLocalCtx = new AsyncLocalStorage<KnexDataSourceContext>();
 
+function knexExecutor(knexDB: Knex): DataSourceSQLExecutor {
+  return async (sql) => (await knexDB.raw<{ rows: Record<string, unknown>[] }>(sql)).rows;
+}
+
 class KnexTransactionHandler implements DataSourceTransactionHandler {
-  readonly dsType = 'KnexDataSource';
   #knexDBField: Knex | undefined;
   readonly schemaName: string;
 
@@ -45,6 +54,7 @@ class KnexTransactionHandler implements DataSourceTransactionHandler {
     readonly name: string,
     private readonly config: Knex.Config,
     schemaName: string = 'dbos',
+    private readonly options: DataSourceMigrationOptions = {},
   ) {
     this.schemaName = schemaName;
   }
@@ -54,30 +64,18 @@ class KnexTransactionHandler implements DataSourceTransactionHandler {
     this.#knexDBField = knex(this.config);
     await knexDB?.destroy();
 
-    // Check for connectivity & the schema
-    let installed = false;
-    try {
-      const { rows } = await this.#knexDBField.raw<{ rows: CheckSchemaInstallationReturn[] }>(
-        checkSchemaInstallationPG(this.schemaName),
-      );
-      installed = !!rows[0].schema_exists && !!rows[0].table_exists;
-    } catch (e) {
-      DBOS.logger.error(e);
-      throw new Error(
-        `In initialization of 'KnexDataSource' ${this.name}: Database could not be reached: ${(e as Error).message}`,
-      );
+    if (this.options.runMigrations === false) {
+      await verifyDataSourcePG(knexExecutor(this.#knexDBField), this.schemaName, this.name);
+      return;
     }
 
-    if (!installed) {
-      try {
-        await this.#knexDBField.raw(createTransactionCompletionSchemaPG(this.schemaName));
-        await this.#knexDBField.raw(createTransactionCompletionTablePG(this.schemaName));
-      } catch (err) {
-        throw new Error(
-          `In initialization of 'KnexDataSource' ${this.name}: The '${this.schemaName}.transaction_completion' table does not exist, and could not be created.  This should be added to your database migrations.
+    try {
+      await this.#knexDBField.transaction((trx) => migrateDataSourcePG(knexExecutor(trx), this.schemaName));
+    } catch (err) {
+      throw new Error(
+        `In initialization of 'KnexDataSource' ${this.name}: The '${this.schemaName}' transaction schema could not be migrated: ${(err as Error).message}. This should be added to your database migrations.
             See: https://docs.dbos.dev/typescript/tutorials/transaction-tutorial#installing-the-dbos-schema`,
-        );
-      }
+      );
     }
   }
 
@@ -94,6 +92,17 @@ class KnexTransactionHandler implements DataSourceTransactionHandler {
     return this.#knexDBField;
   }
 
+  async deleteCheckpoints(workflowID: string, startStep: number, beforeCommit?: () => Promise<void>): Promise<void> {
+    await this.#knexDB.transaction(async (client) => {
+      await client<transaction_completion>('transaction_completion')
+        .withSchema('dbos')
+        .where('workflow_id', checkpointWorkflowID(workflowID))
+        .where('function_num', '>=', startStep)
+        .delete();
+      await beforeCommit?.();
+    });
+  }
+
   async #checkExecution(
     workflowID: string,
     stepID: number,
@@ -102,7 +111,7 @@ class KnexTransactionHandler implements DataSourceTransactionHandler {
       .withSchema('dbos')
       .select('output', 'error')
       .where({
-        workflow_id: workflowID,
+        workflow_id: checkpointWorkflowID(workflowID),
         function_num: stepID,
       })
       .first();
@@ -114,19 +123,30 @@ class KnexTransactionHandler implements DataSourceTransactionHandler {
   }
 
   async #recordError(workflowID: string, stepID: number, error: string): Promise<void> {
-    try {
-      await this.#knexDB<transaction_completion>('transaction_completion').withSchema('dbos').insert({
-        workflow_id: workflowID,
+    const rows = await this.#knexDB<transaction_completion>('transaction_completion')
+      .withSchema('dbos')
+      .insert({
+        workflow_id: checkpointWorkflowID(workflowID),
         function_num: stepID,
         error,
-      });
-    } catch (error) {
-      if (isPGKeyConflictError(error)) {
-        throw new DBOSWorkflowConflictError(workflowID);
-      } else {
-        throw error;
-      }
+      })
+      .onConflict(['workflow_id', 'function_num'])
+      .ignore()
+      .returning('workflow_id');
+    if (rows.length === 0) {
+      throw new DBOSStepAlreadyRecordedError(workflowID, stepID);
     }
+  }
+
+  // A duplicate execution won the race, so its recorded outcome is the durable one.
+  async #replayConflictingStep<Return>(workflowID: string, stepID: number): Promise<Return> {
+    const recorded = await this.#checkExecution(workflowID, stepID);
+    if (recorded === undefined) {
+      throw new DBOSError(
+        `Step ${stepID} of workflow ${workflowID} conflicted with a concurrent execution, but no recorded outcome was found`,
+      );
+    }
+    return replayRecordedStep<Return>(recorded);
   }
 
   static async #recordOutput(
@@ -135,19 +155,21 @@ class KnexTransactionHandler implements DataSourceTransactionHandler {
     stepID: number,
     output: string | null,
   ): Promise<void> {
-    try {
-      await client<transaction_completion>('transaction_completion').withSchema('dbos').insert({
-        workflow_id: workflowID,
+    const rows = await client<transaction_completion>('transaction_completion')
+      .withSchema('dbos')
+      .insert({
+        workflow_id: checkpointWorkflowID(workflowID),
         function_num: stepID,
         output,
-      });
-    } catch (error) {
-      if (isPGKeyConflictError(error)) {
-        throw new DBOSWorkflowConflictError(workflowID);
-      } else {
-        throw error;
-      }
+      })
+      .onConflict(['workflow_id', 'function_num'])
+      .ignore()
+      .returning('workflow_id');
+    if (rows.length === 0) {
+      throw new DBOSStepAlreadyRecordedError(workflowID, stepID);
     }
+    // Holding this step's row, so a later owner's insert waits on our commit.
+    await assertStillOwnsWorkflow(workflowID);
   }
 
   async invokeTransactionFunction<This, Args extends unknown[], Return>(
@@ -174,12 +196,7 @@ class KnexTransactionHandler implements DataSourceTransactionHandler {
       // Check to see if this tx has already been executed
       const previousResult = saveResults ? await this.#checkExecution(workflowID, stepID!) : undefined;
       if (previousResult) {
-        DBOS.span?.setAttribute('cached', true);
-
-        if ('error' in previousResult) {
-          throw SuperJSON.parse(previousResult.error);
-        }
-        return (previousResult.output ? SuperJSON.parse(previousResult.output) : null) as Return;
+        return replayRecordedStep<Return>(previousResult);
       }
 
       try {
@@ -202,6 +219,11 @@ class KnexTransactionHandler implements DataSourceTransactionHandler {
 
         return result;
       } catch (error) {
+        if (saveResults && error instanceof DBOSStepAlreadyRecordedError) {
+          return await this.#replayConflictingStep<Return>(workflowID, stepID!);
+        }
+        // The new owner wins; recording an error here would replay it as this step's outcome.
+        if (error instanceof DBOSWorkflowConflictError) throw error;
         if (isPGRetriableTransactionError(error)) {
           DBOS.span?.addEvent('TXN SERIALIZATION FAILURE', { retryWaitMillis: retryWaitMS }, performance.now());
           await new Promise((resolve) => setTimeout(resolve, retryWaitMS));
@@ -210,7 +232,14 @@ class KnexTransactionHandler implements DataSourceTransactionHandler {
         } else {
           if (saveResults) {
             const message = SuperJSON.stringify(error);
-            await this.#recordError(workflowID, stepID!, message);
+            try {
+              await this.#recordError(workflowID, stepID!, message);
+            } catch (recordError) {
+              if (recordError instanceof DBOSStepAlreadyRecordedError) {
+                return await this.#replayConflictingStep<Return>(workflowID, stepID!);
+              }
+              throw recordError;
+            }
           }
 
           throw error;
@@ -245,7 +274,15 @@ export class KnexDataSource implements DBOSDataSource<TransactionConfig> {
     return KnexDataSource.#getClient(this.#provider);
   }
 
-  static async initializeDBOSSchema(knexOrConfig: Knex.Config, schemaName: string = 'dbos') {
+  /**
+   * Create or migrate the DBOS transaction schema, typically with a privileged role,
+   * optionally granting `applicationRole` the minimal permissions to use it.
+   */
+  static async initializeDBOSSchema(
+    knexOrConfig: Knex.Config,
+    schemaName: string = 'dbos',
+    options: { applicationRole?: string } = {},
+  ) {
     if (isKnex(knexOrConfig)) {
       await $initSchema(knexOrConfig);
     } else {
@@ -258,8 +295,9 @@ export class KnexDataSource implements DBOSDataSource<TransactionConfig> {
     }
 
     async function $initSchema(knexDB: Knex) {
-      await knexDB.raw(createTransactionCompletionSchemaPG(schemaName));
-      await knexDB.raw(createTransactionCompletionTablePG(schemaName));
+      await knexDB.transaction((trx) =>
+        initializeDataSourceSchemaPG(knexExecutor(trx), schemaName, options.applicationRole),
+      );
     }
   }
 
@@ -288,8 +326,9 @@ export class KnexDataSource implements DBOSDataSource<TransactionConfig> {
     readonly name: string,
     config: Knex.Config,
     schemaName: string = 'dbos',
+    options: DataSourceMigrationOptions = {},
   ) {
-    this.#provider = new KnexTransactionHandler(name, config, schemaName);
+    this.#provider = new KnexTransactionHandler(name, config, schemaName, options);
     registerDataSource(this.#provider);
   }
 

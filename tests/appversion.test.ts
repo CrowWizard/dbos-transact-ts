@@ -1,7 +1,27 @@
 import { randomUUID } from 'crypto';
+import { Client } from 'pg';
 import { DBOS, DBOSClient, StatusString } from '../src';
 import { DBOSConfig, DBOSExecutor } from '../src/dbos-executor';
-import { generateDBOSTestConfig, recoverPendingWorkflows, setUpDBOSTestSysDb } from './helpers';
+import { globalParams } from '../src/utils';
+import * as enterprise from '../src/enterprise';
+import type { AutoUpgradePass, ConductorConnection } from '../src/enterprise';
+
+class FakeConductor implements ConductorConnection {
+  start() {}
+  stop() {
+    return Promise.resolve();
+  }
+}
+
+class FakePass implements AutoUpgradePass {
+  run() {
+    return Promise.resolve(0);
+  }
+  close() {
+    return Promise.resolve();
+  }
+}
+import { generateDBOSTestConfig, recoverPendingWorkflows, setUpDBOSTestSysDb, testUnlessSharded } from './helpers';
 
 describe('test-app-version', () => {
   let config: DBOSConfig;
@@ -38,7 +58,7 @@ describe('test-app-version', () => {
     await DBOS.shutdown();
 
     // Verify stability -- the same source produces the same app version
-    expect(DBOS.applicationVersion.length).toBe(0);
+    expect(DBOS.applicationVersion).toEqual(appVersion);
     await DBOS.launch();
     expect(DBOS.applicationVersion).toEqual(appVersion);
     await expect(TestAppVersionStability.testWorkflow()).resolves.toEqual(0);
@@ -53,7 +73,6 @@ describe('test-app-version', () => {
       }
     }
 
-    expect(DBOS.applicationVersion.length).toBe(0);
     await DBOS.launch();
     expect(DBOS.applicationVersion.length).toBeGreaterThan(0);
     expect(DBOS.applicationVersion).not.toEqual(appVersion);
@@ -65,7 +84,6 @@ describe('test-app-version', () => {
     const test_version = 'test_version';
     config.applicationVersion = test_version;
     DBOS.setConfig(config);
-    expect(DBOS.applicationVersion.length).toBe(0);
     await DBOS.launch();
     expect(DBOS.applicationVersion).toBe(test_version);
   });
@@ -95,7 +113,8 @@ describe('test-app-version', () => {
     await expect(handles[0].getResult()).resolves.toEqual(0);
     await DBOSExecutor.globalInstance?.systemDatabase.setWorkflowStatus(handle.workflowID, StatusString.PENDING, true);
 
-    // Shutdown and restart with different source code. Verify it does not recover.
+    // Shutdown and restart with different source code
+    const oldVersion = DBOS.applicationVersion;
     await DBOS.shutdown();
     class YetAnotherWorkflow {
       @DBOS.workflow()
@@ -104,9 +123,80 @@ describe('test-app-version', () => {
       }
     }
     await DBOS.launch();
-    handles = await recoverPendingWorkflows();
-    expect(handles.length).toBe(0);
+    expect(DBOS.applicationVersion).not.toEqual(oldVersion);
+
+    // Startup recovery covers only its own version, so the old workflow is still pending
+    const pending = await DBOS.getWorkflowStatus(handle.workflowID);
+    expect(pending?.status).toBe(StatusString.PENDING);
+    expect(pending?.executorId).toBe('test-app-version-recovery');
+
+    // Explicit recovery re-enqueues it on its own version, which this process does not run
+    handles = await recoverPendingWorkflows(['test-app-version-recovery']);
+    expect(handles.map((h) => h.workflowID)).toEqual([handle.workflowID]);
+    const requeued = await DBOS.getWorkflowStatus(handle.workflowID);
+    expect(requeued?.status).toBe(StatusString.ENQUEUED);
+    expect(requeued?.applicationVersion).toBe(oldVersion);
     await expect(YetAnotherWorkflow.anotherWorkflow()).resolves.toEqual(1);
+  });
+
+  test('test-recover-workflows-any-version', async () => {
+    class TestRecoverWorkflowsVersion {
+      @DBOS.workflow()
+      static async target(x: string) {
+        return Promise.resolve(x);
+      }
+    }
+
+    const queueName = 'recover-any-version';
+    const launch = async (version: string) => {
+      await DBOS.shutdown();
+      config.applicationVersion = version;
+      DBOS.setConfig(config);
+      await DBOS.launch();
+      await DBOS.registerQueue(queueName, { globalConcurrency: 1, onConflict: 'always_update' });
+    };
+    const client = new Client({ connectionString: config.systemDatabaseUrl });
+    await client.connect();
+    const pendingOnQueue = async () => {
+      const { rows } = await client.query<{ count: string }>(
+        `SELECT count(*) AS count FROM dbos.workflow_status WHERE queue_name = $1 AND status = $2`,
+        [queueName, StatusString.PENDING],
+      );
+      return Number(rows[0].count);
+    };
+
+    try {
+      await launch('v1');
+      const wfid = randomUUID();
+      const handle = await DBOS.startWorkflow(TestRecoverWorkflowsVersion, { workflowID: wfid, queueName }).target(
+        'v1',
+      );
+      await expect(handle.getResult()).resolves.toBe('v1');
+      await client.query(
+        `UPDATE dbos.workflow_status SET status=$1, executor_id=$2, queue_name=$3 WHERE workflow_uuid=$4`,
+        [StatusString.PENDING, 'dead-executor', queueName, wfid],
+      );
+
+      // A v2 process recovers the dead executor's v1 workflow, freeing the queue's only slot
+      await launch('v2');
+      await expect(pendingOnQueue()).resolves.toBe(1);
+      const handles = await DBOS.recoverWorkflows(['dead-executor']);
+      expect(handles.map((h) => h.workflowID)).toEqual([wfid]);
+      await expect(pendingOnQueue()).resolves.toBe(0);
+
+      // v2 runs its own work but skips the older v1 workflow ahead of it
+      const v2Handle = await DBOS.startWorkflow(TestRecoverWorkflowsVersion, { queueName }).target('v2');
+      await expect(v2Handle.getResult()).resolves.toBe('v2');
+      const stat = await DBOS.getWorkflowStatus(wfid);
+      expect(stat?.status).toBe(StatusString.ENQUEUED);
+      expect(stat?.applicationVersion).toBe('v1');
+
+      // A v1 process runs it
+      await launch('v1');
+      await expect(DBOS.retrieveWorkflow(wfid).getResult()).resolves.toBe('v1');
+    } finally {
+      await client.end();
+    }
   });
 
   test('test-setting-app-version', async () => {
@@ -134,6 +224,54 @@ describe('test-app-version', () => {
     // Verify those values are set on workflows
     expect(status?.applicationVersion).toBe(testVersion);
     expect(status?.executorId).toBe(testExecutorID);
+  });
+
+  // The stand-in package has no sharded system database.
+  testUnlessSharded('test-setting-executor-id', async () => {
+    const originalVMID = process.env.DBOS__VMID;
+    const originalCloud = globalParams.dbosCloud;
+    const originalSysDbUrl = process.env.DBOS_SYSTEM_DATABASE_URL;
+    // The executor ID is core's to assign; the Conductor client itself is not under test here.
+    const load = jest.spyOn(enterprise, 'load').mockReturnValue({
+      ConductorWebsocket: FakeConductor,
+      AutoUpgradePass: FakePass,
+      ShardedSystemDatabase: class {} as unknown as enterprise.ShardedSystemDatabaseFactory,
+      Suspend: class {} as unknown as enterprise.SuspendFactory,
+      ExternalStorage: class {} as unknown as enterprise.ExternalStorageFactory,
+    });
+    try {
+      // An empty DBOS__VMID is an unset one
+      process.env.DBOS__VMID = '';
+      await DBOS.launch();
+      expect(DBOS.executorID).toBe('local');
+      await DBOS.shutdown();
+
+      // Conductor assigns its own executor ID off DBOS Cloud
+      process.env.DBOS__VMID = 'cloud-vm';
+      await DBOS.launch({ conductorKey: 'test-key', conductorURL: 'ws://127.0.0.1:1' });
+      expect(DBOS.executorID).not.toBe('cloud-vm');
+      await DBOS.shutdown();
+
+      // On DBOS Cloud the platform names the process, and a key passed in code is not used
+      // DBOS Cloud supplies the system database through the environment
+      process.env.DBOS_SYSTEM_DATABASE_URL = config.systemDatabaseUrl;
+      globalParams.dbosCloud = true;
+      await DBOS.launch({ conductorKey: 'test-key', conductorURL: 'ws://127.0.0.1:1' });
+      expect(DBOS.executorID).toBe('cloud-vm');
+    } finally {
+      load.mockRestore();
+      globalParams.dbosCloud = originalCloud;
+      if (originalVMID === undefined) {
+        delete process.env.DBOS__VMID;
+      } else {
+        process.env.DBOS__VMID = originalVMID;
+      }
+      if (originalSysDbUrl === undefined) {
+        delete process.env.DBOS_SYSTEM_DATABASE_URL;
+      } else {
+        process.env.DBOS_SYSTEM_DATABASE_URL = originalSysDbUrl;
+      }
+    }
   });
 
   test('test-version-registration-on-launch', async () => {
